@@ -68,6 +68,12 @@ def test_safety_error_classification_is_explicit():
     assert classify_error("Gate request timed out") == "timeout"
 
 
+def test_risk_limit_errors_are_classified_as_blocked_not_worker_crashes():
+    limits = RiskLimits(1000, 1000, 300)
+    with pytest.raises(PermissionError, match="position notional"):
+        limits.check_order(order_margin_usd=10, current_margin_usd=0, current_position_notional_usd=1001, order_notional_usd=1, environment="testnet", live_enabled=False)
+
+
 def test_live_read_only_is_allowed_but_write_gate_stays_closed():
     live = GateSettings(environment="live", api_key="k", api_secret="s")
     live.validate()

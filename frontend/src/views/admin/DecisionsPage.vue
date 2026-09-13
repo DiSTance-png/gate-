@@ -44,6 +44,7 @@ const tradeStatusText: Record<string, string> = {
   blocked_symbol_cooldown: '该合约处于止损冷却，其他合约不受影响',
   blocked_invalid_margin: '保证金额度无效，已阻止下单',
   blocked_invalid_size: '合约张数无效，已阻止下单',
+  blocked_risk_limit: '组合仓位或保证金超过上限，已阻止下单',
   blocked_opposite_position: '与现有持仓方向冲突，已阻止下单',
   blocked_by_strategy_interceptor: '未通过策略风控，已阻止下单',
   blocked_by_strategy_interceptor_error: '策略风控检查异常，已阻止下单',

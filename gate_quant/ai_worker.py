@@ -784,7 +784,19 @@ def run_cycle() -> dict:
         current_margin = _account_committed_margin(account)
         current_notional = _portfolio_position_notional(client, positions)
         risk = {"order_margin_usd": estimated_margin, "current_margin_usd": current_margin, "current_position_notional_usd": current_notional, "order_notional_usd": order_notional, "environment": settings.environment, "live_enabled": settings.live_trading_enabled}
-        limits.check_order(**risk)
+        try:
+            limits.check_order(**risk)
+        except PermissionError as exc:
+            result["trade"] = {
+                "status": "blocked_risk_limit",
+                "contract": trade_symbol,
+                "reason": str(exc),
+                "risk": risk,
+            }
+            payload = {**decisions_payload, "generated_at_ms": now, "exchange": "gate", "environment": settings.environment, "policy_snapshot": policy_snapshot, "risk_snapshot": risk_snapshot, "position_management": position_management, "pending_orders_management": pending_management, "private_context": private_context, "trade": result["trade"]}
+            _save_decision_payload(payload, decisions_payload, result["trade"], now, settings.environment, risk_snapshot)
+            result["decisions"] = decisions_payload
+            return result
         try:
             from .strategy_adapter import validate_decision
             package = {**trade_feature, "instId": trade_symbol, "data_quality": "valid", "macro_4h": trade_feature.get("macro_4h", "RANGE")}
