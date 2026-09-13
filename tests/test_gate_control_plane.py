@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from gate_quant.client import GateFuturesClient
 from gate_quant.config import GateSettings, load_settings
+from gate_quant.web import _account_book_stats
 
 
 class CaptureSession:
@@ -57,6 +58,23 @@ def test_credentials_are_selected_only_for_active_environment(monkeypatch):
     monkeypatch.setenv("GATE_PUBLIC_MARKET_ENV", "live")
     selected = load_settings()
     assert (selected.api_key, selected.api_secret) == ("live-key", "live-secret")
+
+
+def test_account_book_stats_reports_gate_pnl_win_loss_counts(monkeypatch):
+    import gate_quant.web as web
+    now = 1_800_000_000
+    monkeypatch.setattr(web.dt, "datetime", web.dt.datetime)
+    rows = [
+        {"time": now, "type": "pnl", "change": "12.5"},
+        {"time": now, "type": "pnl", "change": "-2.5"},
+        {"time": now, "type": "fee", "change": "-0.1"},
+        {"time": now, "type": "fund", "change": "-0.2"},
+    ]
+    stats = _account_book_stats(rows)
+    assert stats["win_trades"] == 1
+    assert stats["loss_trades"] == 1
+    assert stats["closed_trades"] == 2
+    assert stats["win_rate"] == 50.0
 
 
 def test_native_gate_order_and_price_order_paths():

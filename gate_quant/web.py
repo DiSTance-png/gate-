@@ -285,6 +285,7 @@ def _account_book_stats(rows: list[dict[str, Any]] | None) -> dict[str, Any]:
     now = dt.datetime.now(dt.timezone(dt.timedelta(hours=8)))
     day_start = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
     fees = funding = realized = 0.0
+    win_trades = loss_trades = 0
     for row in rows or []:
         try:
             if int(float(row.get("time") or 0)) < day_start:
@@ -299,7 +300,12 @@ def _account_book_stats(rows: list[dict[str, Any]] | None) -> dict[str, Any]:
             funding += amount
         elif kind == "pnl":
             realized += amount
-    return {"realized_gross": round(realized, 8), "fees_paid": round(fees, 8), "funding_paid": round(funding, 8), "net_realized": round(realized + fees + funding, 8), "total_pnl": round(realized + fees + funding, 8), "win_trades": 0, "loss_trades": 0, "win_rate": None, "source": "Gate Futures account_book", "timezone": "Asia/Shanghai"}
+            if amount > 0:
+                win_trades += 1
+            elif amount < 0:
+                loss_trades += 1
+    closed_trades = win_trades + loss_trades
+    return {"realized_gross": round(realized, 8), "fees_paid": round(fees, 8), "funding_paid": round(funding, 8), "net_realized": round(realized + fees + funding, 8), "total_pnl": round(realized + fees + funding, 8), "win_trades": win_trades, "loss_trades": loss_trades, "closed_trades": closed_trades, "win_rate": round(win_trades / closed_trades * 100, 2) if closed_trades else None, "source": "Gate Futures account_book", "timezone": "Asia/Shanghai"}
 
 
 @app.get("/")
