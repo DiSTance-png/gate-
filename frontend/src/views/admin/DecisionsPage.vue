@@ -41,6 +41,7 @@ const tradeStatusText: Record<string, string> = {
   submitted_testnet: '已提交模拟盘订单',
   submitted_live: '已提交实盘订单',
   blocked_safety_fail_closed: '安全门已关闭，暂停新增仓位',
+  blocked_symbol_cooldown: '该合约处于止损冷却，其他合约不受影响',
   blocked_invalid_margin: '保证金额度无效，已阻止下单',
   blocked_invalid_size: '合约张数无效，已阻止下单',
   blocked_opposite_position: '与现有持仓方向冲突，已阻止下单',

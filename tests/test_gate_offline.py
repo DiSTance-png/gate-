@@ -10,7 +10,7 @@ from gate_quant.ai_worker import _extract_decision_object, _extract_response_obj
 from gate_quant.strategy_adapter import validate_decision
 from gate_quant.risk_profiles import get_risk_profile
 from r20_gateway.scheduler import JOBS
-from gate_quant.safety import classify_error, daily_loss_state, reconcile_exchange_state
+from gate_quant.safety import classify_error, cooldown_state, daily_loss_state, reconcile_exchange_state
 from gate_quant.protection_lifecycle import intent_from_history, is_system_protection, recovery_plans
 
 
@@ -51,6 +51,16 @@ def test_safety_daily_loss_uses_stricter_absolute_or_equity_limit(tmp_path):
     state = daily_loss_state(ledger, max_loss_usd=100, max_loss_ratio=0.05, equity=1000, now=1000)
     assert state["tripped"]
     assert state["limit_usd"] == 50
+
+
+def test_stop_cooldown_is_scoped_to_the_losing_contract(tmp_path):
+    ledger = tmp_path / "ledger.json"
+    ledger.write_text(json.dumps([
+        {"status": "closed", "inst": "ETH_USDT", "close_time": "2026-09-14 03:49:48", "net_pnl": -2.7},
+    ]), encoding="utf-8")
+    now = __import__("datetime").datetime.strptime("2026-09-14 04:00:00", "%Y-%m-%d %H:%M:%S").timestamp()
+    assert cooldown_state(ledger, cooldown_seconds=1800, contract="ETH_USDT", now=now)["active"]
+    assert not cooldown_state(ledger, cooldown_seconds=1800, contract="BTC_USDT", now=now)["active"]
 
 
 def test_safety_error_classification_is_explicit():

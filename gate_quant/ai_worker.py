@@ -462,13 +462,14 @@ def run_cycle() -> dict:
     )
     equity = float(private_context["account"].get("total") or private_context["account"].get("available") or 0)
     daily_loss = daily_loss_state(LEDGER, max_loss_usd=settings.max_daily_loss_usd, max_loss_ratio=settings.max_daily_loss_ratio, equity=equity)
-    cooldown = cooldown_state(LEDGER, cooldown_seconds=settings.stop_cooldown_seconds)
+    cooldowns = {symbol: cooldown_state(LEDGER, cooldown_seconds=settings.stop_cooldown_seconds, contract=symbol) for symbol in SYMBOLS}
+    cooldown = {"active": False, "remaining_seconds": 0, "reason": "per_contract", "contracts": cooldowns}
     safety_status = {
         "environment": settings.environment, "checked_at_ms": int(time.time() * 1000),
         "reconciliation": reconciliation, "daily_loss": daily_loss, "cooldown": cooldown,
         "private_errors": private_context["private_errors"],
     }
-    safety_status["safe_for_new_risk"] = bool(not private_context["private_errors"] and reconciliation["safe_for_new_risk"] and not daily_loss["tripped"] and not cooldown["active"])
+    safety_status["safe_for_new_risk"] = bool(not private_context["private_errors"] and reconciliation["safe_for_new_risk"] and not daily_loss["tripped"])
     lifecycle_actions: list[dict] = []
     if execution_enabled and not private_context["private_errors"]:
         service = GateTradingService(client, RiskLimits(settings.max_position_notional_usd, settings.max_total_margin_usd, settings.max_order_margin_usd))
@@ -554,7 +555,7 @@ def run_cycle() -> dict:
                 private_context["protections"] = client.protection_orders() or []
                 reconciliation = reconcile_exchange_state(private_context["positions"], private_context["pending_orders"], private_context["protections"], max_pending_age_seconds=settings.max_pending_order_age_seconds)
                 safety_status["reconciliation"] = reconciliation
-                safety_status["safe_for_new_risk"] = bool(reconciliation["safe_for_new_risk"] and not daily_loss["tripped"] and not cooldown["active"])
+                safety_status["safe_for_new_risk"] = bool(reconciliation["safe_for_new_risk"] and not daily_loss["tripped"])
             except Exception as exc:
                 safety_status["safe_for_new_risk"] = False
                 safety_status["private_errors"].append({"category": classify_error(exc), "error": f"post-action reconciliation: {exc}"})
@@ -717,7 +718,8 @@ def run_cycle() -> dict:
             except Exception as exc:
                 management_result["pending_orders"].append({"contract": contract_name, "order_id": order_id, "error": str(exc)})
         result["management"] = management_result
-    if execution_enabled and safety_status["safe_for_new_risk"] and llm_source == "gate-multifactor-llm" and action != "WAIT" and confidence >= risk_profile.min_confidence:
+    symbol_cooldown = cooldown_state(LEDGER, cooldown_seconds=settings.stop_cooldown_seconds, contract=trade_symbol)
+    if execution_enabled and safety_status["safe_for_new_risk"] and not symbol_cooldown["active"] and llm_source == "gate-multifactor-llm" and action != "WAIT" and confidence >= risk_profile.min_confidence:
         limits = RiskLimits(settings.max_position_notional_usd, settings.max_total_margin_usd, settings.max_order_margin_usd)
         contract = client.contracts(trade_symbol)
         multiplier = float(contract.get("quanto_multiplier") or 0)
@@ -881,8 +883,10 @@ def run_cycle() -> dict:
             except Exception as close_error:
                 cleanup["close_order"] = f"close failed: {close_error}"
             result["trade"] = {"status": "protection_failed_flatten_attempted", "contract": trade_symbol, "client_id": client_id, "order": order, "error": str(protection_error), "cleanup": cleanup}
-    if execution_enabled and not safety_status["safe_for_new_risk"] and result["trade"].get("status") == "not_submitted":
-        result["trade"] = {"status": "blocked_safety_fail_closed", "reason": "Gate reconciliation, daily-loss or cooldown gate blocked new risk", "safety_status": safety_status}
+    if execution_enabled and symbol_cooldown["active"] and result["trade"].get("status") == "not_submitted":
+        result["trade"] = {"status": "blocked_symbol_cooldown", "contract": trade_symbol, "reason": f"{trade_symbol} is in post-stop cooldown; other contracts remain eligible", "cooldown": symbol_cooldown}
+    elif execution_enabled and not safety_status["safe_for_new_risk"] and result["trade"].get("status") == "not_submitted":
+        result["trade"] = {"status": "blocked_safety_fail_closed", "reason": "Gate reconciliation or daily-loss gate blocked new risk", "safety_status": safety_status}
     result["trade"].setdefault("policy_version", policy_snapshot["policy_version"])
     result["trade"].setdefault("policy_hash", policy_snapshot["policy_hash"])
     payload = {**decisions_payload, "generated_at_ms": now, "exchange": "gate", "environment": settings.environment, "policy_snapshot": policy_snapshot, "risk_snapshot": risk_snapshot, "safety_status": safety_status, "position_management": position_management, "pending_orders_management": pending_management, "private_context": private_context, "trade": result["trade"]}

@@ -117,22 +117,25 @@ def daily_loss_state(ledger_path: Path, *, max_loss_usd: float, max_loss_ratio: 
     return {"tripped": limit <= 0 or loss >= limit, "reason": "daily_loss_limit" if limit > 0 and loss >= limit else ("daily_loss_limit_unconfigured" if limit <= 0 else "ok"), "loss_usd": float(loss), "limit_usd": float(limit), "net_pnl_usd": float(pnl)}
 
 
-def cooldown_state(ledger_path: Path, *, cooldown_seconds: int, now: float | None = None) -> dict[str, Any]:
+def cooldown_state(ledger_path: Path, *, cooldown_seconds: int, contract: str | None = None, now: float | None = None) -> dict[str, Any]:
     now = now or time.time()
     try:
         rows = json.loads(ledger_path.read_text(encoding="utf-8")) if ledger_path.exists() else []
     except (OSError, json.JSONDecodeError):
         return {"active": True, "reason": "ledger_unreadable"}
     latest_loss = 0.0
+    wanted_contract = str(contract or "").upper()
     for row in rows if isinstance(rows, list) else []:
         if row.get("status") != "closed" or decimal_value(row.get("net_pnl", row.get("pnl"))) >= 0:
+            continue
+        if wanted_contract and str(row.get("inst") or row.get("contract") or "").upper() != wanted_contract:
             continue
         try:
             latest_loss = max(latest_loss, datetime.strptime(str(row.get("close_time")), "%Y-%m-%d %H:%M:%S").timestamp())
         except (TypeError, ValueError):
             continue
     remaining = max(0, int(latest_loss + cooldown_seconds - now)) if latest_loss else 0
-    return {"active": remaining > 0, "remaining_seconds": remaining, "reason": "post_stop_cooldown" if remaining else "ok"}
+    return {"active": remaining > 0, "remaining_seconds": remaining, "reason": "post_stop_cooldown" if remaining else "ok", **({"contract": wanted_contract} if wanted_contract else {})}
 
 
 def atomic_json(path: Path, payload: Any) -> None:
