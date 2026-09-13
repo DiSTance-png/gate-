@@ -1,0 +1,689 @@
+@import "tailwindcss";
+
+/* =========================================================================
+   R20 Institutional Terminal Theme Variables (Dual-Mode: Light & Dark)
+   ========================================================================= */
+
+:root,
+:root.dark,
+:root[data-theme="dark"] {
+  --bg-app: #0A0B0E;
+  --bg-header: rgba(14, 15, 18, 0.96);
+  --bg-card: #121317;
+  --bg-card-subtle: #17181E;
+  --bg-card-hover: #1E2028;
+  --bg-input: #0E0F13;
+  --bg-badge: #1C1E26;
+
+  --border-subtle: #242630;
+  --border-medium: #343746;
+  --border-strong: #4F5468;
+
+  --text-main: #F3F4F6;
+  --text-muted: #9CA3AF;
+  --text-faint: #6B7280;
+
+  /* Dark Titanium / Silver sheen */
+  --color-brand: #F3F4F6;
+  --color-brand-bg: rgba(255, 255, 255, 0.08);
+  --color-brand-border: rgba(255, 255, 255, 0.16);
+
+  --color-up: #10B981;
+  --color-up-bg: rgba(16, 185, 129, 0.12);
+  --color-up-border: rgba(16, 185, 129, 0.28);
+
+  --color-down: #F43F5E;
+  --color-down-bg: rgba(244, 63, 94, 0.12);
+  --color-down-border: rgba(244, 63, 94, 0.28);
+
+  --color-warn: #F59E0B;
+  --color-warn-bg: rgba(245, 158, 11, 0.12);
+  --color-warn-border: rgba(245, 158, 11, 0.28);
+
+  --shadow-card: 0 4px 20px -2px rgba(0, 0, 0, 0.5);
+  --shadow-float: 0 20px 35px -8px rgba(0, 0, 0, 0.7);
+}
+
+:root[data-theme="light"] {
+  --bg-app: #F8FAFC;
+  --bg-header: rgba(255, 255, 255, 0.92);
+  --bg-card: #FFFFFF;
+  --bg-card-subtle: #F1F5F9;
+  --bg-card-hover: #E2E8F0;
+  --bg-input: #FFFFFF;
+  --bg-badge: #F1F5F9;
+  
+  --border-subtle: #E2E8F0;
+  --border-medium: #CBD5E1;
+  --border-strong: #94A3B8;
+
+  --text-main: #0F172A;
+  --text-muted: #475569;
+  --text-faint: #94A3B8;
+
+  /* Neutral Titanium / Obsidian brand styling */
+  --color-brand: #0F172A;
+  --color-brand-bg: #F1F5F9;
+  --color-brand-border: #CBD5E1;
+
+  --color-up: #059669;
+  --color-up-bg: rgba(16, 185, 129, 0.08);
+  --color-up-border: rgba(16, 185, 129, 0.25);
+
+  --color-down: #E11D48;
+  --color-down-bg: rgba(225, 29, 72, 0.08);
+  --color-down-border: rgba(225, 29, 72, 0.25);
+
+  --color-warn: #D97706;
+  --color-warn-bg: rgba(217, 119, 6, 0.08);
+  --color-warn-border: rgba(217, 119, 6, 0.25);
+
+  --shadow-card: 0 1px 3px 0 rgba(15, 23, 42, 0.04), 0 1px 2px -1px rgba(15, 23, 42, 0.03);
+  --shadow-float: 0 10px 25px -5px rgba(15, 23, 42, 0.08), 0 8px 10px -6px rgba(15, 23, 42, 0.04);
+}
+
+/* =========================================================================
+   Base Typography & Styles
+   ========================================================================= */
+
+body {
+  background-color: var(--bg-app);
+  color: var(--text-main);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  margin: 0;
+  padding: 0;
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+/* Financial Monospace Numbers */
+.num-tabular {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.015em;
+}
+
+/* =========================================================================
+   Universal Border & Table Normalization (Eliminate Any Stray White Lines)
+   ========================================================================= */
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+*,
+::before,
+::after {
+  border-color: var(--border-subtle);
+}
+
+table,
+thead,
+tbody,
+tfoot,
+tr,
+th,
+td {
+  border-color: var(--border-subtle) !important;
+}
+
+.divide-x > *,
+.divide-y > *,
+.divide-x > :not([hidden]) ~ :not([hidden]),
+.divide-y > :not([hidden]) ~ :not([hidden]) {
+  border-color: var(--border-subtle) !important;
+}
+
+/* Map legacy hardcoded dark borders universally */
+.border-\[\#1A2232\],
+.border-\[\#1A2232\]\/50,
+.border-\[\#1A2232\]\/60,
+.border-\[\#1E293B\],
+.border-\[\#192333\],
+.border-\[\#202C3F\],
+.border-\[\#233147\],
+.border-\[\#2D3748\],
+.border-\[\#2E3C52\],
+.border-\[\#273246\],
+.border-\[\#23354D\],
+.border-\[\#33445b\] {
+  border-color: var(--border-subtle) !important;
+}
+
+/* =========================================================================
+   Custom Table Scrollbar Container (Eliminate Table Layout Explosion)
+   ========================================================================= */
+
+.table-scroll-container,
+.table-scroll,
+.overflow-x-auto {
+  overflow-x: auto !important;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-medium) var(--bg-card-subtle);
+}
+
+.table-scroll-container::-webkit-scrollbar,
+.table-scroll::-webkit-scrollbar,
+.overflow-x-auto::-webkit-scrollbar {
+  height: 7px;
+  width: 7px;
+}
+
+.table-scroll-container::-webkit-scrollbar-track,
+.table-scroll::-webkit-scrollbar-track,
+.overflow-x-auto::-webkit-scrollbar-track {
+  background: var(--bg-card-subtle);
+  border-radius: 4px;
+}
+
+.table-scroll-container::-webkit-scrollbar-thumb,
+.table-scroll::-webkit-scrollbar-thumb,
+.overflow-x-auto::-webkit-scrollbar-thumb {
+  background: var(--border-medium);
+  border-radius: 4px;
+}
+
+.table-scroll-container::-webkit-scrollbar-thumb:hover,
+.table-scroll::-webkit-scrollbar-thumb:hover,
+.overflow-x-auto::-webkit-scrollbar-thumb:hover {
+  background: var(--border-strong);
+}
+
+/* Custom Scrollbars for all elements */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-medium);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--border-strong);
+}
+
+/* =========================================================================
+   Universal Double-Mode Adapters & Contrast Normalizers
+   ========================================================================= */
+
+:root[data-theme="light"] {
+  /* Comprehensive dark backgrounds mapping */
+  .bg-\[\#0D121B\],
+  .bg-\[\#080B10\],
+  .bg-\[\#090f18\],
+  .bg-\[\#090F18\],
+  .bg-\[\#0A0F18\],
+  .bg-\[\#040813\],
+  .bg-\[\#0A1124\],
+  .bg-\[\#060B18\],
+  .bg-\[\#06090F\],
+  .bg-\[\#0A0E17\],
+  .bg-\[\#0E1420\],
+  .bg-\[\#05080E\],
+  .bg-\[\#0E131E\],
+  .bg-\[\#0B1120\],
+  .bg-\[\#0A0D14\],
+  .bg-\[\#0A0D14\]\/40,
+  .bg-\[\#0E121B\],
+  .bg-\[\#0B0F17\],
+  .bg-\[\#0E131F\],
+  .bg-\[\#0E1422\],
+  .bg-\[\#070D1C\],
+  .bg-\[\#0B1020\],
+  .bg-\[\#080E1E\],
+  .bg-\[\#080B10\]\/95,
+  .bg-\[\#060B18\]\/90,
+  .bg-\[\#0E121B\]\/95,
+  .bg-\[\#0D121B\]\/50 {
+    background-color: var(--bg-card) !important;
+  }
+
+  .bg-\[\#111c2a\],
+  .bg-\[\#111C2A\],
+  .bg-\[\#141B26\],
+  .bg-\[\#111a29\],
+  .bg-\[\#101724\],
+  .bg-\[\#151D2C\],
+  .bg-\[\#1A2232\],
+  .bg-\[\#141B28\],
+  .bg-\[\#1E2738\],
+  .bg-\[\#1A2B42\],
+  .bg-\[\#111723\],
+  .bg-zinc-800,
+  .bg-zinc-800\/30,
+  .bg-zinc-800\/50 {
+    background-color: var(--bg-card-subtle) !important;
+  }
+
+  /* Modal background gradient override in light mode */
+  .from-\[\#111a29\].to-\[\#0D121B\] {
+    --tw-gradient-from: var(--bg-card) var(--tw-gradient-from-position) !important;
+    --tw-gradient-to: var(--bg-card) var(--tw-gradient-to-position) !important;
+    background-color: var(--bg-card) !important;
+  }
+
+  /* Dividers & Borders normalization */
+  .divide-x > :not([hidden]) ~ :not([hidden]),
+  .divide-y > :not([hidden]) ~ :not([hidden]),
+  .border-\[\#1A2232\],
+  .border-\[\#162444\],
+  .border-\[\#1E2D4A\],
+  .border-\[\#33445b\],
+  .border-\[\#23354D\],
+  .border-\[\#233147\],
+  .border-\[\#273246\],
+  .border-\[\#2D3748\],
+  .border-\[\#192333\],
+  .border-\[\#161F2E\],
+  .border-\[\#20293A\],
+  .border-\[\#1E293B\],
+  .border-\[\#182644\],
+  .border-\[\#1A284A\],
+  .border-zinc-700,
+  .border-zinc-700\/30,
+  .divide-\[\#1A2232\]\/50 > * + * {
+    border-color: var(--border-subtle) !important;
+  }
+
+  /* Text Contrast Normalization for Light Mode: Eliminate unreadable white text on light backgrounds */
+  .text-white:not(.btn-primary-text):not(.badge-filled),
+  .text-zinc-100,
+  .text-zinc-200,
+  .text-zinc-300,
+  .text-slate-100,
+  .text-slate-200,
+  .text-slate-300,
+  .text-\[\#EAECEF\] {
+    color: var(--text-main) !important;
+  }
+
+  .text-\[\#707E94\],
+  .text-\[\#8997aa\],
+  .text-\[\#8A99AD\],
+  .text-\[\#6f7d91\],
+  .text-\[\#b8c4d4\],
+  .text-slate-400,
+  .text-zinc-400,
+  .text-zinc-500,
+  .text-gray-400,
+  .text-gray-500,
+  .text-\[\#556677\] {
+    color: var(--text-muted) !important;
+  }
+
+  /* High contrast for light mode labels & muted texts */
+  .text-gray-200,
+  .text-gray-300 {
+    color: var(--text-main) !important;
+  }
+
+  /* Form Elements */
+  input:not([type="checkbox"]):not([type="radio"]),
+  select,
+  textarea {
+    background-color: var(--bg-input) !important;
+    border-color: var(--border-subtle) !important;
+    color: var(--text-main) !important;
+  }
+
+  input:not([type="checkbox"]):not([type="radio"]):focus,
+  select:focus,
+  textarea:focus {
+    border-color: var(--color-brand) !important;
+    box-shadow: 0 0 0 1px var(--color-brand) !important;
+    outline: none !important;
+  }
+
+  /* Refined light-mode status banner overrides (prevent unreadable pastel on light theme) */
+  .bg-emerald-500\/10 {
+    background-color: var(--color-up-bg) !important;
+  }
+  .border-emerald-500\/20,
+  .border-emerald-500\/25,
+  .border-emerald-500\/30 {
+    border-color: var(--color-up-border) !important;
+  }
+  .text-emerald-400 {
+    color: var(--color-up) !important;
+  }
+
+  .bg-rose-500\/10 {
+    background-color: var(--color-down-bg) !important;
+  }
+  .border-rose-500\/20,
+  .border-rose-500\/25,
+  .border-rose-500\/30 {
+    border-color: var(--color-down-border) !important;
+  }
+  .text-rose-400 {
+    color: var(--color-down) !important;
+  }
+
+  .bg-amber-500\/10 {
+    background-color: var(--color-warn-bg) !important;
+  }
+  .border-amber-500\/20,
+  .border-amber-500\/25,
+  .border-amber-500\/30 {
+    border-color: var(--color-warn-border) !important;
+  }
+  .text-amber-400 {
+    color: var(--color-warn) !important;
+  }
+
+  /* Core frontdesk dashboard light-mode enhancements */
+  .hud-bento-card {
+    background-color: #FFFFFF !important;
+    border-color: var(--border-subtle) !important;
+    box-shadow: var(--shadow-card) !important;
+  }
+  .hud-bento-card:hover {
+    border-color: var(--border-medium) !important;
+  }
+
+  /* Tactical Desk light table zebra striping and crisp text */
+  .tactical-table tbody tr.tactical-row:nth-child(even) {
+    background-color: rgba(241, 245, 249, 0.45);
+  }
+  .tactical-table tbody tr.tactical-row:hover {
+    background-color: var(--bg-card-hover) !important;
+  }
+
+  /* InstrumentMatrix cards & calculus telemetry */
+  .matrix-ticker-card {
+    background-color: #FFFFFF !important;
+    box-shadow: var(--shadow-card) !important;
+  }
+  .matrix-ticker-card:hover {
+    background-color: #FFFFFF !important;
+    border-color: var(--border-strong) !important;
+    box-shadow: var(--shadow-float) !important;
+  }
+  .calculus-telemetry-grid {
+    background-color: #F8FAFC !important;
+    border-color: var(--border-subtle) !important;
+  }
+  .calculus-telemetry-grid .metric-label {
+    color: #64748B !important;
+    font-weight: 600 !important;
+  }
+}
+
+:root[data-theme="dark"] {
+  /* Harmonize all dark containers into titanium dark */
+  .bg-\[\#0D121B\],
+  .bg-\[\#080B10\],
+  .bg-\[\#090f18\],
+  .bg-\[\#090F18\],
+  .bg-\[\#040813\],
+  .bg-\[\#0A1124\],
+  .bg-\[\#060B18\],
+  .bg-\[\#0E1420\],
+  .bg-\[\#05080E\],
+  .bg-\[\#0E131E\],
+  .bg-\[\#0B1120\],
+  .bg-\[\#0A0D14\],
+  .bg-\[\#0E121B\],
+  .bg-\[\#0B0F17\],
+  .bg-\[\#0E131F\],
+  .bg-\[\#0E1422\],
+  .bg-\[\#070D1C\],
+  .bg-\[\#0B1020\],
+  .bg-\[\#080E1E\] {
+    background-color: var(--bg-card);
+  }
+
+  .divide-x > :not([hidden]) ~ :not([hidden]),
+  .divide-y > :not([hidden]) ~ :not([hidden]),
+  .border-\[\#1A2232\],
+  .border-\[\#162444\],
+  .border-\[\#1E2D4A\],
+  .border-\[\#33445b\],
+  .border-\[\#23354D\],
+  .border-\[\#233147\],
+  .border-\[\#192333\],
+  .border-\[\#161F2E\],
+  .border-\[\#20293A\],
+  .border-\[\#1E293B\],
+  .border-\[\#182644\],
+  .border-\[\#1A284A\] {
+    border-color: var(--border-subtle);
+  }
+
+  .text-\[\#707E94\],
+  .text-\[\#8997aa\],
+  .text-\[\#8A99AD\],
+  .text-\[\#6f7d91\],
+  .text-slate-400 {
+    color: var(--text-muted);
+  }
+
+  /* Prevent text-gray-500 from disappearing on deep dark background */
+  .text-gray-500 {
+    color: #8C9BAE !important;
+  }
+}
+
+/* =========================================================================
+   Unified Quantitative Micro-Components System (Theme-Aware & Crisp)
+   ========================================================================= */
+
+/* 1. Leverage Badge (e.g. 3x, 5x, 10x) */
+.badge-lever {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background-color: var(--bg-badge);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-main);
+  letter-spacing: -0.02em;
+}
+
+/* OCO Stop-loss indicator badge */
+.badge-oco-sl {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 7px;
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  border: 1px solid var(--border-subtle);
+  background-color: var(--bg-badge);
+  line-height: 1.2;
+}
+
+/* Pending order badge */
+.badge-pending-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-weight: 700;
+  padding: 3px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--color-brand-border);
+  background-color: var(--color-brand-bg);
+  color: var(--color-brand);
+}
+
+/* 2. Direction Capsules (Long / Short) */
+.capsule-direction-long {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2.5px 8px;
+  border-radius: 4px;
+  background-color: var(--color-up-bg);
+  border: 1px solid var(--color-up-border);
+  color: var(--color-up);
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.capsule-direction-short {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2.5px 8px;
+  border-radius: 4px;
+  background-color: var(--color-down-bg);
+  border: 1px solid var(--color-down-border);
+  color: var(--color-down);
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+/* 3. Strategy & Policy Badges */
+.badge-strategy {
+  display: inline-flex;
+  align-items: center;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 3px;
+  background-color: var(--bg-badge);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  line-height: 1.2;
+  width: fit-content;
+}
+
+.badge-policy-hash {
+  display: inline-flex;
+  align-items: center;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 9px;
+  font-weight: 600;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background-color: rgba(6, 182, 212, 0.08);
+  border: 1px solid rgba(6, 182, 212, 0.25);
+  color: #22d3ee;
+  line-height: 1.2;
+}
+
+/* 4. Compact Secondary Page Subheader Banner */
+.panel-banner-compact {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border-subtle);
+  background-color: var(--bg-card);
+  transition: background-color 0.2s ease, border-color 0.2s ease;
+}
+
+@media (min-width: 640px) {
+  .panel-banner-compact {
+    padding: 12px 16px;
+  }
+}
+
+.panel-banner-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 5px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  background-color: var(--bg-card-subtle);
+  border: 1px solid var(--border-medium);
+  color: var(--text-main);
+}
+
+/* 5. Institutional Admin Button System */
+.btn-admin-primary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  font-weight: 700;
+  height: 30px;
+  padding: 0 12px;
+  border-radius: 4px;
+  background-color: var(--text-main);
+  color: var(--bg-app);
+  border: 1px solid var(--text-main);
+  cursor: pointer;
+  transition: opacity 0.15s ease, background-color 0.15s ease;
+  white-space: nowrap;
+}
+
+.btn-admin-primary:hover {
+  opacity: 0.92;
+}
+
+.btn-admin-secondary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  font-weight: 600;
+  height: 30px;
+  padding: 0 12px;
+  border-radius: 4px;
+  background-color: var(--bg-card-subtle);
+  color: var(--text-main);
+  border: 1px solid var(--border-medium);
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+  white-space: nowrap;
+}
+
+.btn-admin-secondary:hover {
+  background-color: var(--bg-card-hover);
+  border-color: var(--border-strong);
+}
+
+.btn-admin-danger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  font-weight: 600;
+  height: 30px;
+  padding: 0 12px;
+  border-radius: 4px;
+  background-color: var(--color-down-bg);
+  color: var(--color-down);
+  border: 1px solid var(--color-down-border);
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+  white-space: nowrap;
+}
+
+.btn-admin-danger:hover {
+  background-color: rgba(244, 63, 94, 0.18);
+}
+
+

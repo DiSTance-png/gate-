@@ -1,0 +1,171 @@
+import importlib
+import sys
+
+import pytest
+from fastapi.testclient import TestClient
+
+from gate_quant.client import GateFuturesClient
+from gate_quant.config import GateSettings, load_settings
+
+
+class CaptureSession:
+    def __init__(self, response):
+        self.response = response
+        self.calls = []
+
+    def request(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        response_payload = self.response
+
+        class Response:
+            content = b"{}"
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return response_payload
+
+        return Response()
+
+
+def configured_settings(**overrides):
+    values = {
+        "environment": "testnet",
+        "api_key": "test-key",
+        "api_secret": "test-secret",
+        "max_position_notional_usd": 1000,
+        "max_total_margin_usd": 100,
+        "max_order_margin_usd": 25,
+    }
+    values.update(overrides)
+    return GateSettings(**values)
+
+
+def test_credentials_are_selected_only_for_active_environment(monkeypatch):
+    monkeypatch.setenv("GATE_TESTNET_API_KEY", "test-key")
+    monkeypatch.setenv("GATE_TESTNET_API_SECRET", "test-secret")
+    monkeypatch.setenv("GATE_LIVE_API_KEY", "live-key")
+    monkeypatch.setenv("GATE_LIVE_API_SECRET", "live-secret")
+    monkeypatch.setenv("GATE_ENVIRONMENT", "testnet")
+    monkeypatch.setenv("GATE_LIVE_TRADING_ENABLED", "false")
+    selected = load_settings()
+    assert (selected.api_key, selected.api_secret) == ("test-key", "test-secret")
+
+    monkeypatch.setenv("GATE_ENVIRONMENT", "live")
+    monkeypatch.setenv("GATE_LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("GATE_PUBLIC_MARKET_ENV", "live")
+    selected = load_settings()
+    assert (selected.api_key, selected.api_secret) == ("live-key", "live-secret")
+
+
+def test_native_gate_order_and_price_order_paths():
+    session = CaptureSession({"id": "1"})
+    client = GateFuturesClient(configured_settings(), session)
+    client.create_order(contract="BTC_USDT", size=1, client_id="t-offline-order")
+    client.create_protection_order(contract="BTC_USDT", size=-1, trigger_price="50000", rule=2, client_id="t-offline-stop")
+
+    assert session.calls[0][1].endswith("/api/v4/futures/usdt/orders")
+    assert session.calls[1][1].endswith("/api/v4/futures/usdt/price_orders")
+    assert '"text":"t-offline-order"' in session.calls[0][2]["data"]
+    assert '"trigger":{"price":"50000","rule":2' in session.calls[1][2]["data"]
+
+
+def test_gate_limit_order_and_cross_leverage_use_native_fields():
+    session = CaptureSession({"id": "1"})
+    client = GateFuturesClient(configured_settings(), session)
+    client.update_position_leverage(contract="SOL_USDT", leverage=4, cross_margin=True)
+    client.create_order(contract="SOL_USDT", size=7, price="103.5", tif="gtc", client_id="t-limit")
+
+    method, url, kwargs = session.calls[0]
+    assert method == "POST"
+    assert url.endswith("/api/v4/futures/usdt/positions/SOL_USDT/leverage")
+    assert kwargs["params"] == {"leverage": "0", "cross_leverage_limit": "4"}
+    payload = session.calls[1][2]["data"]
+    assert '"size":7' in payload
+    assert '"price":"103.5"' in payload
+    assert '"tif":"gtc"' in payload
+
+
+def test_gate_decimal_size_is_sent_as_native_json_number():
+    session = CaptureSession({"id": "1"})
+    client = GateFuturesClient(configured_settings(), session)
+    client.create_order(contract="SOL_USDT", size=0.4, price="103.5", tif="gtc", client_id="t-decimal")
+    client.create_protection_order(contract="SOL_USDT", size=-0.4, trigger_price="100", rule=2, client_id="t-decimal-sl")
+    assert '"size":0.4' in session.calls[0][2]["data"]
+    assert '"size":-0.4' in session.calls[1][2]["data"]
+
+
+def test_position_not_found_is_a_gate_empty_position_condition():
+    assert "POSITION_NOT_FOUND" in "Gate API POSITION_NOT_FOUND: Bad Request (HTTP 400)"
+
+
+def test_gate_admin_routes_require_authentication(monkeypatch):
+    monkeypatch.setenv("GATE_SSH_TUNNEL_ENABLED", "false")
+    from gate_quant.web import app
+
+    response = TestClient(app).get("/api/v1/admin/gate/runtime")
+    assert response.status_code == 401
+
+
+def test_live_read_only_config_is_allowed_without_trading_switch(monkeypatch):
+    import gate_quant.web as web
+
+    monkeypatch.setattr(web, "_require_control_admin", lambda token: {"username": "tester"})
+    captured = {}
+    monkeypatch.setattr(web, "_update_env", lambda values: captured.update(values))
+    monkeypatch.setattr(web, "load_settings", lambda: configured_settings(environment="live", api_key="live-key", api_secret="live-secret", public_market_environment="live"))
+    monkeypatch.setattr(web.store, "add", lambda *args, **kwargs: None)
+    payload = web.GateAdminConfig(
+        environment="live",
+        live_trading_enabled=False,
+        max_position_notional_usd=1000,
+        max_total_margin_usd=100,
+        max_order_margin_usd=25,
+    )
+    result = web.gate_admin_config(payload, None)
+    assert result["environment"] == "live"
+    assert captured["GATE_LIVE_TRADING_ENABLED"] == "false"
+
+
+def test_gate_import_does_not_start_legacy_dashboard_worker():
+    sys.modules.pop("dashboard.app", None)
+    module = importlib.reload(importlib.import_module("gate_quant.web"))
+    assert module.app.title == "Gate Quantum Trading System"
+    assert "dashboard.app" not in sys.modules
+
+
+def test_required_proxy_fails_closed():
+    with pytest.raises(ValueError, match="GATE_PROXY_URL is required"):
+        configured_settings(proxy_url=None, require_proxy=True).validate()
+
+
+def test_api_v4_base_url_override_is_validated():
+    custom = configured_settings(testnet_base_url="https://fx-api-testnet.gateio.ws/api/v4")
+    custom.validate()
+    with pytest.raises(ValueError, match="GATE_TESTNET_BASE_URL"):
+        configured_settings(testnet_base_url="https://example.com").validate()
+
+
+def test_account_book_uses_gate_native_endpoint():
+    session = CaptureSession([])
+    client = GateFuturesClient(configured_settings(), session)
+    client.account_book(from_time=100, to_time=200, limit=1000)
+    method, url, kwargs = session.calls[0]
+    assert url.endswith("/api/v4/futures/usdt/account_book")
+    assert kwargs["params"] == {"limit": 1000, "from": 100, "to": 200}
+
+
+def test_position_close_uses_gate_native_endpoint():
+    session = CaptureSession([])
+    client = GateFuturesClient(configured_settings(), session)
+    client.position_close(contract="BTC_USDT", limit=25)
+    assert session.calls[0][1].endswith("/api/v4/futures/usdt/position_close")
+    assert session.calls[0][2]["params"] == {"limit": 25, "contract": "BTC_USDT"}
+
+
+def test_order_list_uses_official_offset_pagination():
+    session = CaptureSession([])
+    client = GateFuturesClient(configured_settings(), session)
+    client.list_orders(status="finished", limit=25, page=3)
+    assert session.calls[0][2]["params"] == {"status": "finished", "limit": 25, "offset": 50}

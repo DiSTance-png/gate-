@@ -1,0 +1,474 @@
+<script setup lang="ts">
+import { ref, computed, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
+import { useApi } from '../../composables/useApi'
+import { useAuthStore } from '../../stores/auth'
+import { APP_VERSION } from '../../config/version'
+import {
+  Cpu,
+  Database,
+  Activity,
+  Server,
+  ShieldCheck,
+  RefreshCw,
+  ArrowRight,
+  FileText,
+  Users,
+  Layers,
+  Clock,
+  CheckCircle2,
+  AlertCircle,
+} from 'lucide-vue-next'
+
+const router = useRouter()
+const { api } = useApi()
+const auth = useAuthStore()
+const runtime = ref<any>(null)
+const loading = ref(true)
+const loadError = ref('')
+
+function duration(s: number | null): string {
+  if (s == null) return '--'
+  if (s < 60) return `${s}s`
+  if (s < 3600) return `${Math.floor(s / 60)}m`
+  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`
+}
+
+function decisionTime(value: unknown): string {
+  if (value == null || value === '') return '--'
+  const numeric = Number(value)
+  if (Number.isFinite(numeric) && numeric > 1e12) {
+    return new Date(numeric).toLocaleTimeString('zh-CN', { hour12: false })
+  }
+  const text = String(value)
+  return text.length >= 19 ? text.substring(11, 19) : text
+}
+
+function confidencePercent(value: unknown): number {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return 0
+  const percent = Math.abs(numeric) <= 1 ? numeric * 100 : numeric
+  return Math.max(0, Math.min(100, percent))
+}
+
+const formattedDecisions = computed(() => {
+  const d = runtime.value?.full_decisions
+  if (!d) return []
+  if (Array.isArray(d)) {
+    return d.map((item: any) => ({
+      ...item,
+      confidence: confidencePercent(item?.decision?.confidence ?? item?.confidence) / 100,
+    }))
+  }
+  if (typeof d === 'object') {
+    return Object.entries(d).map(([k, v]: [string, any]) => ({
+      instId: v.instId || k,
+      action: v.decision?.action || v.action || 'WAIT',
+      confidence: confidencePercent(v.decision?.confidence ?? v.confidence) / 100,
+      timestamp: v.time_str || (v.timestamp ? String(v.timestamp) : '--'),
+      reason: v.decision?.summary_reason || v.thought_process?.market_structure || v.reason || '',
+    }))
+  }
+  return []
+})
+
+const dataHealthFiles = computed(() => {
+  const dh = runtime.value?.data_health
+  if (!dh) return []
+  if (Array.isArray(dh)) return dh
+  if (Array.isArray(dh.files)) return dh.files
+  return []
+})
+
+const dataHealthOverall = computed(() => {
+  const dh = runtime.value?.data_health
+  if (!dh) return 'UNKNOWN'
+  if (typeof dh === 'object' && dh.overall) return dh.overall
+  if (Array.isArray(dh)) {
+    return dh.every((f: any) => f.fresh) ? 'LIVE' : 'STALE'
+  }
+  return 'UNKNOWN'
+})
+
+async function loadRuntime() {
+  loading.value = true
+  loadError.value = ''
+  try {
+    const [rt, cfg] = await Promise.all([
+      api('/api/v1/admin/runtime').catch(() => null),
+      api('/api/v1/admin/config').catch(() => null),
+    ])
+    if (!rt) throw new Error('管理员会话已失效，请重新登录')
+    if (rt) {
+      if (cfg?.configuration) {
+        rt.configuration = { ...cfg.configuration, ...(rt?.configuration || {}) }
+      }
+      runtime.value = rt
+    }
+  } catch (e: any) {
+    console.error('Failed to load runtime:', e)
+    loadError.value = e?.message || '控制面运行态读取失败'
+    if (!auth.isAuthenticated || String(loadError.value).includes('会话')) {
+      window.setTimeout(() => router.replace('/admin/login'), 250)
+    }
+  } finally {
+    loading.value = false
+  }
+}
+
+onMounted(() => {
+  loadRuntime()
+})
+
+const quickNav = [
+  { label: '提示词策略工作室', desc: '语义变量与预设方案', route: '/admin/promptlib', icon: FileText },
+  { label: '物理拦截插件', desc: 'Fail-Closed 风险拦截器', route: '/admin/interceptors', icon: ShieldCheck },
+  { label: '多模型决策委员会', desc: '博弈仲裁与思考链透视', route: '/admin/council', icon: Users },
+  { label: '模型连接配置', desc: '供应商与思考强度', route: '/admin/llm', icon: Cpu },
+]
+</script>
+
+<template>
+  <div class="space-y-4 2xl:space-y-6 max-w-[2048px] mx-auto">
+    <!-- Top Executive Header Strip -->
+    <div class="panel-banner-compact">
+      <div class="flex items-center space-x-2.5">
+        <div class="panel-banner-icon">
+          <Activity class="w-3.5 h-3.5" />
+        </div>
+        <div>
+          <div class="flex items-center space-x-2">
+            <h1 class="text-xs sm:text-[13px] 2xl:text-sm font-black font-mono tracking-wide" style="color: var(--text-main);">
+              GATE QUANTUM CONTROL CENTER
+            </h1>
+            <span class="badge-lever">
+              {{ APP_VERSION }}
+            </span>
+          </div>
+          <p class="text-[11px] 2xl:text-xs font-mono mt-0.5" style="color: var(--text-muted);">
+            交易引擎、微积分动力学、数据健康与物理拦截门禁全景监控
+          </p>
+        </div>
+      </div>
+
+      <div class="flex items-center space-x-2">
+        <button
+          @click="loadRuntime"
+          :disabled="loading"
+          class="btn-admin-secondary text-xs disabled:opacity-50"
+        >
+          <RefreshCw class="w-3 h-3" :class="loading ? 'animate-spin' : ''" />
+          <span>刷新状态</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Loading State -->
+    <div v-if="loading" class="py-16 text-center text-xs font-mono" style="color: var(--text-muted);">
+      <RefreshCw class="w-6 h-6 animate-spin mx-auto mb-2" style="color: var(--color-brand);" />
+      <span>正在拉取最新控制面运行态...</span>
+    </div>
+
+    <!-- Runtime Data -->
+    <template v-else-if="runtime">
+      <!-- 4 High-Density Metric Bento Cards -->
+      <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 2xl:gap-4">
+        <!-- 1. 服务状态 -->
+        <div
+          class="rounded-xl border p-4 2xl:p-5 shadow-xs transition-colors"
+          style="background-color: var(--bg-card); border-color: var(--border-subtle);"
+        >
+          <div class="flex items-center justify-between mb-2">
+            <span class="text-[11px] 2xl:text-xs font-mono" style="color: var(--text-muted);">后台服务进程</span>
+            <div
+              class="w-6 h-6 2xl:w-7 2xl:h-7 rounded-md flex items-center justify-center border"
+              style="background-color: var(--color-up-bg); border-color: var(--color-up-border); color: var(--color-up);"
+            >
+              <Server class="w-3.5 h-3.5 2xl:w-4 2xl:h-4" />
+            </div>
+          </div>
+          <div class="text-xl sm:text-2xl 2xl:text-3xl font-black font-mono tracking-tight" style="color: var(--color-up);">
+            ONLINE
+          </div>
+          <div class="text-[10px] 2xl:text-[11px] font-mono mt-1" style="color: var(--text-faint);">
+            PID {{ runtime.service?.pid || '--' }} · FastAPI V5
+          </div>
+        </div>
+
+        <!-- 2. 运行时间 -->
+        <div
+          class="rounded-xl border p-4 2xl:p-5 shadow-xs transition-colors"
+          style="background-color: var(--bg-card); border-color: var(--border-subtle);"
+        >
+          <div class="flex items-center justify-between mb-2">
+            <span class="text-[11px] 2xl:text-xs font-mono" style="color: var(--text-muted);">引擎持续运行</span>
+            <div
+              class="w-6 h-6 2xl:w-7 2xl:h-7 rounded-md flex items-center justify-center border"
+              style="background-color: var(--color-brand-bg); border-color: var(--color-brand-border); color: var(--color-brand);"
+            >
+              <Activity class="w-3.5 h-3.5 2xl:w-4 2xl:h-4" />
+            </div>
+          </div>
+          <div class="text-xl sm:text-2xl 2xl:text-3xl font-black font-mono tracking-tight num-tabular" style="color: var(--text-main);">
+            {{ duration(runtime.service?.uptime_seconds) }}
+          </div>
+          <div class="text-[10px] 2xl:text-[11px] font-mono mt-1" style="color: var(--text-faint);">
+            已运行秒数 {{ runtime.service?.uptime_seconds || 0 }}s
+          </div>
+        </div>
+
+        <!-- 3. LLM 核心主脑 -->
+        <div
+          class="rounded-xl border p-4 2xl:p-5 shadow-xs transition-colors cursor-pointer group"
+          style="background-color: var(--bg-card); border-color: var(--border-subtle);"
+          @click="router.push('/admin/llm')"
+        >
+          <div class="flex items-center justify-between mb-2">
+            <span class="text-[11px] 2xl:text-xs font-mono" style="color: var(--text-muted);">决策主脑模型</span>
+            <div
+              class="w-6 h-6 2xl:w-7 2xl:h-7 rounded-md flex items-center justify-center border"
+              style="background-color: var(--bg-badge); border-color: var(--border-subtle); color: var(--text-main);"
+            >
+              <Cpu class="w-3.5 h-3.5 2xl:w-4 2xl:h-4" />
+            </div>
+          </div>
+          <div class="text-sm sm:text-base 2xl:text-lg font-black font-mono truncate" style="color: var(--text-main);">
+            {{ runtime.llm_runtime?.active_model || runtime.llm_runtime?.model || (runtime.exchange === 'gate' ? 'Gate AI Worker' : '未配置') }}
+          </div>
+          <div class="text-[10px] 2xl:text-[11px] font-mono mt-1 flex items-center space-x-1.5" style="color: var(--text-faint);">
+            <span>推理思考: {{ runtime.llm_runtime?.active_reasoning_effort || runtime.llm_runtime?.reasoning_effort || (runtime.exchange === 'gate' ? 'native' : '未配置') }}</span>
+            <span>·</span>
+            <span class="text-indigo-400 group-hover:underline">配置通道 →</span>
+          </div>
+        </div>
+
+        <!-- 4. 交易所环境与授权 -->
+        <div
+          class="rounded-xl border p-4 2xl:p-5 shadow-xs transition-colors cursor-pointer group"
+          style="background-color: var(--bg-card); border-color: var(--border-subtle);"
+          @click="router.push('/admin/security')"
+        >
+          <div class="flex items-center justify-between mb-2">
+            <span class="text-[11px] 2xl:text-xs font-mono" style="color: var(--text-muted);">Gate 连接环境</span>
+            <div
+              class="w-6 h-6 2xl:w-7 2xl:h-7 rounded-md flex items-center justify-center border"
+              style="background-color: var(--bg-badge); border-color: var(--border-subtle); color: var(--text-main);"
+            >
+              <Database class="w-3.5 h-3.5 2xl:w-4 2xl:h-4" />
+            </div>
+          </div>
+          <div class="text-xl sm:text-2xl 2xl:text-3xl font-black font-mono tracking-tight" style="color: var(--color-brand);">
+            {{ runtime.exchange === 'gate' ? (runtime.environment || 'TESTNET').toUpperCase() : (runtime.credentials?.simulated_trading ? 'TESTNET' : 'LIVE') }}
+          </div>
+          <div class="text-[10px] 2xl:text-[11px] font-mono mt-1 flex items-center space-x-1" style="color: var(--text-faint);">
+            <span :class="runtime.credentials?.gate ? 'text-emerald-400' : 'text-amber-400'">
+              ● {{ runtime.credentials?.gate ? 'Gate API 凭证就绪' : 'Gate 原生只读模式' }}
+            </span>
+            <span>·</span>
+            <span class="text-indigo-400 group-hover:underline">账户管理 →</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Quick Nav Action Deck -->
+      <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 2xl:gap-4">
+        <button
+          v-for="nav in quickNav"
+          :key="nav.route"
+          @click="router.push(nav.route)"
+          class="p-3.5 2xl:p-4 rounded-xl border flex items-center justify-between transition-all cursor-pointer text-left group"
+          style="background-color: var(--bg-card); border-color: var(--border-subtle);"
+        >
+          <div class="flex items-center space-x-3">
+            <div
+              class="w-8 h-8 2xl:w-9 2xl:h-9 rounded-lg flex items-center justify-center border shrink-0 transition-transform group-hover:scale-105"
+              style="background-color: var(--bg-card-subtle); border-color: var(--border-medium); color: var(--text-main);"
+            >
+              <component :is="nav.icon" class="w-4 h-4 2xl:w-4.5 2xl:h-4.5" />
+            </div>
+            <div>
+              <div class="text-xs 2xl:text-sm font-black font-mono group-hover:text-blue-500 transition-colors" style="color: var(--text-main);">
+                {{ nav.label }}
+              </div>
+              <div class="text-[10px] 2xl:text-[11px] font-mono truncate" style="color: var(--text-faint);">
+                {{ nav.desc }}
+              </div>
+            </div>
+          </div>
+          <ArrowRight class="w-3.5 h-3.5 shrink-0 transition-transform group-hover:translate-x-0.5" style="color: var(--text-faint);" />
+        </button>
+      </div>
+
+      <!-- Main Dual Panel: LLM Decision Audit & Data Freshness -->
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 2xl:gap-5">
+        <!-- Left: Full Decisions Audit (2 Columns) -->
+        <div
+          class="lg:col-span-2 rounded-xl border p-4 sm:p-5 2xl:p-6 shadow-xs transition-colors flex flex-col justify-between"
+          style="background-color: var(--bg-card); border-color: var(--border-subtle);"
+        >
+          <div>
+            <div class="flex items-center justify-between pb-3 mb-3 border-b" style="border-color: var(--border-subtle);">
+              <div class="flex items-center space-x-2">
+                <Layers class="w-4 h-4" style="color: var(--color-brand);" />
+                <h2 class="text-xs font-black font-mono uppercase tracking-wider" style="color: var(--text-main);">
+                  大模型决策态势全景 (Realtime Brain Status)
+                </h2>
+              </div>
+              <button
+                @click="router.push('/admin/decisions')"
+                class="text-xs font-mono flex items-center space-x-1 cursor-pointer transition-colors"
+                style="color: var(--color-brand);"
+              >
+                <span>完整推演日志</span>
+                <ArrowRight class="w-3 h-3" />
+              </button>
+            </div>
+
+            <!-- Decisions List -->
+            <div v-if="formattedDecisions.length" class="space-y-2">
+              <div
+                v-for="d in formattedDecisions"
+                :key="d.instId"
+                class="p-3 rounded-lg border font-mono text-xs transition-colors"
+                style="background-color: var(--bg-card-subtle); border-color: var(--border-subtle);"
+              >
+                <div class="flex items-center justify-between">
+                  <div class="flex items-center space-x-2">
+                    <span class="font-black text-sm" style="color: var(--text-main);">{{ d.instId }}</span>
+                    <span
+                      class="px-2 py-0.5 rounded-[3px] text-[10px] font-mono font-bold border"
+                      :style="{
+                        backgroundColor: d.action?.includes('BUY') ? 'var(--color-up-bg)' : d.action?.includes('SELL') ? 'var(--color-down-bg)' : 'var(--bg-badge)',
+                        borderColor: d.action?.includes('BUY') ? 'var(--color-up-border)' : d.action?.includes('SELL') ? 'var(--color-down-border)' : 'var(--border-subtle)',
+                        color: d.action?.includes('BUY') ? 'var(--color-up)' : d.action?.includes('SELL') ? 'var(--color-down)' : 'var(--text-muted)'
+                      }"
+                    >
+                      {{ d.action || '观望 HOLD' }}
+                    </span>
+                    <span v-if="d.confidence" class="text-[10px]" style="color: var(--text-faint);">
+                      置信度 {{ Math.round(d.confidence * 100) }}%
+                    </span>
+                  </div>
+                  <div class="text-[10px]" style="color: var(--text-faint);">
+                    {{ decisionTime(d.timestamp) }}
+                  </div>
+                </div>
+                <div class="mt-2 text-xs font-sans line-clamp-2 leading-relaxed" style="color: var(--text-muted);">
+                  {{ d.reason || '大模型评估当前动能结构未达到击穿阈值，顺势风控保持被动防御。' }}
+                </div>
+              </div>
+            </div>
+            <div v-else class="py-12 text-center text-xs font-mono" style="color: var(--text-muted);">
+              暂无巡检决策记录，等待下轮 15M 定时任务...
+            </div>
+          </div>
+        </div>
+
+        <!-- Right: Data Health Monitor (1 Column) -->
+        <div
+          class="rounded-xl border p-4 sm:p-5 2xl:p-6 shadow-xs transition-colors flex flex-col justify-between"
+          style="background-color: var(--bg-card); border-color: var(--border-subtle);"
+        >
+          <div>
+            <div class="flex items-center justify-between pb-3 mb-3 border-b" style="border-color: var(--border-subtle);">
+              <div class="flex items-center space-x-2">
+                <Clock class="w-4 h-4" style="color: var(--color-brand);" />
+                <h2 class="text-xs font-black font-mono uppercase tracking-wider" style="color: var(--text-main);">
+                  关键数据管道时效 (Data Health)
+                </h2>
+              </div>
+              <span
+                class="px-2 py-0.5 rounded text-[10px] font-mono font-bold border"
+                :style="{
+                  backgroundColor: dataHealthOverall === 'LIVE' ? 'var(--color-up-bg)' : 'var(--color-down-bg)',
+                  borderColor: dataHealthOverall === 'LIVE' ? 'var(--color-up-border)' : 'var(--color-down-border)',
+                  color: dataHealthOverall === 'LIVE' ? 'var(--color-up)' : 'var(--color-down)'
+                }"
+              >
+                {{ dataHealthOverall }}
+              </span>
+            </div>
+
+            <table class="w-full text-left font-mono text-xs border-collapse">
+              <thead>
+                <tr class="border-b text-[10px] uppercase" style="border-color: var(--border-subtle); color: var(--text-faint);">
+                  <th class="pb-2 font-medium">通道来源</th>
+                  <th class="pb-2 font-medium">状态</th>
+                  <th class="pb-2 font-medium">更新延时</th>
+                  <th class="pb-2 text-right font-medium">字节数</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y" style="border-color: var(--border-subtle);">
+                <tr
+                  v-for="(x, idx) in dataHealthFiles"
+                  :key="idx"
+                  class="hover:bg-[var(--bg-card-subtle)] transition-colors"
+                >
+                  <td class="py-2.5 font-bold" style="color: var(--text-main);">
+                    {{ x.file || x.name }}
+                  </td>
+                  <td class="py-2.5">
+                    <span
+                      class="px-2 py-0.5 rounded-[3px] text-[10px] font-mono font-bold border inline-flex items-center space-x-1"
+                      :style="{
+                        backgroundColor: x.fresh ? 'var(--color-up-bg)' : 'var(--color-down-bg)',
+                        borderColor: x.fresh ? 'var(--color-up-border)' : 'var(--color-down-border)',
+                        color: x.fresh ? 'var(--color-up)' : 'var(--color-down)'
+                      }"
+                    >
+                      <CheckCircle2 v-if="x.fresh" class="w-2.5 h-2.5" />
+                      <AlertCircle v-else class="w-2.5 h-2.5" />
+                      <span>{{ x.fresh ? '正常' : '延迟' }}</span>
+                    </span>
+                  </td>
+                  <td class="py-2.5 num-tabular" style="color: var(--text-muted);">
+                    {{ duration(x.age_seconds) }}
+                  </td>
+                  <td class="py-2.5 text-right font-mono num-tabular" style="color: var(--text-muted);">
+                    {{ x.bytes ? Math.round(x.bytes / 1024) + ' KB' : '--' }}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Security & Config Cards -->
+      <div
+        class="rounded-xl border p-4 sm:p-5 shadow-xs transition-colors"
+        style="background-color: var(--bg-card); border-color: var(--border-subtle);"
+      >
+        <div class="flex items-center justify-between pb-3 mb-3 border-b" style="border-color: var(--border-subtle);">
+          <div class="flex items-center space-x-2">
+            <ShieldCheck class="w-4 h-4 text-emerald-500" />
+            <h2 class="text-xs font-black font-mono uppercase tracking-wider" style="color: var(--text-main);">
+              生产环境核心安全配置
+            </h2>
+          </div>
+          <span class="text-[10px] font-mono" style="color: var(--text-faint);">敏感 Key 已脱敏防泄露保护</span>
+        </div>
+
+        <div v-if="runtime.configuration && Object.keys(runtime.configuration).length" class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6 gap-3">
+          <div
+            v-for="(v, k) in runtime.configuration"
+            :key="k"
+            class="rounded-lg border p-3 font-mono transition-colors"
+            style="background-color: var(--bg-card-subtle); border-color: var(--border-subtle);"
+          >
+            <div class="text-[10px] uppercase truncate font-medium" style="color: var(--text-faint);">{{ k }}</div>
+            <div class="text-xs font-bold truncate mt-1.5" style="color: var(--text-main);" :title="String(v)">{{ v || '未配置' }}</div>
+          </div>
+        </div>
+        <div v-else class="py-6 text-center text-xs font-mono" style="color: var(--text-muted);">
+          正在拉取核心安全配置...
+        </div>
+      </div>
+    </template>
+    <div v-else class="py-16 text-center text-xs font-mono" style="color: var(--text-muted);">
+      <AlertCircle class="w-7 h-7 mx-auto mb-3" style="color: var(--color-down);" />
+      <div style="color: var(--color-down);">{{ loadError || '控制面暂无可用数据' }}</div>
+      <div class="mt-2">正在返回管理员登录页…</div>
+    </div>
+  </div>
+</template>
