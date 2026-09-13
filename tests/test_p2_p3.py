@@ -90,3 +90,16 @@ def test_trader_heartbeat_reports_freshness(monkeypatch):
     status = web._heartbeat_status()
     assert status["age_seconds"] == 100
     assert status["fresh"] is True
+
+
+def test_dashboard_protection_orders_classify_linked_and_orphan():
+    protections = [
+        {"id_string": "1", "status": "open", "create_time": 100, "trigger": {"rule": 1, "price": "3000"}, "initial": {"contract": "ETH_USDT", "size": -4, "is_reduce_only": True, "text": "t-gate-tp-1"}},
+        {"id_string": "2", "status": "open", "create_time": 101, "trigger": {"rule": 2, "price": "2000"}, "initial": {"contract": "ETH_USDT", "size": -4, "is_reduce_only": True, "text": "t-gate-sl-1"}},
+        {"id_string": "90071992547409930", "status": "open", "create_time": 102, "trigger": {"rule": 2, "price": "70000"}, "initial": {"contract": "BTC_USDT", "size": -10, "is_reduce_only": True, "text": "t-gate-sl-2"}},
+    ]
+    rows = web._dashboard_protection_orders(protections, [{"contract": "ETH_USDT", "size": 4}])
+    assert [(row["kind"], row["relation"]) for row in rows] == [
+        ("take_profit", "linked"), ("stop_loss", "linked"), ("stop_loss", "orphan")
+    ]
+    assert rows[2]["order_id"] == "90071992547409930"

@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import type { DashboardResponse, InstrumentFactor, PositionItem, PendingOrderItem } from '../types/dashboard'
+import type { DashboardResponse, InstrumentFactor, PositionItem, PendingOrderItem, ProtectionOrderItem } from '../types/dashboard'
 
 export const useDashboardStore = defineStore('dashboard', () => {
   const activeTab = ref<'trading' | 'factors' | 'news' | 'lab' | 'history'>('trading')
@@ -17,6 +17,7 @@ export const useDashboardStore = defineStore('dashboard', () => {
   const account = computed(() => data.value?.account || null)
   const positions = computed<PositionItem[]>(() => data.value?.positions_summary?.items || [])
   const pendingOrders = computed<PendingOrderItem[]>(() => data.value?.pending_orders || [])
+  const protectionOrders = computed<ProtectionOrderItem[]>(() => data.value?.protection_orders_normalized || [])
   const factors = computed<InstrumentFactor[]>(() => {
     const rawFactors = data.value?.factors || []
     const libInstruments: any[] = (data.value as any)?.factor_library?.instruments || (data.value as any)?.factor_library_snapshot?.instruments || []
@@ -142,6 +143,7 @@ export const useDashboardStore = defineStore('dashboard', () => {
     account,
     positions,
     pendingOrders,
+    protectionOrders,
     factors,
     factorLibrary,
     macroAssessment,

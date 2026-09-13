@@ -7,6 +7,7 @@ import { APP_VERSION, APP_NAME } from '../config/version'
 import HeaderBar from '../components/HeaderBar.vue'
 import TopHudRibbon from '../components/TopHudRibbon.vue'
 import TacticalDesk from '../components/TacticalDesk.vue'
+import ProtectionOrders from '../components/ProtectionOrders.vue'
 import InstrumentMatrix from '../components/InstrumentMatrix.vue'
 import LedgerLogs from '../components/LedgerLogs.vue'
 import NewsIntelligence from '../components/NewsIntelligence.vue'
@@ -145,6 +146,7 @@ function setLayout(mode: 'dual' | 'stacked') {
             <TopHudRibbon />
             <!-- 2. Integrated Interactive Tactical Desk (Positions + Orders) -->
             <TacticalDesk />
+            <ProtectionOrders />
           </div>
 
           <!-- Right Wing: 6-Asset Live Dynamics Radar (40% width on desktop, 38% on 2K wide displays) -->
@@ -157,6 +159,7 @@ function setLayout(mode: 'dual' | 'stacked') {
         <div v-else class="space-y-3.5">
           <TopHudRibbon />
           <TacticalDesk />
+          <ProtectionOrders />
           <InstrumentMatrix :layout-mode="layoutMode" />
         </div>
       </div>

@@ -46,6 +46,18 @@ export interface PendingOrderItem {
   slTriggerPx?: string
 }
 
+export interface ProtectionOrderItem {
+  order_id: string
+  contract: string
+  kind: 'take_profit' | 'stop_loss' | 'plan'
+  trigger_price: string
+  size: string
+  status: string
+  relation: 'linked' | 'orphan'
+  reduce_only: boolean
+  created_at_ms: number
+}
+
 export interface InstrumentFactor {
   instId: string
   name: string
@@ -112,6 +124,7 @@ export interface DashboardResponse {
     items: PositionItem[]
   }
   pending_orders: PendingOrderItem[]
+  protection_orders_normalized?: ProtectionOrderItem[]
   factors: InstrumentFactor[]
   macro_assessment?: string
   llm_runtime?: LLMRuntime

@@ -62,6 +62,43 @@ def _heartbeat_status() -> dict[str, Any]:
     age_seconds = max(0, int(time.time() - timestamp_ms / 1000)) if timestamp_ms else None
     return {**heartbeat, "age_seconds": age_seconds, "fresh": bool(age_seconds is not None and age_seconds <= 20 * 60)}
 
+
+def _dashboard_protection_orders(protections: list[dict], positions: list[dict]) -> list[dict[str, Any]]:
+    active = {
+        str(row.get("contract") or "").upper(): float(row.get("size") or 0)
+        for row in positions if float(row.get("size") or 0) != 0
+    }
+    result = []
+    for row in protections:
+        initial = row.get("initial") or {}
+        trigger = row.get("trigger") or {}
+        contract = str(initial.get("contract") or row.get("contract") or "").upper()
+        position_size = active.get(contract)
+        rule = int(trigger.get("rule") or 0)
+        text_value = str(initial.get("text") or "")
+        if position_size is None:
+            kind = "take_profit" if "-tp-" in text_value else ("stop_loss" if "-sl-" in text_value else "plan")
+            relation = "orphan"
+        else:
+            take_profit_rule = 1 if position_size > 0 else 2
+            stop_loss_rule = 2 if position_size > 0 else 1
+            kind = "take_profit" if rule == take_profit_rule else ("stop_loss" if rule == stop_loss_rule else "plan")
+            relation = "linked"
+        result.append({
+            "order_id": str(row.get("id_string") or row.get("id") or ""),
+            "contract": contract,
+            "kind": kind,
+            "trigger_price": str(trigger.get("price") or ""),
+            "rule": rule,
+            "size": str(abs(float(initial.get("size") or initial.get("amount") or 0))),
+            "status": str(row.get("status") or "unknown"),
+            "relation": relation,
+            "reduce_only": bool(initial.get("is_reduce_only")),
+            "created_at_ms": int(float(row.get("create_time") or 0) * 1000),
+            "text": text_value,
+        })
+    return result
+
 def _tail_log(name: str, lines: int = 100) -> str:
     path = ROOT / "logs" / name
     if not path.exists():
@@ -378,7 +415,8 @@ def all_dashboard():
     for row in reversed(decision_history[-200:]):
         stamp = int(row.get("generated_at_ms") or 0) if isinstance(row, dict) else 0
         history_view.append({**row, "time": dt.datetime.fromtimestamp(stamp / 1000).strftime("%Y-%m-%d %H:%M:%S") if stamp else "时间未记录", "macro_assessment": f"{(row.get('risk_snapshot') or {}).get('label', profile.label)}档位 · Gate {(row.get('environment') or s.environment).upper()} · {(row.get('trade') or {}).get('status', 'not_submitted')}"})
-    return {"timestamp": str(int(time.time() * 1000)), "is_stale": bool(errors), "account": {"total_eq": float(account.get("total") or 0), "avail_eq": float(account.get("available") or 0), "upl": float(account.get("unrealised_pnl") or 0), "currency": s.settle.upper(), "margin_usage_pct": 0, "initial_capital": s.initial_capital_usd or None}, "positions_summary": {"total_count": len(positions), "long_count": sum(p["side"] == "long" for p in positions), "short_count": sum(p["side"] == "short" for p in positions), "items": positions}, "pending_orders": pending, "factors": factors, "factor_library": factor_snapshot, "macro_assessment": "Gate Futures 原生行情、因子与账户数据巡检中", "llm_runtime": {"model": os.getenv("LLM_MODEL", "Gate AI Worker"), "provider_name": "Gate-native", "reasoning_effort": os.getenv("LLM_REASONING_EFFORT", "high"), "api_format": "openai_chat"}, "logs": [f"Gate {s.environment.upper()} · {profile.label} · {s.leverage:g}x · 私有数据{'可用' if not errors else '未配置或不可用'}"], "trades": [], "today_stats": book_stats, "news_intelligence": [], "protection_orders": protections_raw or [], "ai_brain_history": history_view, "risk_snapshot": risk_snapshot, "safety_status": _safety_status(), "gate_environment": s.environment, "gate_public_market_environment": s.public_market_environment, "errors": sorted(set(errors))}
+    normalized_protections = _dashboard_protection_orders(protections_raw or [], positions_raw or [])
+    return {"timestamp": str(int(time.time() * 1000)), "is_stale": bool(errors), "account": {"total_eq": float(account.get("total") or 0), "avail_eq": float(account.get("available") or 0), "upl": float(account.get("unrealised_pnl") or 0), "currency": s.settle.upper(), "margin_usage_pct": 0, "initial_capital": s.initial_capital_usd or None}, "positions_summary": {"total_count": len(positions), "long_count": sum(p["side"] == "long" for p in positions), "short_count": sum(p["side"] == "short" for p in positions), "items": positions}, "pending_orders": pending, "factors": factors, "factor_library": factor_snapshot, "macro_assessment": "Gate Futures 原生行情、因子与账户数据巡检中", "llm_runtime": {"model": os.getenv("LLM_MODEL", "Gate AI Worker"), "provider_name": "Gate-native", "reasoning_effort": os.getenv("LLM_REASONING_EFFORT", "high"), "api_format": "openai_chat"}, "logs": [f"Gate {s.environment.upper()} · {profile.label} · {s.leverage:g}x · 私有数据{'可用' if not errors else '未配置或不可用'}"], "trades": [], "today_stats": book_stats, "news_intelligence": [], "protection_orders": protections_raw or [], "protection_orders_normalized": normalized_protections, "ai_brain_history": history_view, "risk_snapshot": risk_snapshot, "safety_status": _safety_status(), "gate_environment": s.environment, "gate_public_market_environment": s.public_market_environment, "errors": sorted(set(errors))}
 
 
 @app.get("/api/v1/contracts/{contract}")
