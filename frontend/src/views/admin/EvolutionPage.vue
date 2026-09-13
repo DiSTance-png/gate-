@@ -42,6 +42,7 @@ const memoryVersion = ref<string | null>(null)
 const newMemoryText = ref('')
 const newCategory = ref('TACTICAL')
 const evolutionReport = ref<any>(null)
+const evolutionCandidates = ref<any[]>([])
 
 // Scheduler settings
 const briefingTimes = ref<string[]>(['02:00', '08:00', '14:00', '20:00'])
@@ -52,16 +53,18 @@ async function loadData() {
   loading.value = true
   memoryVersion.value = null
   try {
-    const [libRes, memRes, reportRes] = await Promise.all([
+    const [libRes, memRes, reportRes, candidateRes] = await Promise.all([
       api('/api/v1/prompt-library').catch(() => api('/api/v1/admin/prompt-library')),
       api('/api/v1/admin/memory'),
       api('/api/v1/cache/self-improvement').catch(() => null),
+      api('/api/v1/admin/evolution/candidates').catch(() => ({ candidates: [] })),
     ])
     lib.value = libRes
     selectedProfileId.value = libRes?.active_profile_id || 'stable'
     structuredLessons.value = memRes?.structured_lessons || []
     memoryVersion.value = memRes?.version || null
     evolutionReport.value = reportRes || null
+    evolutionCandidates.value = candidateRes?.candidates || []
     syncWorkingModules()
   } catch (e: any) {
     bannerMsg.value = { text: `加载失败: ${e.message}`, type: 'err' }
@@ -235,6 +238,26 @@ async function triggerEvolutionNow() {
   }
 }
 
+async function reviewCandidate(candidate: any, action: 'apply' | 'reject') {
+  if (!auth.isSuperadmin || busy.value) return
+  const verb = action === 'apply' ? '应用' : '拒绝'
+  if (!confirm(`确认${verb}自进化候选 ${candidate.id}？${action === 'apply' ? '\n应用后下一轮 AI 决策会使用新心法；凭证、环境与代理不会改变。' : ''}`)) return
+  busy.value = action === 'apply' ? 'save' : 'delete'
+  try {
+    await api(`/api/v1/admin/evolution/candidates/${encodeURIComponent(candidate.id)}/${action}`, {
+      method: 'POST',
+      body: action === 'apply' ? JSON.stringify({ expected_version: expectedMemoryVersion() }) : undefined,
+    })
+    bannerMsg.value = { text: `自进化候选已${verb}`, type: 'ok' }
+    await loadData()
+  } catch (e: any) {
+    memoryVersion.value = null
+    bannerMsg.value = { text: `${verb}候选失败: ${e.message}`, type: 'err' }
+  } finally {
+    busy.value = ''
+  }
+}
+
 onMounted(loadData)
 </script>
 
@@ -377,6 +400,14 @@ onMounted(loadData)
           </div>
         </div>
 
+        <div v-if="evolutionReport.performance_snapshot" class="grid grid-cols-2 sm:grid-cols-5 gap-2 text-xs">
+          <div class="p-2 rounded-lg border" style="border-color: var(--border-subtle);"><div class="text-[10px]" style="color: var(--text-faint);">净盈亏</div><b>{{ evolutionReport.performance_snapshot.net_pnl }} USDT</b></div>
+          <div class="p-2 rounded-lg border" style="border-color: var(--border-subtle);"><div class="text-[10px]" style="color: var(--text-faint);">手续费</div><b>{{ evolutionReport.performance_snapshot.fees }} USDT</b></div>
+          <div class="p-2 rounded-lg border" style="border-color: var(--border-subtle);"><div class="text-[10px]" style="color: var(--text-faint);">资金费</div><b>{{ evolutionReport.performance_snapshot.funding_fee ?? '不可用' }}</b></div>
+          <div class="p-2 rounded-lg border" style="border-color: var(--border-subtle);"><div class="text-[10px]" style="color: var(--text-faint);">最大回撤</div><b>{{ evolutionReport.performance_snapshot.max_drawdown_usd }} USDT</b></div>
+          <div class="p-2 rounded-lg border" style="border-color: var(--border-subtle);"><div class="text-[10px]" style="color: var(--text-faint);">平均滑点</div><b>{{ evolutionReport.performance_snapshot.average_slippage_bps ?? '不可用' }}</b></div>
+        </div>
+
         <div v-if="evolutionReport.memory_overwrites_reason" class="p-2.5 rounded-lg border text-xs" style="background-color: var(--bg-card-subtle); border-color: var(--border-subtle);">
           <div class="text-[10px] uppercase font-bold text-amber-400 mb-0.5">决策裁决理由:</div>
           <p class="text-[11px] leading-relaxed" style="color: var(--text-muted);">{{ evolutionReport.memory_overwrites_reason }}</p>
@@ -391,6 +422,21 @@ onMounted(loadData)
             </div>
           </div>
         </div>
+      </div>
+
+      <div class="rounded-xl border p-4 space-y-3 font-mono" style="background-color: var(--bg-card); border-color: var(--border-subtle);">
+        <div class="flex items-center justify-between">
+          <div><h3 class="text-xs font-black" style="color: var(--text-main);">待审核自进化候选</h3><p class="text-[10px] mt-1" style="color: var(--text-muted);">定时复盘只生成候选，默认不会自动覆盖当前稳定心法。</p></div>
+          <span class="text-xs" style="color: var(--text-muted);">{{ evolutionCandidates.filter((x: any) => x.status === 'pending').length }} 待处理</span>
+        </div>
+        <div v-for="candidate in evolutionCandidates.slice(0, 10)" :key="candidate.id" class="rounded-lg border p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3" style="border-color: var(--border-subtle); background-color: var(--bg-card-subtle);">
+          <div class="min-w-0"><div class="text-xs font-bold truncate">{{ candidate.id }} · {{ candidate.change_status }}</div><div class="text-[10px] mt-1" style="color: var(--text-muted);">{{ candidate.sample_size }} 笔样本 · {{ candidate.status }} · {{ candidate.reason || '无补充说明' }}</div></div>
+          <div v-if="candidate.status === 'pending'" class="flex gap-2 shrink-0">
+            <button @click="reviewCandidate(candidate, 'reject')" :disabled="!auth.isSuperadmin || !!busy" class="btn-admin-secondary text-xs">拒绝</button>
+            <button @click="reviewCandidate(candidate, 'apply')" :disabled="!auth.isSuperadmin || !!busy" class="btn-admin-primary text-xs">审核并应用</button>
+          </div>
+        </div>
+        <div v-if="!evolutionCandidates.length" class="text-xs py-4 text-center" style="color: var(--text-muted);">暂无候选，等待下一轮有新平仓证据的复盘。</div>
       </div>
 
       <!-- Strategy & Schedule Overview -->

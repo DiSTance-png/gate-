@@ -90,6 +90,11 @@ const dataHealthOverall = computed(() => {
   return 'UNKNOWN'
 })
 
+const safetyIssues = computed(() => {
+  const value = runtime.value?.safety_status?.reconciliation?.issues
+  return Array.isArray(value) ? value : []
+})
+
 async function loadRuntime() {
   loading.value = true
   loadError.value = ''
@@ -267,6 +272,35 @@ const quickNav = [
             <span>·</span>
             <span class="text-indigo-400 group-hover:underline">账户管理 →</span>
           </div>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+        <div class="rounded-xl border p-4" :style="{ backgroundColor: 'var(--bg-card)', borderColor: runtime.safety_status?.safe_for_new_risk ? 'var(--color-up-border)' : 'var(--color-down-border)' }">
+          <div class="flex items-center gap-2 text-xs font-bold font-mono">
+            <ShieldCheck class="w-4 h-4" />
+            <span>新增风险安全门</span>
+          </div>
+          <div class="mt-2 text-lg font-black font-mono" :style="{ color: runtime.safety_status?.safe_for_new_risk ? 'var(--color-up)' : 'var(--color-down)' }">
+            {{ runtime.safety_status?.safe_for_new_risk ? '允许开仓' : 'FAIL-CLOSED' }}
+          </div>
+          <div class="mt-1 text-[11px]" style="color: var(--text-muted);">
+            {{ safetyIssues.length ? `${safetyIssues.length} 项持仓/保护单对账异常` : '持仓、保护单、日亏损与冷却门禁正常' }}
+          </div>
+        </div>
+        <div class="rounded-xl border p-4" style="background-color: var(--bg-card); border-color: var(--border-subtle);">
+          <div class="text-xs font-bold font-mono" style="color: var(--text-muted);">Gateway 调度进程</div>
+          <div class="mt-2 text-lg font-black font-mono" :style="{ color: runtime.gateway?.running ? 'var(--color-up)' : 'var(--color-down)' }">
+            {{ runtime.gateway?.running ? 'ONLINE' : 'OFFLINE' }}
+          </div>
+          <div class="mt-1 text-[11px]" style="color: var(--text-muted);">PID {{ runtime.gateway?.pid || '--' }} · 调度状态来自进程锁与 PID</div>
+        </div>
+        <div class="rounded-xl border p-4" style="background-color: var(--bg-card); border-color: var(--border-subtle);">
+          <div class="text-xs font-bold font-mono" style="color: var(--text-muted);">Trader 最近心跳</div>
+          <div class="mt-2 text-lg font-black font-mono" :style="{ color: runtime.trader_heartbeat?.fresh ? 'var(--color-up)' : 'var(--color-down)' }">
+            {{ runtime.trader_heartbeat?.fresh ? 'FRESH' : 'STALE' }}
+          </div>
+          <div class="mt-1 text-[11px]" style="color: var(--text-muted);">{{ duration(runtime.trader_heartbeat?.age_seconds) }} 前 · PID {{ runtime.trader_heartbeat?.pid || '--' }}</div>
         </div>
       </div>
 

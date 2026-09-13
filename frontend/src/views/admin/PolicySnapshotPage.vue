@@ -99,7 +99,7 @@ async function saveArchive() {
 
 async function restorePolicy(hash: string, name: string) {
   if (!auth.isSuperadmin) return
-  if (!confirm(`确定要将当前策略原子回滚至【${name}】(#${hash}) 吗？\n将同时恢复对应的提示词、心法、拦截器及投委会配置！`)) {
+  if (!confirm(`确定要将当前策略原子回滚至【${name}】(#${hash}) 吗？\n将恢复提示词、心法、拦截器、投委会、Gate 风控参数及标的池。\nAPI 凭证、代理、Testnet/Live 环境和实盘开关不会改变。`)) {
     return
   }
   restoring.value = true
@@ -188,7 +188,7 @@ onMounted(() => {
             </span>
           </div>
           <p class="text-xs 2xl:text-sm font-mono mt-0.5" style="color: var(--text-muted);">
-            四大策略单元（提示词、自进化、物理拦截、模型委员会）的不可变指纹聚合与具名归档/一键回滚。
+            五大策略单元（提示词、自进化、物理拦截、模型委员会、Gate 执行策略）的不可变指纹聚合与具名归档/一键回滚。
           </p>
         </div>
       </div>
@@ -266,7 +266,7 @@ onMounted(() => {
         </div>
       </div>
 
-      <!-- 2. Four Strategy Units Matrix -->
+      <!-- 2. Strategy Units Matrix -->
       <div class="grid grid-cols-1 md:grid-cols-2 gap-4 2xl:gap-5">
         <!-- Unit 1: Prompt Policy -->
         <div
@@ -471,6 +471,24 @@ onMounted(() => {
           <div class="p-2 rounded-xl text-[11px] font-mono" style="background-color: var(--bg-card-subtle); color: var(--text-muted);">
             ✓ 剔除虚假共识选项，实战双轮互评，超时毫秒级自适应安全降级。
           </div>
+        </div>
+
+        <!-- Unit 5: Gate Execution Policy -->
+        <div class="p-4 sm:p-5 rounded-2xl border space-y-3 flex flex-col justify-between" style="background-color: var(--bg-card); border-color: var(--border-subtle);">
+          <div class="space-y-2">
+            <div class="flex items-center space-x-2 pb-2 border-b" style="border-color: var(--border-subtle);">
+              <span class="p-1.5 rounded-lg bg-cyan-500/10 border border-cyan-500/20 text-cyan-400"><Activity class="w-4 h-4" /></span>
+              <span class="font-bold font-mono text-xs" style="color: var(--text-main);">Gate 执行与风险策略</span>
+            </div>
+            <div class="space-y-1 text-xs font-mono">
+              <div v-for="key in ['GATE_RISK_PROFILE','GATE_LEVERAGE','GATE_MAX_POSITION_NOTIONAL_USD','GATE_MAX_TOTAL_MARGIN_USD','GATE_MAX_ORDER_MARGIN_USD','GATE_MAX_PENDING_ORDER_AGE_SECONDS','GATE_MAX_POSITION_AGE_SECONDS','GATE_STOP_COOLDOWN_SECONDS']" :key="key" class="flex justify-between gap-3 py-1 border-b border-dashed" style="border-color: var(--border-subtle);">
+                <span class="text-[#8A99AD] truncate">{{ key }}:</span>
+                <span class="font-bold text-right" style="color: var(--text-main);">{{ snapshotData.snapshot.units?.gate_execution?.values?.[key] || '默认值' }}</span>
+              </div>
+              <div class="flex justify-between py-1"><span class="text-[#8A99AD]">标的池哈希:</span><span class="text-cyan-400 font-bold">#{{ snapshotData.snapshot.units?.gate_execution?.instrument_hash }}</span></div>
+            </div>
+          </div>
+          <div class="p-2 rounded-xl text-[11px] font-mono" style="background-color: var(--bg-card-subtle); color: var(--text-muted);">凭证、代理、Testnet/Live 环境和实盘开关不属于策略包，回滚不会修改。</div>
         </div>
       </div>
 

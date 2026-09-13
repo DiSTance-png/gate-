@@ -32,6 +32,7 @@ from .service import GateTradingService, protection_coverage_status
 from .store import EventStore
 from .proxy_tunnel import gate_tunnel
 from .risk_profiles import get_risk_profile, profile_catalog
+from .safety import order_age_seconds
 from r20_gateway.supervisor import start_supervisor as start_gateway_supervisor, stop_supervisor as stop_gateway_supervisor
 from r20_gateway.publisher import DB_PATH as GATEWAY_DB_PATH
 from r20_gateway.store import GatewayStore
@@ -53,6 +54,13 @@ def _read_json_file(name: str, default):
 
 def _safety_status() -> dict[str, Any]:
     return _read_json_file("gate_safety_status.json", {"safe_for_new_risk": False, "reason": "no safety check recorded"})
+
+
+def _heartbeat_status() -> dict[str, Any]:
+    heartbeat = _read_json_file("gate_trader_heartbeat.json", {})
+    timestamp_ms = float(heartbeat.get("timestamp_ms") or 0)
+    age_seconds = max(0, int(time.time() - timestamp_ms / 1000)) if timestamp_ms else None
+    return {**heartbeat, "age_seconds": age_seconds, "fresh": bool(age_seconds is not None and age_seconds <= 20 * 60)}
 
 def _tail_log(name: str, lines: int = 100) -> str:
     path = ROOT / "logs" / name
@@ -339,7 +347,10 @@ def all_dashboard():
         fully_protected = bool(coverage["fully_protected"])
         effective_covered_size = min(coverage["take_profit"], coverage["stop_loss"])
         positions.append({"instId": contract, "name": contract, "side": side, "pos": str(abs(size)), "lever": str(effective_leverage), "margin": str(occupied_margin), "margin_usdt": str(occupied_margin), "avgPx": str(p.get("entry_price") or "--"), "last": str(p.get("mark_price") or "--"), "markPx": str(p.get("mark_price") or "--"), "upl": str(p.get("unrealised_pnl") or "0"), "uplRatio": "--", "displayStop": float(stop_price) if stop_price not in (None, "") else None, "takeProfitPx": float(tp_price) if tp_price not in (None, "") else None, "protectionStatus": "fully_protected" if fully_protected else ("partially_protected" if contract_protections else "unprotected"), "protectionCoveragePct": min(100.0, float(effective_covered_size) / abs(size) * 100) if size else 0.0, "cloud_oco_verified": fully_protected})
-    pending = [{"ordId": str(o.get("id")), "instId": o.get("contract"), "name": o.get("contract"), "side": "buy" if float(o.get("size") or 0) > 0 else "sell", "posSide": "long" if float(o.get("size") or 0) > 0 else "short", "px": str(o.get("price") or "0"), "sz": str(abs(float(o.get("size") or 0))), "state": o.get("status", "open"), "cTime": str(o.get("create_time_ms") or ""), "text": o.get("text", "")} for o in orders_raw or []]
+    pending = []
+    for o in orders_raw or []:
+        age = order_age_seconds(o)
+        pending.append({"ordId": str(o.get("id")), "instId": o.get("contract"), "name": o.get("contract"), "side": "buy" if float(o.get("size") or 0) > 0 else "sell", "posSide": "long" if float(o.get("size") or 0) > 0 else "short", "px": str(o.get("price") or "0"), "sz": str(abs(float(o.get("size") or 0))), "state": o.get("status", "open"), "cTime": str(o.get("create_time_ms") or o.get("create_time") or ""), "text": o.get("text", ""), "age_seconds": int(age) if age is not None else None, "expires_in_seconds": max(0, s.max_pending_order_age_seconds - int(age)) if age is not None else None})
     dashboard_contracts = {"BTC_USDT", "ETH_USDT", "SOL_USDT", "DOGE_USDT", "SUI_USDT", "XRP_USDT"}
     account["initial_capital"] = s.initial_capital_usd or None
     factor_snapshot = _read_json_file("factor_library_snapshot.json", {})
@@ -531,7 +542,9 @@ def gate_admin_runtime_overview(x_gate_session: str | None = Header(default=None
     except Exception:
         llm_runtime = {"model": os.getenv("LLM_MODEL", ""), "provider_name": "Gate AI Worker", "reasoning_effort": os.getenv("LLM_REASONING_EFFORT", "high")}
     configuration = {"Gate 当前环境": settings.environment.upper(), "Gate API 凭证": "已配置" if settings.api_key and settings.api_secret else "未配置", "AI 风险档位": get_risk_profile(settings.risk_profile).label, "Gate Testnet 自动交易": "已启用" if settings.testnet_execute_trades else "关闭", "Gate Live 交易开关": "显式启用" if settings.environment == "live" and settings.live_trading_enabled else "关闭 (FAIL-CLOSED)", "Gate VPS 独立代理": "已配置" if settings.proxy_url else "未配置", "执行杠杆": f"{settings.leverage:g}x", "原生保护单覆盖": "Gate price_orders 双保护校验", "总持仓名义敞口上限": f"{settings.max_position_notional_usd:.2f} USDT", "总保证金上限": f"{settings.max_total_margin_usd:.2f} USDT", "单笔保证金上限": f"{settings.max_order_margin_usd:.2f} USDT"}
-    return {"service": {"version": app.version, "pid": os.getpid(), "uptime_seconds": int(time.time() - STARTED_AT)}, "exchange": "gate", "environment": settings.environment, "credentials": {"gate": bool(settings.api_key and settings.api_secret), "llm": bool(os.getenv("LLM_API_KEY"))}, "configuration": configuration, "data_health": {"overall": "LIVE" if all(item["fresh"] for item in health_files) else "STALE", "files": health_files}, "full_decisions": full, "decisions": full, "decision_history": list(reversed(history)), "decision_history_total": len(history), "recent_logs": [], "logs": {"trader": _tail_log("gate_trader.log", 18), "backend": _tail_log("gate_backend.log", 18), "scheduler": _tail_log("r20_gateway.log", 18)}, "llm_runtime": llm_runtime}
+    gateway_store = GatewayStore(GATEWAY_DB_PATH)
+    gateway_pid = current_pid()
+    return {"service": {"version": app.version, "pid": os.getpid(), "uptime_seconds": int(time.time() - STARTED_AT)}, "exchange": "gate", "environment": settings.environment, "credentials": {"gate": bool(settings.api_key and settings.api_secret), "llm": bool(os.getenv("LLM_API_KEY"))}, "configuration": configuration, "data_health": {"overall": "LIVE" if all(item["fresh"] for item in health_files) else "STALE", "files": health_files}, "safety_status": _safety_status(), "trader_heartbeat": _heartbeat_status(), "gateway": {"running": bool(gateway_pid or _worker_lock_held()), "pid": gateway_pid or None, "scheduler": scheduler_snapshot(gateway_store)}, "full_decisions": full, "decisions": full, "decision_history": list(reversed(history)), "decision_history_total": len(history), "recent_logs": [], "logs": {"trader": _tail_log("gate_trader.log", 18), "backend": _tail_log("gate_backend.log", 18), "scheduler": _tail_log("r20_gateway.log", 18)}, "llm_runtime": llm_runtime}
 
 
 @app.get("/api/v1/admin/history")

@@ -54,6 +54,24 @@ AI 的 `entry_price` 使用 Gate 原生 GTC 限价单；只有明确的市价操
 
 P0/P1 安全层还会记录 Gate 对账、日亏损熔断、挂单生命周期、最长持仓、止损冷却和进程心跳；运行时文件默认被 `.gitignore` 排除，不应提交到公开仓库。
 
+## P2/P3 策略版本与运行监控
+
+每轮 AI 决策、交易结果和历史记录都绑定 `policy_version` 与 `policy_hash`。版本指纹覆盖提示词、自进化心法、物理拦截器、模型委员会、Gate 风险档位/杠杆/资金上限/生命周期参数和标的池；归档与回滚明确排除 API Key、Secret、代理、`GATE_ENVIRONMENT` 和 Live 开关。
+
+自动复盘默认只写入 `data/evolution_candidates/` 候选，不会直接覆盖当前稳定心法或标的倍率。超级管理员可在“自进化配置”审核应用或拒绝候选。收益快照基于真实平仓台账统计净盈亏、手续费、最大回撤和分标的表现；台账没有资金费或滑点字段时显示“不可用”，不会估算或伪造。
+
+策略自动回滚默认关闭，只允许 Testnet：
+
+```dotenv
+GATE_AUTO_ROLLBACK_ENABLED=false
+GATE_AUTO_ROLLBACK_POLICY_HASH=
+GATE_AUTO_ROLLBACK_MIN_TRADES=20
+GATE_AUTO_ROLLBACK_MIN_PROFIT_FACTOR=0.8
+GATE_AUTO_ROLLBACK_MAX_DRAWDOWN_USD=100
+```
+
+必须先在策略版本页归档一个已验证版本，再把它的哈希填入目标字段。即使误将自动回滚开关带入 Live，执行器也会返回 `live_forbidden`，不会自动回滚。管理总览显示新增风险安全门、Gateway 真实 PID/进程锁和 Trader 心跳；主页挂单表显示已挂时长、剩余时间及正常/即将过期/等待撤单状态。
+
 ## Gate Testnet 验证
 
 已通过 Gate Testnet 只读验证：行情、合约元数据、账户余额、持仓、挂单和保护单查询均可用；AI worker 已使用原 R20 提示词链生成六合约决策。交易写链路仍保持默认关闭（`GATE_TESTNET_EXECUTE_TRADES=false`），不会自动执行 Gate Live 交易；Live 交易必须由操作者在独立环境显式启用并通过限额检查。

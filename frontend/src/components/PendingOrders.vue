@@ -3,6 +3,21 @@ import { useDashboardStore } from '../stores/dashboard'
 import { Clock, CheckCircle2 } from 'lucide-vue-next'
 
 const store = useDashboardStore()
+
+function lifecycleState(order: any) {
+  const left = Number(order.expires_in_seconds)
+  if (!Number.isFinite(left)) return { label: '挂单中', color: 'var(--color-brand)' }
+  if (left <= 0) return { label: '等待撤单', color: 'var(--color-down)' }
+  if (left <= 300) return { label: '即将过期', color: '#f59e0b' }
+  return { label: '正常等待', color: 'var(--color-up)' }
+}
+
+function elapsed(seconds: any) {
+  const value = Number(seconds)
+  if (!Number.isFinite(value)) return '--'
+  if (value < 60) return `${Math.max(0, Math.floor(value))}秒`
+  return `${Math.floor(value / 60)}分${Math.floor(value % 60)}秒`
+}
 </script>
 
 <template>
@@ -60,6 +75,7 @@ const store = useDashboardStore()
             <th class="py-2.5 px-3.5 font-bold">挂单限价</th>
             <th class="py-2.5 px-3.5 font-bold">委托数量</th>
             <th class="py-2.5 px-3.5 font-bold">挂单时间</th>
+            <th class="py-2.5 px-3.5 font-bold">生命周期</th>
             <th class="py-2.5 px-3.5 text-right font-bold">状态</th>
           </tr>
         </thead>
@@ -97,10 +113,13 @@ const store = useDashboardStore()
             <td class="py-2.5 px-3.5 num-tabular" style="color: var(--text-muted);">
               {{ ord.time || (ord.cTime ? new Date(parseInt(ord.cTime)).toLocaleTimeString() : '--') }}
             </td>
-            <td class="py-2.5 px-3.5 text-right font-bold" style="color: var(--color-brand);">
+            <td class="py-2.5 px-3.5 num-tabular" style="color: var(--text-muted);">
+              已挂 {{ elapsed(ord.age_seconds) }} · 剩余 {{ elapsed(ord.expires_in_seconds) }}
+            </td>
+            <td class="py-2.5 px-3.5 text-right font-bold" :style="{ color: lifecycleState(ord).color }">
               <span class="inline-flex items-center space-x-1">
-                <span class="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse"></span>
-                <span>挂单中</span>
+                <span class="w-1.5 h-1.5 rounded-full animate-pulse" :style="{ backgroundColor: lifecycleState(ord).color }"></span>
+                <span>{{ lifecycleState(ord).label }}</span>
               </span>
             </td>
           </tr>

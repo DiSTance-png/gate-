@@ -1,11 +1,12 @@
 """R20 Strategy Policy Snapshot & Version Control Workbench Engine.
 
 Provides immutable snapshot fingerprinting, persistent archiving, one-click rollback,
-and export/import capabilities across all 4 strategy units:
+and export/import capabilities across all 5 strategy units:
 1. Prompt Profile (Prompt Studio)
 2. Evolution Mind (Evolution Shield)
 3. Physical Interceptors (Interceptors Plugin Pipeline)
 4. Model Council (Council Desk)
+5. Gate Execution & Risk Policy
 """
 from __future__ import annotations
 
@@ -37,6 +38,25 @@ ARCHIVE_DIR = DATA_DIR / "policy_archives"
 ARCHIVE_INDEX_FILE = ARCHIVE_DIR / "index.json"
 
 DEFAULT_BASE_VERSION = f"v{__version__}"
+
+GATE_POLICY_ENV_KEYS = (
+    "GATE_RISK_PROFILE", "GATE_LEVERAGE", "GATE_MAX_POSITION_NOTIONAL_USD",
+    "GATE_MAX_TOTAL_MARGIN_USD", "GATE_MAX_ORDER_MARGIN_USD",
+    "GATE_MAX_PENDING_ORDER_AGE_SECONDS", "GATE_MAX_POSITION_AGE_SECONDS",
+    "GATE_STOP_COOLDOWN_SECONDS", "GATE_MAX_DAILY_LOSS_USD", "GATE_MAX_DAILY_LOSS_RATIO",
+)
+
+
+def extract_gate_policy_fingerprint(root_dir: Optional[Path] = None) -> Dict[str, Any]:
+    root = root_dir or ROOT
+    values = {key: os.getenv(key, "") for key in GATE_POLICY_ENV_KEYS}
+    instrument_file = root / "data" / "instrument_pool.json"
+    try:
+        instrument_hash = hashlib.sha256(instrument_file.read_bytes()).hexdigest()[:16]
+    except OSError:
+        instrument_hash = "missing"
+    canonical = json.dumps({"values": values, "instrument_hash": instrument_hash}, sort_keys=True, separators=(",", ":"))
+    return {"values": values, "instrument_hash": instrument_hash, "config_hash": hashlib.sha256(canonical.encode()).hexdigest()[:16]}
 
 
 def compute_layout_hash(profile: Dict[str, Any]) -> str:
@@ -293,13 +313,14 @@ def generate_policy_snapshot(
     plugins_dir: Optional[Path] = None,
     base_version: str = DEFAULT_BASE_VERSION,
 ) -> Dict[str, Any]:
-    """Generates an immutable snapshot fingerprint across the 4 core strategy units."""
+    """Generates an immutable snapshot fingerprint across the 5 core strategy units."""
     prompt_info = extract_prompt_profile_fingerprint(prompt_profile, root_dir=root_dir)
     evolution_info = extract_evolution_mind_fingerprint(memory_snapshot, root_dir=root_dir)
     interceptor_info = extract_interceptors_fingerprint(
         interceptor_plugins, plugins_dir=plugins_dir, root_dir=root_dir
     )
     council_info = extract_council_fingerprint(council_config, root_dir=root_dir)
+    gate_info = extract_gate_policy_fingerprint(root_dir=root_dir)
 
     canonical_fingerprint = {
         "prompt_profile": {
@@ -321,6 +342,7 @@ def generate_policy_snapshot(
             "active_roles": council_info["active_roles"],
             "role_models": council_info["role_models"],
         },
+        "gate_execution": gate_info,
     }
 
     canon_bytes = json.dumps(canonical_fingerprint, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -333,7 +355,8 @@ def generate_policy_snapshot(
         f"prompt:{prompt_info['active_profile_id']}#{prompt_info['layout_hash']} "
         f"mind:{mind_ver_short}({evolution_info['enabled_count']}) "
         f"interceptors:{interceptor_info['plugins_hash']}({interceptor_info['enabled_count']}) "
-        f"council:{'on' if council_info['enabled'] else 'off'}({council_info['consensus_mode']})"
+        f"council:{'on' if council_info['enabled'] else 'off'}({council_info['consensus_mode']}) "
+        f"gate:{gate_info['config_hash']}"
     )
 
     return {
@@ -347,6 +370,7 @@ def generate_policy_snapshot(
             "evolution_mind": evolution_info,
             "physical_interceptors": interceptor_info,
             "model_council": council_info,
+            "gate_execution": gate_info,
         },
     }
 
@@ -515,7 +539,7 @@ def save_archive_index(index_data: List[Dict[str, Any]], archive_dir: Optional[P
 
 
 def capture_full_strategy_package(root_dir: Optional[Path] = None) -> Dict[str, Any]:
-    """Captures complete runtime data payload across all 4 units for rollback/export."""
+    """Captures complete runtime data payload across all 5 units for rollback/export."""
     r_dir = root_dir or ROOT
     sys_path_added = False
     scripts_dir = str(r_dir / "scripts")
@@ -568,6 +592,12 @@ def capture_full_strategy_package(root_dir: Optional[Path] = None) -> Dict[str, 
                 pass
 
     snapshot = generate_policy_snapshot(root_dir=r_dir)
+    gate_policy = {key: os.getenv(key, "") for key in GATE_POLICY_ENV_KEYS}
+    instrument_file = r_dir / "data" / "instrument_pool.json"
+    try:
+        instrument_pool = json.loads(instrument_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        instrument_pool = None
 
     return {
         "format": "r20_policy_package_v1",
@@ -581,6 +611,8 @@ def capture_full_strategy_package(root_dir: Optional[Path] = None) -> Dict[str, 
             "evolution_memory": memory_full,
             "interceptor_config": interceptor_full,
             "council_config": council_full,
+            "gate_policy": gate_policy,
+            "instrument_pool": instrument_pool,
         },
     }
 
@@ -732,6 +764,17 @@ def restore_archived_policy(
             ):
                 from r20_backend.council_manager import save_council_config
                 save_council_config(payload["council_config"])
+
+            # Gate credentials, proxy and environment are intentionally never
+            # part of a strategy restore.
+            if isinstance(payload.get("gate_policy"), dict):
+                from r20_backend.settings_store import update_env
+                safe_values = {key: str(payload["gate_policy"].get(key, "")) for key in GATE_POLICY_ENV_KEYS if key in payload["gate_policy"]}
+                if safe_values:
+                    update_env(safe_values)
+                    os.environ.update(safe_values)
+            if isinstance(payload.get("instrument_pool"), (list, dict)):
+                _atomic_write_json(r_dir / "data" / "instrument_pool.json", payload["instrument_pool"])
         finally:
             if sys_path_added and scripts_dir in sys.path:
                 try:

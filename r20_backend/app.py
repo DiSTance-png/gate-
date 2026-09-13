@@ -485,6 +485,10 @@ class MemoryUpdateAllRequest(BaseModel):
     items: list[str]
 
 
+class EvolutionCandidateActionRequest(BaseModel):
+    expected_version: str | None = None
+
+
 def require_admin_token(token: str) -> None:
     expected = settings.admin_token or settings.setup_token
     if not expected:
@@ -3015,6 +3019,41 @@ def update_admin_memory_all(payload: MemoryUpdateAllRequest, x_r20_admin_token: 
     result = _memory_service_call("admin_mutate", "replace", texts=payload.items, expected_version=payload.expected_version)
     audit_record("memory.update_all", "success", {"actor": actor.get("username", "admin"), "count": len(result["items"])})
     return result
+
+
+@app.get("/api/v1/admin/evolution/candidates")
+def get_evolution_candidates(x_r20_admin_token: str | None = Header(default=None), x_r20_session: str | None = Header(default=None, alias="X-R20-Session")) -> dict[str, Any]:
+    require_admin_header(x_r20_admin_token, x_r20_session)
+    from scripts.self_improvement_engine import list_evolution_candidates
+    return {"ok": True, "candidates": list_evolution_candidates()}
+
+
+@app.post("/api/v1/admin/evolution/candidates/{candidate_id}/apply")
+def apply_admin_evolution_candidate(candidate_id: str, payload: EvolutionCandidateActionRequest, x_r20_session: str | None = Header(default=None, alias="X-R20-Session")) -> dict[str, Any]:
+    actor = require_superadmin(x_r20_session)
+    from scripts.self_improvement_engine import apply_evolution_candidate
+    try:
+        result = apply_evolution_candidate(candidate_id, payload.expected_version or "")
+        audit_record("evolution.candidate.apply", "success", {"actor": actor.get("username", "admin"), "candidate_id": candidate_id})
+        return {"ok": True, "candidate": result}
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/admin/evolution/candidates/{candidate_id}/reject")
+def reject_admin_evolution_candidate(candidate_id: str, x_r20_session: str | None = Header(default=None, alias="X-R20-Session")) -> dict[str, Any]:
+    actor = require_superadmin(x_r20_session)
+    from scripts.self_improvement_engine import reject_evolution_candidate
+    try:
+        result = reject_evolution_candidate(candidate_id)
+        audit_record("evolution.candidate.reject", "success", {"actor": actor.get("username", "admin"), "candidate_id": candidate_id})
+        return {"ok": True, "candidate": result}
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.get("/health", include_in_schema=False)

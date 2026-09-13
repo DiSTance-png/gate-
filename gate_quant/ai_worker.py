@@ -30,12 +30,17 @@ LEDGER = DATA / "trading_ledger.json"
 
 
 def _save_decision_payload(payload: dict, decisions_payload: dict, trade: dict, now: int, environment: str, risk_snapshot: dict | None = None) -> None:
+    risk_snapshot = risk_snapshot or {}
+    trade.setdefault("policy_version", risk_snapshot.get("policy_version", "gate@unknown"))
+    trade.setdefault("policy_hash", risk_snapshot.get("policy_hash", "unknown"))
     DECISIONS.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     history_item = {
         "generated_at_ms": now,
         "environment": environment,
         "trade": trade,
-        "risk_snapshot": risk_snapshot or {},
+        "policy_version": risk_snapshot.get("policy_version", "gate@unknown"),
+        "policy_hash": risk_snapshot.get("policy_hash", "unknown"),
+        "risk_snapshot": risk_snapshot,
         "decisions": {
             symbol: {
                 "action": envelope["decision"].get("action", "WAIT"),
@@ -425,6 +430,12 @@ def run_cycle() -> dict:
     settings = load_settings()
     risk_profile = get_risk_profile(settings.risk_profile)
     risk_snapshot = risk_profile.snapshot(leverage=settings.leverage, environment=settings.environment)
+    try:
+        from r20_backend.policy_snapshot import generate_policy_snapshot
+        policy_snapshot = generate_policy_snapshot(root_dir=ROOT)
+    except Exception as exc:
+        policy_snapshot = {"policy_version": "gate@unavailable", "policy_hash": "unavailable", "error": str(exc)}
+    risk_snapshot.update({"policy_version": policy_snapshot["policy_version"], "policy_hash": policy_snapshot["policy_hash"]})
     execution_enabled = _execution_enabled(settings)
     client = GateFuturesClient(settings)
     market = GateFuturesClient(replace(settings, environment=settings.public_market_environment, api_key="public-readonly", api_secret="public-readonly", live_trading_enabled=True))
@@ -573,7 +584,7 @@ def run_cycle() -> dict:
     management = full_response if 'full_response' in locals() and isinstance(full_response, dict) else {}
     position_management = _as_instruction_list(management.get("position_management"))
     pending_management = _as_instruction_list(management.get("pending_orders_management"))
-    decisions_payload = {symbol: {"instId": symbol, "decision_timestamp_ms": now, "decision": item, "source": llm_source, "llm_error": llm_error, "llm_preview": llm_preview, "risk_snapshot": risk_snapshot, "indicators": next(f for f in features if f["contract"] == symbol)} for symbol, item in decisions.items()}
+    decisions_payload = {symbol: {"instId": symbol, "decision_timestamp_ms": now, "decision": item, "source": llm_source, "llm_error": llm_error, "llm_preview": llm_preview, "policy_version": policy_snapshot["policy_version"], "policy_hash": policy_snapshot["policy_hash"], "risk_snapshot": risk_snapshot, "indicators": next(f for f in features if f["contract"] == symbol)} for symbol, item in decisions.items()}
     # Apply the same deterministic quote gate used by the original OKX
     # execution chain before selecting any candidate for execution.
     try:
@@ -659,7 +670,9 @@ def run_cycle() -> dict:
         leverage = settings.leverage
         if planned_margin <= 0:
             result["trade"] = {"status": "blocked_invalid_margin", "contract": trade_symbol, "reason": "AI did not provide a positive margin_usdt; no order was submitted"}
-            payload = {**decisions_payload, "generated_at_ms": now, "exchange": "gate", "environment": settings.environment, "risk_snapshot": risk_snapshot, "position_management": position_management, "pending_orders_management": pending_management, "private_context": private_context, "trade": result["trade"]}
+            result["trade"].setdefault("policy_version", policy_snapshot["policy_version"])
+            result["trade"].setdefault("policy_hash", policy_snapshot["policy_hash"])
+            payload = {**decisions_payload, "generated_at_ms": now, "exchange": "gate", "environment": settings.environment, "policy_snapshot": policy_snapshot, "risk_snapshot": risk_snapshot, "position_management": position_management, "pending_orders_management": pending_management, "private_context": private_context, "trade": result["trade"]}
             _save_decision_payload(payload, decisions_payload, result["trade"], now, settings.environment, risk_snapshot)
             result["decisions"] = decisions_payload
             return result
@@ -807,7 +820,9 @@ def run_cycle() -> dict:
             result["trade"] = {"status": "protection_failed_flatten_attempted", "contract": trade_symbol, "client_id": client_id, "order": order, "error": str(protection_error), "cleanup": cleanup}
     if execution_enabled and not safety_status["safe_for_new_risk"] and result["trade"].get("status") == "not_submitted":
         result["trade"] = {"status": "blocked_safety_fail_closed", "reason": "Gate reconciliation, daily-loss or cooldown gate blocked new risk", "safety_status": safety_status}
-    payload = {**decisions_payload, "generated_at_ms": now, "exchange": "gate", "environment": settings.environment, "risk_snapshot": risk_snapshot, "safety_status": safety_status, "position_management": position_management, "pending_orders_management": pending_management, "private_context": private_context, "trade": result["trade"]}
+    result["trade"].setdefault("policy_version", policy_snapshot["policy_version"])
+    result["trade"].setdefault("policy_hash", policy_snapshot["policy_hash"])
+    payload = {**decisions_payload, "generated_at_ms": now, "exchange": "gate", "environment": settings.environment, "policy_snapshot": policy_snapshot, "risk_snapshot": risk_snapshot, "safety_status": safety_status, "position_management": position_management, "pending_orders_management": pending_management, "private_context": private_context, "trade": result["trade"]}
     _save_decision_payload(payload, decisions_payload, result["trade"], now, settings.environment, risk_snapshot)
     result["decisions"] = decisions_payload
     return result

@@ -36,6 +36,7 @@ LOGS_DIR = os.path.join(WORKSPACE_DIR, "logs")
 LEDGER_JSON_FILE = os.path.join(DATA_DIR, "trading_ledger.json")
 REPORT_JSON_FILE = os.path.join(DATA_DIR, "self_improvement_report.json")
 REPORT_ARCHIVE_DIR = os.path.join(DATA_DIR, "self_improvement_history")
+EVOLUTION_CANDIDATE_DIR = os.path.join(DATA_DIR, "evolution_candidates")
 AI_DECISIONS_FILE = os.path.join(DATA_DIR, "ai_brain_decisions.json")
 AI_MEMORY_FILE = os.path.join(DATA_DIR, "ai_trading_memory.json")
 AI_MEMORY_MD_FILE = os.path.join(DATA_DIR, "AI_TRADING_MEMORY.md")
@@ -61,6 +62,160 @@ def atomic_write_json(path: str, payload: Any) -> None:
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
+
+
+def _candidate_path(candidate_id: str) -> str:
+    clean = str(candidate_id or "")
+    if not clean or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for ch in clean):
+        raise ValueError("无效的自进化候选标识")
+    os.makedirs(EVOLUTION_CANDIDATE_DIR, exist_ok=True)
+    return os.path.join(EVOLUTION_CANDIDATE_DIR, f"{clean}.json")
+
+
+def list_evolution_candidates(limit: int = 100) -> List[Dict[str, Any]]:
+    os.makedirs(EVOLUTION_CANDIDATE_DIR, exist_ok=True)
+    rows = []
+    paths = sorted(Path(EVOLUTION_CANDIDATE_DIR).glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                rows.append(payload)
+        except (OSError, ValueError):
+            continue
+        if len(rows) >= max(1, min(int(limit), 500)):
+            break
+    return rows
+
+
+def apply_evolution_candidate(candidate_id: str, expected_version: str) -> Dict[str, Any]:
+    path = _candidate_path(candidate_id)
+    if not os.path.isfile(path):
+        raise FileNotFoundError("未找到自进化候选")
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if payload.get("status") != "pending":
+        raise ValueError("该候选已处理，不能重复应用")
+    if str(payload.get("expected_memory_version") or "") != str(expected_version or ""):
+        raise ValueError("心法版本已变化，请重新复盘生成候选；未覆盖当前数据")
+
+    from scripts import evolution_shield as memory_service
+    published = memory_service.publish_review(
+        payload.get("proposed_memory") or [], expected_version=expected_version,
+        sample_size=int(payload.get("sample_size") or 0),
+        change_status=str(payload.get("change_status") or "NO_CHANGE"),
+    )
+    if not published:
+        raise ValueError("候选未产生可发布的心法变化")
+    payload.update({"status": "applied", "applied_at": datetime.datetime.now(datetime.timezone.utc).isoformat()})
+    atomic_write_json(path, payload)
+    multipliers = payload.get("asset_multipliers")
+    if isinstance(multipliers, dict):
+        try:
+            atomic_write_json(os.path.join(DATA_DIR, "asset_multipliers.json"), {
+                "timestamp": payload.get("created_at"), "multipliers": multipliers,
+                "updated_by": "approved_evolution_candidate", "candidate_id": candidate_id,
+            })
+        except OSError as exc:
+            payload["asset_multiplier_warning"] = f"{type(exc).__name__}: {exc}"
+            atomic_write_json(path, payload)
+    memory_service.sync_markdown_mirror()
+    return payload
+
+
+def reject_evolution_candidate(candidate_id: str) -> Dict[str, Any]:
+    path = _candidate_path(candidate_id)
+    if not os.path.isfile(path):
+        raise FileNotFoundError("未找到自进化候选")
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if payload.get("status") != "pending":
+        raise ValueError("该候选已处理")
+    payload.update({"status": "rejected", "rejected_at": datetime.datetime.now(datetime.timezone.utc).isoformat()})
+    atomic_write_json(path, payload)
+    return payload
+
+
+def build_performance_snapshot(closed_trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+    equity = peak = max_drawdown = 0.0
+    by_instrument: Dict[str, Dict[str, Any]] = {}
+    funding_values: List[float] = []
+    slippage_values: List[float] = []
+    for trade in closed_trades:
+        net = float(trade.get("net_pnl") or 0)
+        equity += net
+        peak = max(peak, equity)
+        max_drawdown = max(max_drawdown, peak - equity)
+        inst = str(trade.get("inst") or "OTHER")
+        row = by_instrument.setdefault(inst, {"trades": 0, "wins": 0, "net_pnl": 0.0, "fees": 0.0})
+        row["trades"] += 1
+        row["wins"] += int(net > 0)
+        row["net_pnl"] += net
+        row["fees"] += abs(float(trade.get("fee") or 0))
+        if trade.get("funding_fee") is not None:
+            funding_values.append(float(trade["funding_fee"] or 0))
+        if trade.get("slippage_bps") is not None:
+            slippage_values.append(float(trade["slippage_bps"] or 0))
+    for row in by_instrument.values():
+        row["net_pnl"] = round(row["net_pnl"], 4)
+        row["fees"] = round(row["fees"], 4)
+        row["win_rate"] = round(row["wins"] / row["trades"] * 100, 2) if row["trades"] else 0.0
+    unavailable = []
+    if not funding_values:
+        unavailable.append("funding_fee")
+    if not slippage_values:
+        unavailable.append("slippage_bps")
+    return {
+        "net_pnl": round(sum(float(t.get("net_pnl") or 0) for t in closed_trades), 4),
+        "fees": round(sum(abs(float(t.get("fee") or 0)) for t in closed_trades), 4),
+        "funding_fee": round(sum(funding_values), 4) if funding_values else None,
+        "max_drawdown_usd": round(max_drawdown, 4),
+        "average_slippage_bps": round(sum(slippage_values) / len(slippage_values), 4) if slippage_values else None,
+        "by_instrument": by_instrument,
+        "unavailable_fields": unavailable,
+    }
+
+
+def evaluate_testnet_auto_rollback(performance: Dict[str, Any], total_trades: int, profit_factor: float) -> Dict[str, Any]:
+    enabled = os.getenv("GATE_AUTO_ROLLBACK_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
+    environment = os.getenv("GATE_ENVIRONMENT", "testnet").strip().lower()
+    result = {"enabled": enabled, "environment": environment, "triggered": False, "reason": "disabled"}
+    if not enabled:
+        return result
+    if environment != "testnet":
+        result["reason"] = "live_forbidden"
+        return result
+    target_hash = os.getenv("GATE_AUTO_ROLLBACK_POLICY_HASH", "").strip()
+    if not target_hash:
+        result["reason"] = "target_policy_missing"
+        return result
+    try:
+        min_trades = max(1, int(os.getenv("GATE_AUTO_ROLLBACK_MIN_TRADES", "20")))
+        min_pf = float(os.getenv("GATE_AUTO_ROLLBACK_MIN_PROFIT_FACTOR", "0.8"))
+        max_drawdown = float(os.getenv("GATE_AUTO_ROLLBACK_MAX_DRAWDOWN_USD", "100"))
+    except ValueError:
+        result["reason"] = "invalid_threshold_config"
+        return result
+    if total_trades < min_trades:
+        result["reason"] = "insufficient_samples"
+        return result
+    observed_dd = float(performance.get("max_drawdown_usd") or 0)
+    reasons = []
+    if profit_factor < min_pf:
+        reasons.append("profit_factor")
+    if observed_dd > max_drawdown:
+        reasons.append("max_drawdown")
+    if not reasons:
+        result["reason"] = "thresholds_ok"
+        return result
+    try:
+        from r20_backend.policy_snapshot import get_current_policy_snapshot, restore_archived_policy
+        if get_current_policy_snapshot().get("policy_hash") == target_hash:
+            result["reason"] = "already_at_target"
+            return result
+        restore_archived_policy(target_hash)
+        result.update({"triggered": True, "reason": ",".join(reasons), "target_policy_hash": target_hash})
+    except Exception as exc:
+        result.update({"reason": "rollback_failed", "error": f"{type(exc).__name__}: {exc}"})
+    return result
 
 
 def clamp(value, lower, upper, default):
@@ -157,6 +312,8 @@ def load_closed_trades():
                         "gross_pnl": round(gross, 2),
                         "fee": round(fee, 2),
                         "net_pnl": round(pnl, 2),
+                        "funding_fee": t.get("funding_fee"),
+                        "slippage_bps": t.get("slippage_bps"),
                         "exit_reason": reason
                     })
         except Exception as e:
@@ -412,6 +569,7 @@ def run_self_evolution(force: bool = False):
         change_status, llm_review.get("ai_long_term_memory", []), existing_core_lessons
     )
 
+    candidate_payload = None
     if not preserve_existing_memory:
         # Safe extraction: convert potential dicts {"rule_text": "..."} to string safely
         safe_long_term = []
@@ -423,14 +581,19 @@ def run_self_evolution(force: bool = False):
             if val:
                 safe_long_term.append(val)
 
-        try:
-            published = memory_service.publish_review(
-                safe_long_term, expected_version=memory_snapshot["version"],
-                sample_size=total_trades, change_status=change_status)
-            preserve_existing_memory = not published
-        except Exception as exc:
-            preserve_existing_memory = True
-            log_msg(f"Memory publication rejected; retaining authority: {exc}")
+        candidate_id = f"ev_{now_bj.strftime('%Y%m%d_%H%M%S')}_{ledger_revision[:10]}"
+        candidate_payload = {
+            "id": candidate_id, "status": "pending", "created_at": now_bj.isoformat(),
+            "ledger_revision": ledger_revision, "expected_memory_version": memory_snapshot["version"],
+            "sample_size": total_trades, "change_status": change_status,
+            "proposed_memory": safe_long_term, "asset_multipliers": asset_mults,
+            "performance_snapshot": build_performance_snapshot(closed_trades),
+            "diagnosis_insights": insights, "evolution_actions": actions_taken,
+            "reason": llm_review.get("memory_overwrites_reason", ""),
+        }
+        atomic_write_json(_candidate_path(candidate_id), candidate_payload)
+        preserve_existing_memory = True
+        log_msg(f"Self-evolution candidate created for administrator review: {candidate_id}")
 
     # Keep the legacy markdown mirror in lock-step with the authority so the
     # public dashboard can never freeze on a hand-edited snapshot.
@@ -440,19 +603,11 @@ def run_self_evolution(force: bool = False):
     except Exception as exc:
         log_msg(f"Markdown mirror sync skipped: {exc}")
 
-    # Persist asset multipliers to data/asset_multipliers.json so brain trader can consume
-    try:
-        mults_payload = {
-            "timestamp": timestamp_str,
-            "multipliers": asset_mults,
-            "updated_by": "self_improvement_engine",
-        }
-        atomic_write_json(os.path.join(DATA_DIR, "asset_multipliers.json"), mults_payload)
-    except Exception as exc:
-        log_msg(f"Failed to persist asset multipliers: {exc}")
-
     # Reflect concurrent toggle/rollback even when the model returns NO_CHANGE.
     _, _, long_term_memory = memory_service.read_trading_context(AI_MEMORY_MD_FILE, AI_MEMORY_FILE)
+
+    performance_snapshot = build_performance_snapshot(closed_trades)
+    auto_rollback = evaluate_testnet_auto_rollback(performance_snapshot, total_trades, profit_factor)
 
     # 4. Save Dashboard Report
     report_payload = {
@@ -461,9 +616,12 @@ def run_self_evolution(force: bool = False):
         "total_trades": total_trades,
         "win_rate": win_rate,
         "profit_factor": profit_factor,
+        "performance_snapshot": performance_snapshot,
+        "auto_rollback": auto_rollback,
         "mode": "R20 Native Heuristic Memory (启发式长期记忆)",
         "change_status": change_status,
         "memory_preserved": preserve_existing_memory,
+        "candidate": candidate_payload,
         "insights": insights,
         "diagnosis_insights": insights,
         "memory_overwrites_reason": llm_review.get("memory_overwrites_reason", ""),
