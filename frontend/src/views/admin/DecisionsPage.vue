@@ -36,6 +36,21 @@ const macroText: Record<string, string> = {
   RANGE: '大周期震荡',
 }
 
+const tradeStatusText: Record<string, string> = {
+  not_submitted: '未下单',
+  submitted_testnet: '已提交模拟盘订单',
+  submitted_live: '已提交实盘订单',
+  blocked_safety_fail_closed: '安全门已关闭，暂停新增仓位',
+  blocked_invalid_margin: '保证金额度无效，已阻止下单',
+  blocked_invalid_size: '合约张数无效，已阻止下单',
+  blocked_opposite_position: '与现有持仓方向冲突，已阻止下单',
+  blocked_by_strategy_interceptor: '未通过策略风控，已阻止下单',
+  blocked_by_strategy_interceptor_error: '策略风控检查异常，已阻止下单',
+  blocked_price_deviation: '报价偏差过大，已阻止下单',
+  order_rejected_safe_wait: '交易所拒绝订单，已转为安全观望',
+  protection_failed_flatten_attempted: '保护单创建失败，已尝试安全平仓',
+}
+
 function pct(value: unknown, digits = 2) {
   const number = Number(value)
   return Number.isFinite(number) ? `${number.toFixed(digits)}%` : '--'
@@ -47,13 +62,7 @@ function cycleTime(value: unknown) {
 }
 
 function cycleTradeText(trade: any) {
-  const labels: Record<string, string> = {
-    not_submitted: '未下单',
-    submitted_testnet: '已提交测试网订单',
-    blocked_by_strategy_interceptor: '被策略拦截',
-    protection_failed_flatten_attempted: '保护单失败，已尝试平仓',
-  }
-  return labels[trade?.status] || trade?.status || '未下单'
+  return tradeStatusText[trade?.status] || (trade?.status ? `未知执行状态（${trade.status}）` : '未下单')
 }
 
 function formatTraderLog(raw: string) {
@@ -110,13 +119,7 @@ function formatTraderLog(raw: string) {
     })
 
     const trade = payload.trade || {}
-    const tradeStatus: Record<string, string> = {
-      not_submitted: '未下单',
-      submitted_testnet: '已提交测试网订单',
-      blocked_by_strategy_interceptor: '被策略拦截',
-      protection_failed_flatten_attempted: '保护单失败，已尝试平仓',
-    }
-    const tradeLine = `执行结果：${tradeStatus[trade.status] || trade.status || '未说明'}${trade.reason ? `（${trade.reason}）` : ''}`
+    const tradeLine = `执行结果：${cycleTradeText(trade)}${trade.reason ? `（${trade.reason}）` : ''}`
     return [`【交易巡检】${timestamp}`, `巡检状态：${returnCode === '0' ? '正常完成' : `异常结束（返回码 ${returnCode}）`}`, tradeLine, '', rows.join('\n\n') || '本轮没有可展示的合约决策'].join('\n')
   }).join('\n\n────────────────────────\n\n')
 }
