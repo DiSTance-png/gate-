@@ -16,6 +16,7 @@ from .risk import RiskLimits
 from .service import GateTradingService, protection_coverage_status
 from .risk_profiles import get_risk_profile
 from .safety import atomic_json, classify_error, cooldown_state, daily_loss_state, position_age_seconds, reconcile_exchange_state
+from .protection_lifecycle import is_system_protection, load_protection_intents, record_protection_intent, recovery_plans
 
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env", override=True)
@@ -27,6 +28,7 @@ DECISION_AUDIT = DATA / "ai_decision_audit.jsonl"
 SAFETY_STATUS = DATA / "gate_safety_status.json"
 RUNTIME_HEARTBEAT = DATA / "gate_trader_heartbeat.json"
 LEDGER = DATA / "trading_ledger.json"
+PROTECTION_INTENTS = DATA / "protection_intents.json"
 
 
 def _save_decision_payload(payload: dict, decisions_payload: dict, trade: dict, now: int, environment: str, risk_snapshot: dict | None = None) -> None:
@@ -470,6 +472,18 @@ def run_cycle() -> dict:
     lifecycle_actions: list[dict] = []
     if execution_enabled and not private_context["private_errors"]:
         service = GateTradingService(client, RiskLimits(settings.max_position_notional_usd, settings.max_total_margin_usd, settings.max_order_margin_usd))
+        lifecycle_close_attempts: set[str] = set()
+        protection_intents = load_protection_intents(PROTECTION_INTENTS, DECISION_AUDIT, DECISION_HISTORY, settings.environment)
+        for orphan in reconciliation["orphan_protections"]:
+            order_id = str(orphan.get("id_string") or orphan.get("id") or "")
+            contract_name = str((orphan.get("initial") or {}).get("contract") or orphan.get("contract") or "").upper()
+            if not order_id or not is_system_protection(orphan):
+                lifecycle_actions.append({"action": "KEEP_UNVERIFIED_ORPHAN", "contract": contract_name, "order_id": order_id, "reason": "not_created_by_gate_quant"})
+                continue
+            try:
+                lifecycle_actions.append({"action": "CANCEL_SYSTEM_ORPHAN", "contract": contract_name, **service.cancel_protection_confirmed(order_id=order_id)})
+            except Exception as exc:
+                lifecycle_actions.append({"action": "CANCEL_SYSTEM_ORPHAN", "contract": contract_name, "order_id": order_id, "error": str(exc), "category": classify_error(exc)})
         for stale in reconciliation["stale_orders"]:
             order_id = str(stale.get("id") or "")
             contract_name = str(stale.get("contract") or "").upper()
@@ -486,11 +500,53 @@ def run_cycle() -> dict:
             age = position_age_seconds(position)
             if age is not None and settings.max_position_age_seconds > 0 and age >= settings.max_position_age_seconds:
                 contract_name = str(position.get("contract") or "").upper()
+                lifecycle_close_attempts.add(contract_name)
                 try:
                     closed = service.close_position_safely(contract=contract_name, client_id=f"t-gate-time-{int(time.time() * 1000)}")
                     lifecycle_actions.append({"action": "CLOSE_MAX_AGE", "contract": contract_name, "age_seconds": int(age), "result": closed})
                 except Exception as exc:
                     lifecycle_actions.append({"action": "CLOSE_MAX_AGE", "contract": contract_name, "age_seconds": int(age), "error": str(exc), "category": classify_error(exc)})
+        recovery_source_available = True
+        try:
+            # Cleanup and time-based closes may have changed exchange state. A
+            # protection repair must only use a fresh, post-action position.
+            private_context["positions"] = client.positions() or []
+            private_context["pending_orders"] = client.open_orders() or []
+            private_context["protections"] = client.protection_orders() or []
+        except Exception as exc:
+            recovery_source_available = False
+            lifecycle_actions.append({"action": "REFRESH_BEFORE_PROTECTION_REPAIR", "error": str(exc), "category": classify_error(exc)})
+        plans = recovery_plans(private_context["positions"], private_context["protections"], protection_intents) if recovery_source_available else []
+        protection_closed_contracts: set[str] = set()
+        for plan in plans:
+            contract_name = plan["contract"]
+            if contract_name in lifecycle_close_attempts or contract_name in protection_closed_contracts:
+                continue
+            if plan["close_required"]:
+                client_id = f"t-gate-pclose-{int(time.time() * 1000)}"
+                try:
+                    closed = service.close_position_safely(contract=contract_name, client_id=client_id)
+                    lifecycle_actions.append({"action": "CLOSE_CROSSED_MISSING_PROTECTION", **plan, "client_id": client_id, "result": closed})
+                    protection_closed_contracts.add(contract_name)
+                except Exception as exc:
+                    lifecycle_actions.append({"action": "CLOSE_CROSSED_MISSING_PROTECTION", **plan, "client_id": client_id, "error": str(exc), "category": classify_error(exc)})
+                continue
+            if not plan["recoverable"]:
+                lifecycle_actions.append({"action": "KEEP_PROTECTION_GAP", **plan})
+                continue
+            kind = plan["kind"]
+            client_tag = "rtp" if kind == "take_profit" else "rsl"
+            client_id = f"t-gate-{client_tag}-{int(time.time() * 1000)}"
+            try:
+                meta = client.contracts(contract_name)
+                trigger_price = _round_price(float(plan["trigger_price"]), meta.get("order_price_round") or meta.get("mark_price_round") or "0")
+                created = client.create_protection_order(contract=contract_name, size=Decimal(plan["close_size"]), trigger_price=trigger_price, rule=plan["rule"], client_id=client_id)
+                current_rows = client.protection_orders(contract_name) or []
+                if not _protection_matches(current_rows, client_id=client_id, size=Decimal(plan["close_size"]), rule=plan["rule"]):
+                    raise RuntimeError(f"Gate repaired {kind} order was not confirmed")
+                lifecycle_actions.append({"action": "RESTORE_TAKE_PROFIT" if kind == "take_profit" else "RESTORE_STOP_LOSS", **plan, "client_id": client_id, "result": created})
+            except Exception as exc:
+                lifecycle_actions.append({"action": "RESTORE_TAKE_PROFIT" if kind == "take_profit" else "RESTORE_STOP_LOSS", **plan, "client_id": client_id, "error": str(exc), "category": classify_error(exc)})
         if lifecycle_actions:
             try:
                 private_context["positions"] = client.positions() or []
@@ -798,6 +854,13 @@ def run_cycle() -> dict:
             if not tp_covered or not sl_covered or not total_coverage["fully_protected"]:
                 raise RuntimeError(f"Gate {settings.environment.title()} protection coverage verification failed (new_tp={tp_covered}, new_sl={sl_covered}, total={total_coverage['fully_protected']})")
             result["trade"] = {"status": f"submitted_{settings.environment}", "environment": settings.environment, "contract": trade_symbol, "client_id": client_id, "position_operation": "add" if is_add_on else "open", "order_type": "limit", "price": limit_price, "size": GateFuturesClient._api_size(size), "expected_position_size": GateFuturesClient._api_size(expected_position_size), "configured_leverage": leverage, "risk_snapshot": risk_snapshot, "estimated_margin_usdt": estimated_margin, "leverage_update": leverage_result, "order": order, "take_profit": tp_order, "stop_loss": sl_order, "protection_covered": True, "take_profit_covered": True, "stop_loss_covered": True}
+            record_protection_intent(PROTECTION_INTENTS, {
+                "environment": settings.environment, "contract": trade_symbol, "entry_client_id": client_id,
+                "position_side": "long" if size > 0 else "short", "entry_size": str(abs(size)),
+                "entry_price": limit_price,
+                "take_profit_price": _round_price(tp, tick), "stop_loss_price": _round_price(sl, tick),
+                "created_at_ms": now, "policy_version": policy_snapshot["policy_version"], "policy_hash": policy_snapshot["policy_hash"],
+            })
         except Exception as protection_error:
             cleanup = {}
             try:

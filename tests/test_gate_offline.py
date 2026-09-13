@@ -11,6 +11,7 @@ from gate_quant.strategy_adapter import validate_decision
 from gate_quant.risk_profiles import get_risk_profile
 from r20_gateway.scheduler import JOBS
 from gate_quant.safety import classify_error, daily_loss_state, reconcile_exchange_state
+from gate_quant.protection_lifecycle import intent_from_history, is_system_protection, recovery_plans
 
 
 class FakeSession:
@@ -106,6 +107,17 @@ def test_protection_coverage():
                 {"initial": {"size": -2}, "trigger": {"rule": 2}},
             ]
     assert GateTradingService(C(), RiskLimits(1, 1, 1)).verify_protection_coverage("BTC_USDT", 2)
+
+
+def test_protection_cancel_is_confirmed_by_fresh_gate_query():
+    class C:
+        def cancel_protection_order(self, order_id):
+            return {"id": order_id, "status": "cancelled"}
+        def protection_orders(self):
+            return [{"id_string": "other"}]
+    result = GateTradingService(C(), RiskLimits(1, 1, 1)).cancel_protection_confirmed(order_id="90071992547409930")
+    assert result["cancelled"] is True
+    assert result["order_id"] == "90071992547409930"
 
 
 def test_llm_parser_uses_reasoning_tail_and_requires_all_contracts():
@@ -252,6 +264,50 @@ def test_protection_requires_each_expected_client_id_and_rule():
     assert _protection_matches(rows, client_id="t-gate-tp-1", size=-2, rule=1)
     assert _protection_matches(rows, client_id="t-gate-sl-1", size=-2, rule=2)
     assert not _protection_matches(rows[:1], client_id="t-gate-sl-1", size=-2, rule=2)
+
+
+def test_protection_intent_is_recovered_from_submitted_history():
+    row = {
+        "generated_at_ms": 123, "environment": "testnet",
+        "trade": {"status": "submitted_testnet", "contract": "ETH_USDT", "client_id": "t-gate-ai-123", "size": 4,
+                  "take_profit": {"trigger": {"price": "2680"}}, "stop_loss": {"order": {"trigger": {"price": "2528"}}}},
+    }
+    intent = intent_from_history(row)
+    assert intent is not None
+    assert intent["take_profit_price"] == "2680"
+    assert intent["stop_loss_price"] == "2528"
+    assert intent["position_side"] == "long"
+
+
+def test_recovery_plan_only_restores_missing_side_from_matching_intent():
+    positions = [{"contract": "ETH_USDT", "size": 4, "mark_price": "2600", "open_time": 1}]
+    protections = [{"trigger": {"rule": 1}, "initial": {"contract": "ETH_USDT", "size": -4, "text": "t-gate-tp-1"}}]
+    intents = [{"contract": "ETH_USDT", "position_side": "long", "entry_client_id": "t-gate-ai-1", "take_profit_price": "2680", "stop_loss_price": "2528", "created_at_ms": 1000}]
+    plans = recovery_plans(positions, protections, intents)
+    assert len(plans) == 1
+    assert plans[0]["kind"] == "stop_loss"
+    assert plans[0]["close_size"] == "-4"
+    assert plans[0]["recoverable"] is True
+
+
+def test_recovery_plan_rejects_crossed_saved_trigger_and_manual_orphan():
+    plans = recovery_plans(
+        [{"contract": "ETH_USDT", "size": 4, "mark_price": "2500", "open_time": 1}], [],
+        [{"contract": "ETH_USDT", "position_side": "long", "entry_client_id": "t-gate-ai-1", "take_profit_price": "2680", "stop_loss_price": "2528", "created_at_ms": 1000}],
+    )
+    crossed = next(plan for plan in plans if plan["kind"] == "stop_loss")
+    assert crossed["recoverable"] is False
+    assert crossed["close_required"] is True
+    assert is_system_protection({"initial": {"text": "manual-protection"}}) is False
+    assert is_system_protection({"initial": {"text": "t-gate-rsl-123"}}) is True
+
+
+def test_recovery_plan_does_not_link_an_old_intent_to_a_new_position():
+    plans = recovery_plans(
+        [{"contract": "ETH_USDT", "size": 4, "mark_price": "2600", "open_time": 7200}], [],
+        [{"contract": "ETH_USDT", "position_side": "long", "entry_client_id": "t-gate-ai-old", "take_profit_price": "2680", "stop_loss_price": "2528", "created_at_ms": 1}],
+    )
+    assert all(plan["recoverable"] is False and plan["close_required"] is False for plan in plans)
 
 
 def test_market_and_limit_semantics_remain_distinct():

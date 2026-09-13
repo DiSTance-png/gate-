@@ -73,3 +73,10 @@ class GateTradingService:
         if any(str(row.get("id") or "") == str(order_id) for row in remaining if isinstance(row, dict)):
             raise RuntimeError(f"Gate cancellation not confirmed for order {order_id}")
         return {"cancelled": True, "order_id": str(order_id), "result": result}
+
+    def cancel_protection_confirmed(self, *, order_id: str) -> dict:
+        result = self.client.cancel_protection_order(order_id)
+        remaining = self.client.protection_orders() or []
+        if any(str(row.get("id_string") or row.get("id") or "") == str(order_id) for row in remaining if isinstance(row, dict)):
+            raise RuntimeError(f"Gate protection cancellation not confirmed for order {order_id}")
+        return {"cancelled": True, "order_id": str(order_id), "result": result}

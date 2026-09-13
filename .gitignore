@@ -26,4 +26,5 @@ data/self_improvement_history/
 data/evolution_candidates/
 data/gate_safety_status.json
 data/gate_trader_heartbeat.json
+data/protection_intents.json
 backups/
