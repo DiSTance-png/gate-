@@ -36,7 +36,7 @@ def _listening(address: tuple[str, int], timeout: float = 1.0) -> bool:
 
 def _ssh_command(address: tuple[str, int]) -> list[str]:
     host, port = address
-    ssh_host = os.getenv("R20_OKX_PROXY_SSH_HOST", "my-vps").strip() or "my-vps"
+    ssh_host = os.getenv("R20_OKX_PROXY_SSH_HOST", "okx-vps").strip() or "okx-vps"
     remote = os.getenv("R20_OKX_PROXY_REMOTE", "127.0.0.1:8888").strip() or "127.0.0.1:8888"
     return [
         "ssh.exe" if os.name == "nt" else "ssh",

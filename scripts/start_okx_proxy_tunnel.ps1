@@ -8,7 +8,7 @@ $arguments = @(
     "-o", "ExitOnForwardFailure=yes",
     "-o", "ServerAliveInterval=30",
     "-o", "ServerAliveCountMax=3",
-    "my-vps"
+    "your-okx-vps-ssh-alias"
 )
 
 while ($true) {
