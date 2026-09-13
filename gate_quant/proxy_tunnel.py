@@ -43,7 +43,7 @@ class GateSshTunnel:
 
     @property
     def ssh_host(self) -> str:
-        return os.getenv("GATE_SSH_TUNNEL_HOST", "my-vps")
+        return os.getenv("GATE_SSH_TUNNEL_HOST", "gate-vps")
 
     @property
     def remote_port(self) -> int:
