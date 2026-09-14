@@ -95,9 +95,10 @@ const router = createRouter({
 router.beforeEach(async (to) => {
   const auth = useAuthStore()
   if (to.meta.requiresAuth && !auth.isAuthenticated) {
-    // Try restore session from localStorage
-    auth.restoreSession()
-    if (!auth.isAuthenticated) {
+    // Validate a restored token before entering the control plane. An expired
+    // token must return to login instead of leaving a blank authenticated SPA.
+    const restored = await auth.restoreSession()
+    if (!restored) {
       return { name: 'admin-login' }
     }
   }

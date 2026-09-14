@@ -62,18 +62,18 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
-  function restoreSession() {
+  async function restoreSession(): Promise<boolean> {
     const savedToken = localStorage.getItem(SESSION_TOKEN_KEY)
     const savedUser = localStorage.getItem(SESSION_USER_KEY)
-    if (savedToken && savedUser) {
-      token.value = savedToken
-      try {
-        user.value = JSON.parse(savedUser)
-      } catch {
-        user.value = null
-      }
-      validateSession()
+    if (!savedToken || !savedUser) return false
+    token.value = savedToken
+    try {
+      user.value = JSON.parse(savedUser)
+    } catch {
+      logout()
+      return false
     }
+    return await validateSession()
   }
 
   function logout() {

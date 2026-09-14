@@ -421,8 +421,18 @@ def all_dashboard():
     for row in reversed(decision_history[-200:]):
         stamp = int(row.get("generated_at_ms") or 0) if isinstance(row, dict) else 0
         history_view.append({**row, "time": dt.datetime.fromtimestamp(stamp / 1000).strftime("%Y-%m-%d %H:%M:%S") if stamp else "时间未记录", "macro_assessment": f"{(row.get('risk_snapshot') or {}).get('label', profile.label)}档位 · Gate {(row.get('environment') or s.environment).upper()} · {(row.get('trade') or {}).get('status', 'not_submitted')}"})
+    ledger_rows = _read_json_file("trading_ledger.json", [])
+    if not isinstance(ledger_rows, list):
+        ledger_rows = []
+    # The Gate ledger is local to this project and is populated from Gate's
+    # native position_close/account-book records. Newest closes are shown first.
+    ledger_rows = sorted(
+        (row for row in ledger_rows if isinstance(row, dict)),
+        key=lambda row: str(row.get("close_time") or row.get("open_time") or ""),
+        reverse=True,
+    )
     normalized_protections = _dashboard_protection_orders(protections_raw or [], positions_raw or [])
-    return {"timestamp": str(int(time.time() * 1000)), "is_stale": bool(errors), "account": {"total_eq": float(account.get("total") or 0), "avail_eq": float(account.get("available") or 0), "upl": float(account.get("unrealised_pnl") or 0), "currency": s.settle.upper(), "margin_usage_pct": 0, "initial_capital": s.initial_capital_usd or None}, "positions_summary": {"total_count": len(positions), "long_count": sum(p["side"] == "long" for p in positions), "short_count": sum(p["side"] == "short" for p in positions), "items": positions}, "pending_orders": pending, "factors": factors, "factor_library": factor_snapshot, "macro_assessment": "Gate Futures 原生行情、因子与账户数据巡检中", "llm_runtime": {"model": os.getenv("LLM_MODEL", "Gate AI Worker"), "provider_name": "Gate-native", "reasoning_effort": os.getenv("LLM_REASONING_EFFORT", "high"), "api_format": "openai_chat"}, "logs": [f"Gate {s.environment.upper()} · {profile.label} · {s.leverage:g}x · 私有数据{'可用' if not errors else '未配置或不可用'}"], "trades": [], "today_stats": book_stats, "news_intelligence": [], "protection_orders": protections_raw or [], "protection_orders_normalized": normalized_protections, "ai_brain_history": history_view, "risk_snapshot": risk_snapshot, "safety_status": _safety_status(), "gate_environment": s.environment, "gate_public_market_environment": s.public_market_environment, "errors": sorted(set(errors))}
+    return {"timestamp": str(int(time.time() * 1000)), "is_stale": bool(errors), "account": {"total_eq": float(account.get("total") or 0), "avail_eq": float(account.get("available") or 0), "upl": float(account.get("unrealised_pnl") or 0), "currency": s.settle.upper(), "margin_usage_pct": 0, "initial_capital": s.initial_capital_usd or None}, "positions_summary": {"total_count": len(positions), "long_count": sum(p["side"] == "long" for p in positions), "short_count": sum(p["side"] == "short" for p in positions), "items": positions}, "pending_orders": pending, "factors": factors, "factor_library": factor_snapshot, "macro_assessment": "Gate Futures 原生行情、因子与账户数据巡检中", "llm_runtime": {"model": os.getenv("LLM_MODEL", "Gate AI Worker"), "provider_name": "Gate-native", "reasoning_effort": os.getenv("LLM_REASONING_EFFORT", "high"), "api_format": "openai_chat"}, "logs": [f"Gate {s.environment.upper()} · {profile.label} · {s.leverage:g}x · 私有数据{'可用' if not errors else '未配置或不可用'}"], "trades": ledger_rows, "today_stats": book_stats, "news_intelligence": [], "protection_orders": protections_raw or [], "protection_orders_normalized": normalized_protections, "ai_brain_history": history_view, "risk_snapshot": risk_snapshot, "safety_status": _safety_status(), "gate_environment": s.environment, "gate_public_market_environment": s.public_market_environment, "errors": sorted(set(errors))}
 
 
 @app.get("/api/v1/contracts/{contract}")
@@ -624,7 +634,9 @@ def gate_admin_history(page: int = 1, page_size: int = 20, query: str = "", x_ga
     except Exception as exc:
         _backend_log(f"history order sync failed: {exc}")
     try:
-        for row in c.account_book(from_time=int(time.time()) - 90 * 86400, to_time=int(time.time()), limit=1000):
+        # Gate Futures rejects account-book ranges greater than 30 days.
+        # Older synchronized rows remain in the local trade-history store.
+        for row in c.account_book(from_time=int(time.time()) - 30 * 86400, to_time=int(time.time()), limit=1000):
             if not isinstance(row, dict):
                 continue
             external = str(row.get("id") or row.get("trade_id") or f"{row.get('time')}-{row.get('text')}")

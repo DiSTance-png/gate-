@@ -12,6 +12,7 @@ from gate_quant.risk_profiles import get_risk_profile
 from r20_gateway.scheduler import JOBS
 from gate_quant.safety import classify_error, cooldown_state, daily_loss_state, reconcile_exchange_state
 from gate_quant.protection_lifecycle import intent_from_history, is_system_protection, recovery_plans
+from scripts.sync_gate_ledger import _ledger_row
 
 
 class FakeSession:
@@ -27,6 +28,28 @@ class FakeSession:
 
 
 def settings(): return GateSettings(environment="testnet", api_key="offline-key", api_secret="offline-secret", max_order_margin_usd=10, max_total_margin_usd=20, max_position_notional_usd=100)
+
+
+def test_gate_position_close_maps_native_lifecycle_fields():
+    row = _ledger_row({
+        "contract": "BTC_USDT", "text": "t-gate-time-1", "side": "long",
+        "long_price": "76815.334991974318", "short_price": "78231.893258426966",
+        "max_size": "546", "first_open_time": 1789336927, "time": 1789395332,
+        "lever": "5", "margin_mode": "cross", "pnl": "83.165703925875",
+        "pnl_pnl": "88.25158", "pnl_fee": "-4.42752016", "pnl_fund": "-0.658355914125",
+    }, quanto_multiplier=0.0001)
+    assert row is not None
+    assert row["side"] == "多"
+    assert row["lever"] == "5x"
+    assert row["open_px"] == pytest.approx(76815.334991974318)
+    assert row["close_px"] == pytest.approx(78231.893258426966)
+    assert row["open_time"] == "2026-09-14 06:02:07"
+    assert row["close_time"] == "2026-09-14 22:15:32"
+    assert row["margin"] == pytest.approx(838.82345771)
+    assert row["net_pnl"] == pytest.approx(83.16570393)
+    assert row["fee"] == pytest.approx(-4.42752016)
+    assert row["funding_fee"] == pytest.approx(-0.65835591)
+    assert row["hold_duration"] == "16小时13分"
 
 
 def test_gateway_scheduler_includes_gate_ledger_and_self_improvement():

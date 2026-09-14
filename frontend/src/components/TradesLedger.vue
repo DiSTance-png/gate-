@@ -161,7 +161,7 @@ function clean(v: any, fallback = '--'): string {
                 <div class="flex items-center space-x-1.5">
                   <span class="font-bold text-sm 2xl:text-base" style="color: var(--text-main);">{{ t.inst }}</span>
                   <span :class="t.side === '多' ? 'capsule-direction-long' : 'capsule-direction-short'">
-                    {{ t.side }} {{ t.lever || '3x' }}
+                    {{ t.side }} {{ t.lever || '--' }}
                   </span>
                 </div>
               </td>
@@ -235,7 +235,7 @@ function clean(v: any, fallback = '--'): string {
         style="border-color: var(--border-subtle); background-color: var(--bg-card-subtle); color: var(--text-faint);"
       >
         <span>已载入 {{ trades.length }} 笔真实撮合成交记录</span>
-        <span class="hidden sm:inline">Gate 交易所实盘历史履历</span>
+        <span class="hidden sm:inline">Gate 当前环境真实历史履历</span>
       </div>
     </div>
   </div>
