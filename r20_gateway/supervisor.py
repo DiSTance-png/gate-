@@ -53,9 +53,8 @@ def _is_gateway_worker(pid: int) -> bool:
         # PID values are reused. Never trust a stale PID file without checking
         # the target process, otherwise shutdown can terminate an unrelated app.
         command_line = _windows_process_command_line(pid)
-        # The module name plus this project's ASCII junction is sufficient to
-        # distinguish Gate's worker from the unrelated OKX service; avoid
-        # Unicode path matching through legacy PowerShell output encoding.
+        # The module name plus this project's ASCII junction identifies the
+        # worker without relying on legacy PowerShell Unicode path output.
         return "r20_gateway.worker" in command_line and "gate-quant" in command_line.lower()
     if not _alive(pid): return False
     try:

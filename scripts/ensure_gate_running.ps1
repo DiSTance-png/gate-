@@ -30,7 +30,7 @@ if (-not (Test-Path -LiteralPath $pythonw)) {
 
 # Remove every stale Gate Web launcher, including older launchers that used the
 # system Python and therefore did not include the project path in CommandLine.
-# The module name is Gate-specific and cannot match the OKX service.
+# The Gate Web module name scopes cleanup to this service.
 $stale = Get-CimInstance Win32_Process | Where-Object {
     $_.CommandLine -match '(?i)(?:-m\s+uvicorn\s+)?gate_quant\.web:app'
 }

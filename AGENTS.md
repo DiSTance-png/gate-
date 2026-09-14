@@ -1,15 +1,14 @@
 # Gate 量化项目智能体工作说明
 
-本文件面向在此仓库工作的 AI 智能体和开发者。开始诊断或修改前必须完整阅读本文件，再按需阅读 `docs/SYSTEM_GUIDE_ZH.md`、`README.md` 和相关源码。不要根据原 OKX 项目、旧对话或界面截图猜测当前实现。
+本文件面向在此仓库工作的 AI 智能体和开发者。开始诊断或修改前必须完整阅读本文件，再按需阅读 `docs/SYSTEM_GUIDE_ZH.md`、`README.md` 和相关源码。不要根据上游项目、旧对话或界面截图猜测当前实现。
 
 ## 项目标识与边界
 
 - 实际项目根目录：`C:\Users\quesi\Documents\ChatGPT\New project\gate量化`。
 - `C:\Users\quesi\Documents\ChatGPT\New project\gate-quant` 是指向上述目录的 Windows Junction，不是第二套代码。
 - Git 远端：`https://github.com/DiSTance-png/gate-.git`，主分支 `main`。
-- 上游来源：`555cute/r20-quantum-trader`。本仓库复用其策略决策链，但交易执行层是 Gate Futures 原生 API。
-- 不得修改、停止、复用或清理原 R20/OKX 项目的进程、配置、日志、数据库、代理和凭证。
-- 本仓库的 `r20_backend`、`r20_gateway`、`scripts` 中保留了一些上游命名和兼容模块。文件名包含 `okx` 不代表 Gate 主链正在调用它，删除前必须先查真实 import/call path。
+- 上游来源：`555cute/r20-quantum-trader`。本仓库复用其策略决策链，但当前项目是独立运行的 Gate 系统，交易执行层是 Gate Futures 原生 API。
+- 本仓库的 `r20_backend`、`r20_gateway`、`scripts` 中保留了一些上游命名和兼容模块。清理遗留模块前必须先检查真实 import/call path，不能按文件名猜测是否仍在使用。
 
 ## 不可突破的交易约束
 
@@ -55,7 +54,7 @@
 - 新保存的 Gate Key/Secret 位于 `data/r20_secrets.enc`，密钥位于 `data/.r20_secret_key`，两者均不得提交或显示内容。
 - `gate_quant/config.py` 优先使用加密仓库，再读取当前环境对应的 `.env` 变量。
 - 面板配置采用“候选配置先完整校验，再保存”。不能改回先写文件后校验。
-- `GATE_PROXY_URL` 和 `GATE_REQUIRE_PROXY` 仅属于 Gate；不要读取 OKX 代理变量。
+- `GATE_PROXY_URL` 和 `GATE_REQUIRE_PROXY` 是 Gate 网络路径的唯一代理配置来源。
 - `GATE_SSH_TUNNEL_*` 只描述本机到用户 VPS 代理的隧道。公开文档只能写通用能力，不得提交私人主机名、IP、用户名或端口凭证。
 - 所有 `data/` 运行快照、数据库、日志和凭证都应被 `.gitignore` 排除。提交前必须检查 staged 文件。
 
@@ -90,7 +89,7 @@
 常见误判：
 
 - Gateway offline 不等于 Gate API 不可用；Gateway 是本地调度/通知进程。
-- Gate 不需要类似 OKX 的 CLI 才能下单，本系统直接签名调用官方 Futures REST API。
+- Gate 下单不依赖外部交易 CLI，本系统直接签名调用官方 Futures REST API。
 - AI 决策每 15 分钟运行，但成交对账每 10 秒运行；二者不能混为同一遥测。
 - K 线来自公开行情环境，账户、持仓和交易永远来自 `GATE_ENVIRONMENT`。
 - “没有仓位”可能是限价单未成交、已撤单、触发止损或最长持仓平仓，必须结合订单和 Gate 平仓台账判断。
@@ -98,7 +97,7 @@
 
 ## 修改和验证规则
 
-- 修改前先读目标模块和测试，保持 Gate 原生字段，不做 OKX 字段硬替换。
+- 修改前先读目标模块和测试，始终保持 Gate 原生字段和语义。
 - 手工编辑使用小范围补丁，保留用户或其他对话的未提交修改。
 - 正常最低验证：
 

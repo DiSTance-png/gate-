@@ -1,7 +1,7 @@
-"""Gate-owned news input with an explicit no-data fail-closed state.
+"""Gate news input with an explicit no-data fail-closed state.
 
-The old OKX news CLI is deliberately not called.  A missing verified feed must
-remain visible to the strategy instead of being represented as neutral news.
+A missing verified feed remains visible to the strategy instead of being
+represented as neutral news.
 """
 from __future__ import annotations
 

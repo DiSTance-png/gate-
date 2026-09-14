@@ -250,7 +250,7 @@ def _features(client, contract, ticker=None):
 
 
 def _strategy_package(feature: dict, ticker: dict | None = None) -> dict:
-    """Map Gate-native fields into the original OKX strategy package contract."""
+    """Map Gate-native fields into the inherited strategy package contract."""
     ticker = ticker or {}
     inst = feature["contract"].replace("_USDT", "-USDT-SWAP")
     calculus = feature.get("calculus") or {}
@@ -672,8 +672,7 @@ def run_cycle() -> dict:
     position_management = _as_instruction_list(management.get("position_management"))
     pending_management = _as_instruction_list(management.get("pending_orders_management"))
     decisions_payload = {symbol: {"instId": symbol, "decision_timestamp_ms": now, "decision": item, "source": llm_source, "llm_error": llm_error, "llm_preview": llm_preview, "policy_version": policy_snapshot["policy_version"], "policy_hash": policy_snapshot["policy_hash"], "risk_snapshot": risk_snapshot, "indicators": next(f for f in features if f["contract"] == symbol)} for symbol, item in decisions.items()}
-    # Apply the same deterministic quote gate used by the original OKX
-    # execution chain before selecting any candidate for execution.
+    # Apply the inherited deterministic quote gate before selecting a candidate.
     try:
         from .strategy_adapter import validate_decision
         active_positions = {str(p.get("contract")): p for p in private_context["positions"] if float(p.get("size") or 0) != 0}
@@ -682,7 +681,7 @@ def run_cycle() -> dict:
             item = envelope["decision"]
             if item.get("action") == "WAIT":
                 continue
-            # Gate output may use the OKX council aliases; normalize them here.
+            # Normalize inherited council aliases at the strategy boundary.
             item["take_profit_price"] = float(item.get("take_profit_price") or item.get("take_profit") or 0)
             item["stop_loss_price"] = float(item.get("stop_loss_price") or item.get("stop_loss") or 0)
             item["entry_price"] = float(item.get("entry_price") or 0)

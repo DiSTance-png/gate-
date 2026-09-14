@@ -1,7 +1,7 @@
 """Reuse the existing R20 decision chain behind a Gate-native data adapter.
 
 This module deliberately exposes only pure strategy helpers. It never imports
-OKX credentials, invokes the OKX CLI, writes R20 files, or performs exchange IO.
+exchange credentials, invokes a trading CLI, writes runtime files, or performs exchange IO.
 """
 from __future__ import annotations
 

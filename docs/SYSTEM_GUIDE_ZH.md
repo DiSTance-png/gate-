@@ -6,9 +6,9 @@
 
 ## 1. 系统定位
 
-本项目基于 `555cute/r20-quantum-trader` 二次开发。保留和复用的核心是原 R20 的策略提示词、六合约决策契约、持仓/挂单管理契约、因子结构、物理拦截器、管理后台和策略版本机制；重新实现的是交易所边界。
+本项目基于 `555cute/r20-quantum-trader` 二次开发。保留和复用的核心是上游的策略提示词、六合约决策契约、持仓/挂单管理契约、因子结构、物理拦截器、管理后台和策略版本机制；重新实现的是交易所边界。当前仓库是一套可独立部署和运行的 Gate 系统。
 
-Gate 执行层不是把 OKX 字段改名后继续使用，而是直接使用 Gate API v4 Futures 原生语义：
+Gate 执行层直接使用 Gate API v4 Futures 原生语义：
 
 - 合约名采用 `BTC_USDT` 等 Gate contract。
 - 下单使用 `/futures/usdt/orders`。
@@ -19,20 +19,20 @@ Gate 执行层不是把 OKX 字段改名后继续使用，而是直接使用 Gat
 
 系统当前是本地常驻应用，Web 绑定 `127.0.0.1:8081`。它不依赖 Gate CLI；所有行情、账户和交易操作都由 Python 客户端签名调用 Gate 官方 Futures REST API。
 
-## 2. 系统边界
+## 2. 独立运行边界
 
-Gate 项目与原 OKX/R20 项目必须保持以下隔离：
+本仓库拥有完整的独立运行边界：
 
-| 项目 | Gate 本系统 | 原 OKX/R20 |
-|---|---|---|
-| 项目目录 | `gate量化` | 其他独立目录 |
-| Web 端口 | `8081` | 不复用 |
-| 环境配置 | 本项目 `.env` | 不读取 |
-| API 凭证 | Gate Testnet/Live 独立键名 | 不读取 OKX 凭证 |
-| 代理 | `GATE_PROXY_URL` 与 `GATE_SSH_TUNNEL_*` | 不读取 OKX 代理 |
-| 日志 | 本项目 `logs/` | 不共享 |
-| 数据库 | 本项目 `data/`、`runtime/` | 不共享 |
-| 进程 | `gate_quant.web`、本目录 `r20_gateway.worker` | 不停止、不复用 |
+| 项目 | 本系统使用位置 |
+|---|---|
+| 项目目录 | `gate量化` |
+| Web 端口 | `127.0.0.1:8081` |
+| 环境配置 | 项目根目录 `.env` |
+| API 凭证 | Gate Testnet/Live 独立键名与加密仓库 |
+| 代理 | `GATE_PROXY_URL` 与 `GATE_SSH_TUNNEL_*` |
+| 日志 | 项目根目录 `logs/` |
+| 数据库与快照 | 项目根目录 `data/`、`runtime/` |
+| 主要进程 | `gate_quant.web`、`r20_gateway.worker` |
 
 本机还存在一个 ASCII 路径 `gate-quant`。它是指向 `gate量化` 的 Windows Junction，用于避免某些 Windows 进程检查对中文路径编码不稳定；它不是项目副本。
 
@@ -308,7 +308,7 @@ Gate Python Client
 
 `GATE_REQUIRE_PROXY=true` 时，如果没有 `GATE_PROXY_URL`，配置直接拒绝；SSH 隧道启用但建立失败时，Web 启动失败。这样不会悄悄回退到本地直连。
 
-SSH 隧道由 Web lifespan 管理。已经存在并且端口可用的隧道会复用，不创建重复转发。这里的代理只用于 Gate/AI 配置指定的网络请求，不应修改原 OKX 隧道。
+SSH 隧道由 Web lifespan 管理。已经存在并且端口可用的隧道会复用，不创建重复转发。这里的代理只用于 Gate/AI 配置指定的网络请求。
 
 ## 16. 数据、日志和台账
 
@@ -373,7 +373,7 @@ Windows 下 `.venv\Scripts\pythonw.exe` 可能再启动基础解释器 `C:\Pytho
 - Gateway 的 OS 文件锁只有一个持有者。
 - 调度日志没有同一任务同秒重复启动。
 
-不要通过杀死所有 Python 进程处理问题，因为原 OKX 或其他程序也可能使用 Python。重启前应先解析精确命令行、端口所有者和父子关系。
+不要通过杀死所有 Python 进程处理问题，因为本机其他程序也可能使用 Python。重启前应先解析精确命令行、端口所有者和父子关系。
 
 ## 19. 推荐诊断命令
 
