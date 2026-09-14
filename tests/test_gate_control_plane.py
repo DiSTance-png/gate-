@@ -1,5 +1,6 @@
 import importlib
 import sys
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -44,6 +45,9 @@ def configured_settings(**overrides):
 
 
 def test_credentials_are_selected_only_for_active_environment(monkeypatch):
+    import r20_gateway.secrets as secret_store
+
+    monkeypatch.setattr(secret_store, "load_secrets", lambda: {})
     monkeypatch.setenv("GATE_TESTNET_API_KEY", "test-key")
     monkeypatch.setenv("GATE_TESTNET_API_SECRET", "test-secret")
     monkeypatch.setenv("GATE_LIVE_API_KEY", "live-key")
@@ -58,6 +62,23 @@ def test_credentials_are_selected_only_for_active_environment(monkeypatch):
     monkeypatch.setenv("GATE_PUBLIC_MARKET_ENV", "live")
     selected = load_settings()
     assert (selected.api_key, selected.api_secret) == ("live-key", "live-secret")
+
+
+def test_encrypted_gate_credentials_override_plain_environment(monkeypatch):
+    import r20_gateway.secrets as secret_store
+
+    monkeypatch.setenv("GATE_ENVIRONMENT", "live")
+    monkeypatch.setenv("GATE_PUBLIC_MARKET_ENV", "live")
+    monkeypatch.setenv("GATE_LIVE_API_KEY", "plain-key")
+    monkeypatch.setenv("GATE_LIVE_API_SECRET", "plain-secret")
+    monkeypatch.setattr(secret_store, "load_secrets", lambda: {
+        "GATE_LIVE_API_KEY": "encrypted-key",
+        "GATE_LIVE_API_SECRET": "encrypted-secret",
+    })
+
+    selected = load_settings()
+
+    assert (selected.api_key, selected.api_secret) == ("encrypted-key", "encrypted-secret")
 
 
 def test_account_book_stats_reports_gate_pnl_win_loss_counts(monkeypatch):
@@ -144,6 +165,81 @@ def test_live_read_only_config_is_allowed_without_trading_switch(monkeypatch):
     result = web.gate_admin_config(payload, None)
     assert result["environment"] == "live"
     assert captured["GATE_LIVE_TRADING_ENABLED"] == "false"
+    assert captured["GATE_PUBLIC_MARKET_ENV"] == "live"
+
+
+def test_manual_protection_write_requires_environment_execution_switch(monkeypatch):
+    import gate_quant.web as web
+
+    monkeypatch.setattr(web, "_require_control_admin", lambda token: {"username": "tester"})
+    monkeypatch.setattr(web, "load_settings", lambda: configured_settings(environment="live", live_trading_enabled=False, public_market_environment="live"))
+    payload = web.GateProtectionRequest(
+        contract="BTC_USDT",
+        size=-1,
+        trigger_price="50000",
+        rule=2,
+        client_id="t-manual-stop",
+    )
+    with pytest.raises(web.HTTPException) as exc:
+        web.create_protection(payload, None)
+    assert exc.value.status_code == 403
+
+
+def test_gate_admin_saves_credentials_only_to_encrypted_store(monkeypatch):
+    import gate_quant.web as web
+    config_values = {}
+    encrypted_values = {}
+    monkeypatch.setattr(web, "_require_control_admin", lambda token: {"username": "tester"})
+    monkeypatch.setattr(web, "_update_env", lambda values: config_values.update(values))
+    monkeypatch.setattr(web, "_save_gate_secrets", lambda values: encrypted_values.update(values))
+    monkeypatch.setattr(web.store, "add", lambda *args, **kwargs: None)
+    monkeypatch.setattr(web, "load_settings", lambda: configured_settings(public_market_environment="testnet"))
+    payload = web.GateAdminConfig(
+        environment="testnet",
+        testnet_api_key="new-key",
+        testnet_api_secret="new-secret",
+        testnet_execute_trades=True,
+        max_position_notional_usd=1000,
+        max_total_margin_usd=100,
+        max_order_margin_usd=25,
+    )
+
+    web.gate_admin_config(payload, None)
+
+    assert "GATE_TESTNET_API_KEY" not in config_values
+    assert "GATE_TESTNET_API_SECRET" not in config_values
+    assert encrypted_values == {
+        "GATE_TESTNET_API_KEY": "new-key",
+        "GATE_TESTNET_API_SECRET": "new-secret",
+    }
+
+
+def test_gate_admin_validation_failure_does_not_persist_config(monkeypatch):
+    import gate_quant.web as web
+
+    persisted = {}
+    monkeypatch.setattr(web, "_require_control_admin", lambda token: {"username": "tester"})
+    monkeypatch.setattr(web, "_update_env", lambda values: persisted.update(values))
+    monkeypatch.setattr(web, "_save_gate_secrets", lambda values: persisted.update(values))
+    monkeypatch.setattr(web, "gate_tunnel", SimpleNamespace(enabled=False))
+    monkeypatch.setattr(web, "load_settings", lambda: configured_settings(
+        require_proxy=True,
+        proxy_url="http://127.0.0.1:18080",
+        public_market_environment="testnet",
+    ))
+    payload = web.GateAdminConfig(
+        environment="testnet",
+        proxy_url=None,
+        max_position_notional_usd=1000,
+        max_total_margin_usd=100,
+        max_order_margin_usd=25,
+    )
+
+    with pytest.raises(web.HTTPException, match="GATE_PROXY_URL is required") as exc:
+        web.gate_admin_config(payload, None)
+
+    assert exc.value.status_code == 400
+    assert persisted == {}
 
 
 def test_gate_import_does_not_start_legacy_dashboard_worker():

@@ -1,6 +1,7 @@
 import json
 import requests
 import pytest
+from concurrent.futures import Future
 from decimal import Decimal
 from gate_quant.client import GateFuturesClient, AmbiguousOrderError
 from gate_quant.config import GateSettings
@@ -9,7 +10,7 @@ from gate_quant.service import GateTradingService, protection_coverage_status
 from gate_quant.ai_worker import _extract_decision_object, _extract_response_object, _as_instruction_list, _order_size_for_margin, _protection_matches, _execution_enabled, _account_committed_margin, _portfolio_position_notional
 from gate_quant.strategy_adapter import validate_decision
 from gate_quant.risk_profiles import get_risk_profile
-from r20_gateway.scheduler import JOBS
+from r20_gateway.scheduler import JOBS, GatewayScheduler
 from gate_quant.safety import classify_error, cooldown_state, daily_loss_state, reconcile_exchange_state
 from gate_quant.protection_lifecycle import intent_from_history, is_system_protection, recovery_plans
 from scripts.sync_gate_ledger import _ledger_row
@@ -57,6 +58,25 @@ def test_gateway_scheduler_includes_gate_ledger_and_self_improvement():
     jobs = {job.name: job for job in JOBS}
     assert jobs["gate_ledger"].interval_seconds == 15 * 60
     assert jobs["self_improvement"].schedule_key == "self_improvement_times"
+
+
+def test_gateway_does_not_launch_reconciler_while_trader_is_running(monkeypatch):
+    import r20_gateway.scheduler as scheduler_module
+
+    class Store:
+        def set_state(self, *args):
+            raise AssertionError("blocked job must not update its schedule timestamp")
+
+    reconcile = next(spec for spec in JOBS if spec.name == "execution_reconcile")
+    scheduler = GatewayScheduler(Store())
+    scheduler.running["trader"] = Future()
+    monkeypatch.setattr(scheduler_module, "current_jobs", lambda: (reconcile,))
+    monkeypatch.setattr(scheduler_module, "load_schedule", lambda: {})
+    monkeypatch.setattr(scheduler, "due", lambda spec, now, schedule: True)
+    try:
+        assert scheduler.tick() == []
+    finally:
+        scheduler.shutdown()
 
 
 def test_safety_reconciliation_detects_stale_order_and_protection_gap():
@@ -143,8 +163,8 @@ def test_protection_coverage():
     class C:
         def protection_orders(self, contract):
             return [
-                {"initial": {"size": -2}, "trigger": {"rule": 1}},
-                {"initial": {"size": -2}, "trigger": {"rule": 2}},
+                {"initial": {"size": -2, "is_reduce_only": True}, "trigger": {"rule": 1}},
+                {"initial": {"size": -2, "is_reduce_only": True}, "trigger": {"rule": 2}},
             ]
     assert GateTradingService(C(), RiskLimits(1, 1, 1)).verify_protection_coverage("BTC_USDT", 2)
 
@@ -258,15 +278,26 @@ def test_same_contract_opposite_direction_add_on_is_blocked():
 
 def test_protection_coverage_requires_both_tp_and_sl_for_full_position():
     rows = [
-        {"initial": {"size": -4}, "trigger": {"rule": 1}},
-        {"initial": {"size": -2}, "trigger": {"rule": 2}},
+        {"initial": {"size": -4, "is_reduce_only": True}, "trigger": {"rule": 1}},
+        {"initial": {"size": -2, "is_reduce_only": True}, "trigger": {"rule": 2}},
     ]
     coverage = protection_coverage_status(rows, 4)
     assert coverage["take_profit"] == 4
     assert coverage["stop_loss"] == 2
     assert not coverage["fully_protected"]
-    rows.append({"initial": {"size": -2}, "trigger": {"rule": 2}})
+    rows.append({"initial": {"size": -2, "is_reduce_only": True}, "trigger": {"rule": 2}})
     assert protection_coverage_status(rows, 4)["fully_protected"]
+
+
+def test_non_reduce_only_trigger_cannot_count_as_position_protection():
+    rows = [
+        {"initial": {"size": -4, "is_reduce_only": False}, "trigger": {"rule": 1}},
+        {"initial": {"size": -4, "is_reduce_only": False}, "trigger": {"rule": 2}},
+    ]
+    coverage = protection_coverage_status(rows, 4)
+    assert coverage["take_profit"] == 0
+    assert coverage["stop_loss"] == 0
+    assert not coverage["fully_protected"]
 
 
 def test_cross_and_isolated_margin_are_counted_for_portfolio_cap():
@@ -298,8 +329,8 @@ def test_aggregate_limits_allow_multiple_positions_until_configured_capacity():
 
 def test_protection_requires_each_expected_client_id_and_rule():
     rows = [
-        {"initial": {"text": "t-gate-tp-1", "size": -2}, "trigger": {"rule": 1}},
-        {"initial": {"text": "t-gate-sl-1", "size": -2}, "trigger": {"rule": 2}},
+        {"initial": {"text": "t-gate-tp-1", "size": -2, "is_reduce_only": True}, "trigger": {"rule": 1}},
+        {"initial": {"text": "t-gate-sl-1", "size": -2, "is_reduce_only": True}, "trigger": {"rule": 2}},
     ]
     assert _protection_matches(rows, client_id="t-gate-tp-1", size=-2, rule=1)
     assert _protection_matches(rows, client_id="t-gate-sl-1", size=-2, rule=2)
@@ -319,9 +350,28 @@ def test_protection_intent_is_recovered_from_submitted_history():
     assert intent["position_side"] == "long"
 
 
+def test_protection_intent_recovers_new_planned_price_format():
+    row = {
+        "environment": "testnet",
+        "generated_at_ms": 1234,
+        "trade": {
+            "status": "submitted_testnet",
+            "contract": "ETH_USDT",
+            "size": 4,
+            "client_id": "t-gate-ai-1234",
+            "take_profit": {"planned_price": "110"},
+            "stop_loss": {"planned_price": "90"},
+        },
+    }
+    intent = intent_from_history(row)
+    assert intent is not None
+    assert intent["take_profit_price"] == "110"
+    assert intent["stop_loss_price"] == "90"
+
+
 def test_recovery_plan_only_restores_missing_side_from_matching_intent():
     positions = [{"contract": "ETH_USDT", "size": 4, "mark_price": "2600", "open_time": 1}]
-    protections = [{"trigger": {"rule": 1}, "initial": {"contract": "ETH_USDT", "size": -4, "text": "t-gate-tp-1"}}]
+    protections = [{"trigger": {"rule": 1}, "initial": {"contract": "ETH_USDT", "size": -4, "text": "t-gate-tp-1", "is_reduce_only": True}}]
     intents = [{"contract": "ETH_USDT", "position_side": "long", "entry_client_id": "t-gate-ai-1", "take_profit_price": "2680", "stop_loss_price": "2528", "created_at_ms": 1000}]
     plans = recovery_plans(positions, protections, intents)
     assert len(plans) == 1

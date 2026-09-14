@@ -46,11 +46,17 @@ pytest -q
 
 后台调度的 trader、factor 和 news 入口均为 Gate 专用模块（`gate_quant.ai_worker`、`gate_quant.factor_worker`、`gate_quant.news_worker`），不会调用旧 OKX CLI。当前没有配置可验证的 Gate 新闻源时，新闻快照会明确标记 `data_quality=unavailable`，策略不得把缺失新闻误判为中性利好。
 
-后台“Gate 账户与合约池”页面可维护独立环境、两套凭证、VPS 代理和三项风险上限。订单写接口要求管理员会话；服务端自行读取 Gate 账户、持仓、合约乘数与行情计算风险额度，客户端不能自行声明额度绕过限制。
+后台“Gate 账户与合约池”页面可维护独立环境、两套凭证、VPS 代理和三项风险上限。Gate Key/Secret 由面板保存到项目独立的 Fernet 加密仓库，普通配置、日志和 Git 仓库不会写入新凭证明文；Testnet 与 Live 使用不同键名和加密条目。订单写接口要求管理员会话；服务端自行读取 Gate 账户、持仓、合约乘数与行情计算风险额度，客户端不能自行声明额度绕过限制。
+
+面板保存配置时会先在内存中构造并校验完整候选配置，验证失败不会写入 `.env` 或加密凭证仓库。自动交易、成交对账和 Web 手工下单/撤单/保护单共用独立的跨进程 Gate 写锁；并发请求拿不到锁时会明确返回“未发送到交易所”，不会绕过对账并重复写单。
 
 AI 的 `entry_price` 使用 Gate 原生 GTC 限价单；只有明确的市价操作才使用 `price=0` 与 `tif=ioc`。下单张数按 `floor(margin_usdt × GATE_LEVERAGE ÷ (entry_price × quanto_multiplier))` 计算，并按 Gate 合约元数据的 `enable_decimal` 与 `order_size_min` 向下对齐。Testnet 的整数合约仍至少 1 张；Live 支持的合约可使用 0.1 等小数张。舍入后会重新计算实际名义价值和保证金，再接受单仓名义价值、总保证金和单笔保证金三重上限校验。
 
 每轮最近 200 条摘要保存在 `data/ai_decision_history.json`，完整追加审计写入 `data/ai_decision_audit.jsonl`。每条记录包含环境、原始/最终动作、拦截原因、交易结果和当轮风险快照，Testnet 与 Live 可明确区分。
+
+入场执行另有 `data/gate_execution.db` 持久化状态机。系统在调用 Gate 下单前先保存客户端订单号、环境、原持仓、计划张数和止盈止损；10 秒对账任务只按已有客户端订单号恢复，绝不根据旧 AI 信号重新提交入场单。保护单按 Gate 返回的实际成交量和真实持仓逐步补齐，顺序固定为先止损、后止盈；部分成交增加时只补覆盖差额。止损无法确认时先撤剩余入场单，再以 `reduce_only` 市价单只减掉本次新增仓位，不会使用整仓平仓误伤加仓前持仓。所有保护覆盖只承认 Gate 明确返回的 `reduce_only/is_reduce_only` 或 `close` 订单。
+
+只要执行台账存在待确认、部分成交或人工复核状态，新增风险安全门就保持关闭。关闭 Live 新增风险开关后，对账器仍可继续确认此前已经提交的订单并执行撤单、补保护或减仓等风险降低操作，但不会补发入场单。
 
 P0/P1 安全层还会记录 Gate 对账、日亏损熔断、挂单生命周期、最长持仓、按合约隔离的止损冷却和进程心跳；某一合约止损后只暂停该合约，组合达到日亏损上限时才暂停全部合约。运行时文件默认被 `.gitignore` 排除，不应提交到公开仓库。
 
@@ -76,8 +82,8 @@ GATE_AUTO_ROLLBACK_MAX_DRAWDOWN_USD=100
 
 ## Gate Testnet 验证
 
-已通过 Gate Testnet 只读验证：行情、合约元数据、账户余额、持仓、挂单和保护单查询均可用；AI worker 已使用原 R20 提示词链生成六合约决策。交易写链路仍保持默认关闭（`GATE_TESTNET_EXECUTE_TRADES=false`），不会自动执行 Gate Live 交易；Live 交易必须由操作者在独立环境显式启用并通过限额检查。
+已通过 Gate Testnet 验证：行情、合约元数据、账户余额、持仓、普通挂单、原生保护单、实际成交、过期挂单撤销、最长持仓平仓和 Gate 原生平仓台账均有运行记录；AI worker 已使用原 R20 提示词链生成六合约决策。全新部署仍默认关闭交易（`GATE_TESTNET_EXECUTE_TRADES=false` 和 `GATE_LIVE_TRADING_ENABLED=false`）；Live 必须选择 Live 环境、使用独立 Live 凭证、显式启用开关并通过限额检查。
 
 ## 当前风险
 
-尚未重新完成一次“开仓 + 两个保护单 + 覆盖查询 + 撤保护单 + 平仓”的完整 Testnet 写链路回归；Gate API 版本或账户模式变化仍需要在 Testnet 回归。Live 交易未执行。
+正常 Testnet 写链路已经在持续运行中完成。下单超时找回、部分成交递增覆盖、保护失败只减新增仓位和重启恢复已加入离线故障注入测试；这些异常分支仍需在不影响现有持仓的受控 Testnet 场景中做最终验证。Gate API 版本、账户持仓模式或合约规则变化后必须重新执行 Testnet 回归。Live 交易从未执行。

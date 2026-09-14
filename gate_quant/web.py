@@ -7,6 +7,7 @@ import time
 import datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -28,6 +29,9 @@ def _backend_log(message: str) -> None:
 
 from .client import GateFuturesClient
 from .config import load_settings
+from .execution_journal import ExecutionJournal
+from .execution_reconciler import JOURNAL_PATH as EXECUTION_JOURNAL
+from .exchange_write_lock import gate_write_lock
 from .risk import RiskLimits
 from .service import GateTradingService, protection_coverage_status
 from .store import EventStore
@@ -54,7 +58,20 @@ def _read_json_file(name: str, default):
 
 
 def _safety_status() -> dict[str, Any]:
-    return _read_json_file("gate_safety_status.json", {"safe_for_new_risk": False, "reason": "no safety check recorded"})
+    payload = _read_json_file("gate_safety_status.json", {"safe_for_new_risk": False, "reason": "no safety check recorded"})
+    try:
+        environment = load_settings().environment
+        active = ExecutionJournal(EXECUTION_JOURNAL).active(environment)
+    except Exception as exc:
+        return {**payload, "safe_for_new_risk": False, "execution_journal_error": str(exc)}
+    if not active:
+        return payload
+    reconciliation = dict(payload.get("reconciliation") or {})
+    issues = list(reconciliation.get("issues") or [])
+    if not any(item.get("code") == "execution_reconciliation_pending" for item in issues if isinstance(item, dict)):
+        issues.append({"code": "execution_reconciliation_pending", "count": len(active)})
+    reconciliation.update({"safe_for_new_risk": False, "issues": issues})
+    return {**payload, "safe_for_new_risk": False, "reconciliation": reconciliation}
 
 
 def _heartbeat_status() -> dict[str, Any]:
@@ -62,6 +79,30 @@ def _heartbeat_status() -> dict[str, Any]:
     timestamp_ms = float(heartbeat.get("timestamp_ms") or 0)
     age_seconds = max(0, int(time.time() - timestamp_ms / 1000)) if timestamp_ms else None
     return {**heartbeat, "age_seconds": age_seconds, "fresh": bool(age_seconds is not None and age_seconds <= 20 * 60)}
+
+
+def _execution_status(environment: str) -> dict[str, Any]:
+    heartbeat = _read_json_file("gate_execution_reconciler.json", {})
+    timestamp_ms = int(heartbeat.get("timestamp_ms") or 0)
+    age_seconds = max(0, int(time.time() - timestamp_ms / 1000)) if timestamp_ms else None
+    try:
+        active = ExecutionJournal(EXECUTION_JOURNAL).active(environment)
+    except Exception as exc:
+        return {"healthy": False, "active_count": 0, "age_seconds": age_seconds, "error": str(exc)}
+    manual_review = [row for row in active if row.get("status") == "manual_review"]
+    errors = [row for row in active if row.get("last_error")]
+    return {
+        "healthy": bool(age_seconds is not None and age_seconds <= 120 and not manual_review),
+        "active_count": len(active),
+        "manual_review_count": len(manual_review),
+        "error_count": len(errors),
+        "age_seconds": age_seconds,
+        "last_status": heartbeat.get("status") or "not_started",
+        "items": [
+            {key: row.get(key) for key in ("client_id", "contract", "status", "filled_size", "protected_size", "last_error", "updated_at_ms")}
+            for row in active[-20:]
+        ],
+    }
 
 
 def _dashboard_protection_orders(protections: list[dict], positions: list[dict]) -> list[dict[str, Any]]:
@@ -245,6 +286,27 @@ def client() -> GateFuturesClient:
 def trading_service(c: GateFuturesClient | None = None) -> GateTradingService:
     s = load_settings()
     return GateTradingService(c or GateFuturesClient(s), RiskLimits(s.max_position_notional_usd, s.max_total_margin_usd, s.max_order_margin_usd))
+
+
+def _execution_writes_enabled(settings) -> bool:
+    profile = get_risk_profile(settings.risk_profile)
+    environment_enabled = settings.testnet_execute_trades if settings.environment == "testnet" else settings.live_trading_enabled
+    return bool(environment_enabled and profile.execution_allowed)
+
+
+def _stored_gate_credential(name: str) -> str:
+    try:
+        from r20_gateway.secrets import load_secrets
+        encrypted = load_secrets()
+    except Exception:
+        encrypted = {}
+    return str(encrypted.get(name) or os.getenv(name) or "")
+
+
+def _save_gate_secrets(values: dict[str, str]) -> None:
+    from r20_gateway.secrets import save_secrets
+    save_secrets(values)
+    os.environ.update(values)
 
 
 def _order_risk(c: GateFuturesClient, *, contract: str, size: float, leverage: float) -> dict[str, Any]:
@@ -474,25 +536,24 @@ def place_order(payload: GateOrderRequest, x_gate_session: str | None = Header(d
     actor = _require_control_admin(x_gate_session)
     if payload.size == 0:
         raise HTTPException(400, "Gate order size cannot be zero")
-    c = client()
     try:
-        settings = load_settings()
-        profile = get_risk_profile(settings.risk_profile)
-        writes_enabled = settings.testnet_execute_trades if settings.environment == "testnet" else settings.live_trading_enabled
-        if not writes_enabled or not profile.execution_allowed:
-            raise PermissionError(f"Gate {settings.environment} order writes are disabled by the execution switch or risk profile")
-        if payload.leverage is not None and abs(payload.leverage - settings.leverage) > 1e-9:
-            raise ValueError(f"Order leverage must match configured Gate leverage {settings.leverage:g}x")
-        risk = _order_risk(c, contract=payload.contract, size=payload.size, leverage=settings.leverage)
-        try:
-            position = c.positions(payload.contract) or {}
-        except RuntimeError as exc:
-            if "POSITION_NOT_FOUND" not in str(exc):
-                raise
-            position = {}
-        cross_margin = str(position.get("pos_margin_mode") or "cross").lower() == "cross" or float(position.get("leverage") or 0) == 0
-        c.update_position_leverage(contract=payload.contract, leverage=settings.leverage, cross_margin=cross_margin)
-        result = trading_service(c).place_order(contract=payload.contract, size=payload.size, price=payload.price, tif=payload.tif, client_id=payload.client_id, reduce_only=payload.reduce_only, close=payload.close, risk=risk)
+        with gate_write_lock():
+            c = client()
+            settings = load_settings()
+            if not _execution_writes_enabled(settings):
+                raise PermissionError(f"Gate {settings.environment} order writes are disabled by the execution switch or risk profile")
+            if payload.leverage is not None and abs(payload.leverage - settings.leverage) > 1e-9:
+                raise ValueError(f"Order leverage must match configured Gate leverage {settings.leverage:g}x")
+            risk = _order_risk(c, contract=payload.contract, size=payload.size, leverage=settings.leverage)
+            try:
+                position = c.positions(payload.contract) or {}
+            except RuntimeError as exc:
+                if "POSITION_NOT_FOUND" not in str(exc):
+                    raise
+                position = {}
+            cross_margin = str(position.get("pos_margin_mode") or "cross").lower() == "cross" or float(position.get("leverage") or 0) == 0
+            c.update_position_leverage(contract=payload.contract, leverage=settings.leverage, cross_margin=cross_margin)
+            result = trading_service(c).place_order(contract=payload.contract, size=payload.size, price=payload.price, tif=payload.tif, client_id=payload.client_id, reduce_only=payload.reduce_only, close=payload.close, risk=risk)
     except PermissionError as exc:
         raise HTTPException(403, str(exc)) from exc
     except Exception as exc:
@@ -505,7 +566,8 @@ def place_order(payload: GateOrderRequest, x_gate_session: str | None = Header(d
 def cancel_order(contract: str, order_id: str, x_gate_session: str | None = Header(default=None, alias="X-R20-Session")):
     actor = _require_control_admin(x_gate_session)
     try:
-        result = client().cancel_order(order_id, contract.upper())
+        with gate_write_lock():
+            result = client().cancel_order(order_id, contract.upper())
     except Exception as exc:
         raise HTTPException(502, f"Gate cancel failed: {exc}") from exc
     store.add("gate.order.cancelled", {"actor": actor.get("username"), "contract": contract.upper(), "order_id": order_id})
@@ -527,7 +589,26 @@ def create_protection(payload: GateProtectionRequest, x_gate_session: str | None
     if payload.size == 0 and not payload.close:
         raise HTTPException(400, "Protection size cannot be zero unless close=true")
     try:
-        result = client().create_protection_order(**payload.model_dump())
+        with gate_write_lock():
+            settings = load_settings()
+            if not _execution_writes_enabled(settings):
+                raise PermissionError(f"Gate {settings.environment} protection writes are disabled by the execution switch or risk profile")
+            if not payload.reduce_only:
+                raise ValueError("Gate protection orders must be reduce_only")
+            c = client()
+            position = c.positions(payload.contract) or {}
+            if isinstance(position, list):
+                position = next((row for row in position if str(row.get("contract") or "").upper() == payload.contract), {})
+            position_size = float(position.get("size") or 0)
+            if position_size == 0:
+                raise ValueError("Gate protection requires an existing position")
+            if not payload.close and (payload.size * position_size >= 0 or abs(payload.size) > abs(position_size)):
+                raise ValueError("Gate protection size must reduce and cannot exceed the existing position")
+            result = c.create_protection_order(**payload.model_dump())
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     except Exception as exc:
         raise HTTPException(502, f"Gate protection order failed: {exc}") from exc
     store.add("gate.protection.created", {"actor": actor.get("username"), "contract": payload.contract, "client_id": payload.client_id})
@@ -550,7 +631,8 @@ def protection_coverage(contract: str, position_size: float, x_gate_session: str
 def cancel_protection(order_id: str, x_gate_session: str | None = Header(default=None, alias="X-R20-Session")):
     actor = _require_control_admin(x_gate_session)
     try:
-        result = client().cancel_protection_order(order_id)
+        with gate_write_lock():
+            result = client().cancel_protection_order(order_id)
     except Exception as exc:
         raise HTTPException(502, f"Gate protection cancel failed: {exc}") from exc
     store.add("gate.protection.cancelled", {"actor": actor.get("username"), "order_id": order_id})
@@ -587,7 +669,7 @@ def gate_admin_runtime(x_gate_session: str | None = Header(default=None, alias="
     tunnel_payload = {**tunnel.__dict__, "running": bool(tunnel.running or shared_tunnel_ready), "pid": tunnel.pid or None}
     profile = get_risk_profile(s.risk_profile)
     snapshot = profile.snapshot(leverage=s.leverage, environment=s.environment)
-    return {"exchange": "gate", "environment": s.environment, "ready": bool(s.api_key and s.api_secret), "base_url": s.base_url, "public_market_environment": s.public_market_environment, "proxy_configured": bool(s.proxy_url), "proxy_url": s.proxy_url or "", "proxy_required": s.require_proxy, "tunnel": tunnel_payload, "testnet_execute_trades": bool(s.testnet_execute_trades), "live_trading_enabled": bool(s.environment == "live" and s.live_trading_enabled), "credentials": {"testnet_configured": bool(os.getenv("GATE_TESTNET_API_KEY") and os.getenv("GATE_TESTNET_API_SECRET")), "live_configured": bool(os.getenv("GATE_LIVE_API_KEY") and os.getenv("GATE_LIVE_API_SECRET"))}, "risk_profiles": profile_catalog(), "risk_snapshot": snapshot, "risk": {"risk_profile": s.risk_profile, "leverage": s.leverage, "max_position_notional_usd": s.max_position_notional_usd, "max_total_margin_usd": s.max_total_margin_usd, "max_order_margin_usd": s.max_order_margin_usd}}
+    return {"exchange": "gate", "environment": s.environment, "ready": bool(s.api_key and s.api_secret), "base_url": s.base_url, "public_market_environment": s.public_market_environment, "proxy_configured": bool(s.proxy_url), "proxy_url": s.proxy_url or "", "proxy_required": s.require_proxy, "tunnel": tunnel_payload, "testnet_execute_trades": bool(s.testnet_execute_trades), "live_trading_enabled": bool(s.environment == "live" and s.live_trading_enabled), "credentials": {"testnet_configured": bool(_stored_gate_credential("GATE_TESTNET_API_KEY") and _stored_gate_credential("GATE_TESTNET_API_SECRET")), "live_configured": bool(_stored_gate_credential("GATE_LIVE_API_KEY") and _stored_gate_credential("GATE_LIVE_API_SECRET"))}, "risk_profiles": profile_catalog(), "risk_snapshot": snapshot, "risk": {"risk_profile": s.risk_profile, "leverage": s.leverage, "max_position_notional_usd": s.max_position_notional_usd, "max_total_margin_usd": s.max_total_margin_usd, "max_order_margin_usd": s.max_order_margin_usd}}
 
 
 @app.get("/api/v1/admin/runtime")
@@ -615,7 +697,7 @@ def gate_admin_runtime_overview(x_gate_session: str | None = Header(default=None
     configuration = {"Gate 当前环境": settings.environment.upper(), "Gate API 凭证": "已配置" if settings.api_key and settings.api_secret else "未配置", "AI 风险档位": get_risk_profile(settings.risk_profile).label, "Gate Testnet 自动交易": "已启用" if settings.testnet_execute_trades else "关闭", "Gate Live 交易开关": "显式启用" if settings.environment == "live" and settings.live_trading_enabled else "关闭 (FAIL-CLOSED)", "Gate VPS 独立代理": "已配置" if settings.proxy_url else "未配置", "执行杠杆": f"{settings.leverage:g}x", "原生保护单覆盖": "Gate price_orders 双保护校验", "总持仓名义敞口上限": f"{settings.max_position_notional_usd:.2f} USDT", "总保证金上限": f"{settings.max_total_margin_usd:.2f} USDT", "单笔保证金上限": f"{settings.max_order_margin_usd:.2f} USDT"}
     gateway_store = GatewayStore(GATEWAY_DB_PATH)
     gateway_pid = current_pid()
-    return {"service": {"version": app.version, "pid": os.getpid(), "uptime_seconds": int(time.time() - STARTED_AT)}, "exchange": "gate", "environment": settings.environment, "credentials": {"gate": bool(settings.api_key and settings.api_secret), "llm": bool(os.getenv("LLM_API_KEY"))}, "configuration": configuration, "data_health": {"overall": "LIVE" if all(item["fresh"] for item in health_files) else "STALE", "files": health_files}, "safety_status": _safety_status(), "trader_heartbeat": _heartbeat_status(), "gateway": {"running": bool(gateway_pid or _worker_lock_held()), "pid": gateway_pid or None, "scheduler": scheduler_snapshot(gateway_store)}, "full_decisions": full, "decisions": full, "decision_history": list(reversed(history)), "decision_history_total": len(history), "recent_logs": [], "logs": {"trader": _tail_log("gate_trader.log", 18), "backend": _tail_log("gate_backend.log", 18), "scheduler": _tail_log("r20_gateway.log", 18)}, "llm_runtime": llm_runtime}
+    return {"service": {"version": app.version, "pid": os.getpid(), "uptime_seconds": int(time.time() - STARTED_AT)}, "exchange": "gate", "environment": settings.environment, "credentials": {"gate": bool(settings.api_key and settings.api_secret), "llm": bool(os.getenv("LLM_API_KEY"))}, "configuration": configuration, "data_health": {"overall": "LIVE" if all(item["fresh"] for item in health_files) else "STALE", "files": health_files}, "safety_status": _safety_status(), "execution_reconciler": _execution_status(settings.environment), "trader_heartbeat": _heartbeat_status(), "gateway": {"running": bool(gateway_pid or _worker_lock_held()), "pid": gateway_pid or None, "scheduler": scheduler_snapshot(gateway_store)}, "full_decisions": full, "decisions": full, "decision_history": list(reversed(history)), "decision_history_total": len(history), "recent_logs": [], "logs": {"trader": _tail_log("gate_trader.log", 18), "backend": _tail_log("gate_backend.log", 18), "scheduler": _tail_log("r20_gateway.log", 18)}, "llm_runtime": llm_runtime}
 
 
 @app.get("/api/v1/admin/history")
@@ -719,24 +801,46 @@ def gate_admin_config(payload: GateAdminConfig, x_gate_session: str | None = Hea
         raise HTTPException(400, f"{profile.label}档位的杠杆上限为 {profile.max_leverage:g}x")
     if payload.live_trading_enabled and payload.environment != "live":
         raise HTTPException(400, "Gate Live 开关只能在已选择 Live 环境时显式启用")
-    testnet_key = (payload.testnet_api_key or os.getenv("GATE_TESTNET_API_KEY") or "").strip()
-    testnet_secret = (payload.testnet_api_secret or os.getenv("GATE_TESTNET_API_SECRET") or "").strip()
-    live_key = (payload.live_api_key or os.getenv("GATE_LIVE_API_KEY") or "").strip()
-    live_secret = (payload.live_api_secret or os.getenv("GATE_LIVE_API_SECRET") or "").strip()
+    testnet_key = (payload.testnet_api_key or _stored_gate_credential("GATE_TESTNET_API_KEY")).strip()
+    testnet_secret = (payload.testnet_api_secret or _stored_gate_credential("GATE_TESTNET_API_SECRET")).strip()
+    live_key = (payload.live_api_key or _stored_gate_credential("GATE_LIVE_API_KEY")).strip()
+    live_secret = (payload.live_api_secret or _stored_gate_credential("GATE_LIVE_API_SECRET")).strip()
     if payload.environment == "testnet" and payload.testnet_execute_trades and not (testnet_key and testnet_secret):
         raise HTTPException(400, "启用 Gate Testnet 自动交易前必须配置完整 Testnet Key/Secret")
     if payload.environment == "live" and payload.live_trading_enabled and not (live_key and live_secret):
         raise HTTPException(400, "启用 Gate Live 实盘前必须配置完整 Live Key/Secret")
     managed_proxy = os.getenv("GATE_PROXY_URL", "") if gate_tunnel.enabled else (payload.proxy_url or "")
-    values = {"GATE_ENVIRONMENT": payload.environment, "GATE_TESTNET_EXECUTE_TRADES": str(payload.testnet_execute_trades).lower(), "GATE_LIVE_TRADING_ENABLED": str(payload.live_trading_enabled).lower(), "GATE_RISK_PROFILE": payload.risk_profile, "GATE_LEVERAGE": str(payload.leverage), "GATE_PROXY_URL": managed_proxy, "GATE_MAX_POSITION_NOTIONAL_USD": str(payload.max_position_notional_usd), "GATE_MAX_TOTAL_MARGIN_USD": str(payload.max_total_margin_usd), "GATE_MAX_ORDER_MARGIN_USD": str(payload.max_order_margin_usd)}
+    values = {"GATE_ENVIRONMENT": payload.environment, "GATE_PUBLIC_MARKET_ENV": payload.environment, "GATE_TESTNET_EXECUTE_TRADES": str(payload.testnet_execute_trades).lower(), "GATE_LIVE_TRADING_ENABLED": str(payload.live_trading_enabled).lower(), "GATE_RISK_PROFILE": payload.risk_profile, "GATE_LEVERAGE": str(payload.leverage), "GATE_PROXY_URL": managed_proxy, "GATE_MAX_POSITION_NOTIONAL_USD": str(payload.max_position_notional_usd), "GATE_MAX_TOTAL_MARGIN_USD": str(payload.max_total_margin_usd), "GATE_MAX_ORDER_MARGIN_USD": str(payload.max_order_margin_usd)}
     # Keep market data, credentials and order writes on the selected cluster.
     # In particular, a Live order must never be priced from Testnet data.
     values["GATE_PUBLIC_MARKET_ENV"] = payload.environment
+    secret_updates = {}
     for env_key, value in (("GATE_TESTNET_API_KEY", payload.testnet_api_key), ("GATE_TESTNET_API_SECRET", payload.testnet_api_secret), ("GATE_LIVE_API_KEY", payload.live_api_key), ("GATE_LIVE_API_SECRET", payload.live_api_secret)):
         if value:
-            values[env_key] = value.strip()
+            secret_updates[env_key] = value.strip()
+    current = load_settings()
+    candidate = replace(
+        current,
+        environment=payload.environment,
+        public_market_environment=payload.environment,
+        api_key=testnet_key if payload.environment == "testnet" else live_key,
+        api_secret=testnet_secret if payload.environment == "testnet" else live_secret,
+        testnet_execute_trades=payload.testnet_execute_trades,
+        live_trading_enabled=payload.live_trading_enabled,
+        risk_profile=payload.risk_profile,
+        leverage=payload.leverage,
+        proxy_url=managed_proxy or None,
+        max_position_notional_usd=payload.max_position_notional_usd,
+        max_total_margin_usd=payload.max_total_margin_usd,
+        max_order_margin_usd=payload.max_order_margin_usd,
+    )
+    try:
+        candidate.validate()
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     _update_env(values)
-    load_settings().validate()
+    if secret_updates:
+        _save_gate_secrets(secret_updates)
     updated = load_settings()
     snapshot = get_risk_profile(updated.risk_profile).snapshot(leverage=updated.leverage, environment=updated.environment)
     store.add("gate.config.updated", {"actor": actor.get("username"), "environment": payload.environment, "risk_snapshot": snapshot})

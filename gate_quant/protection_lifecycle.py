@@ -27,8 +27,9 @@ def _order_payload(value: Any) -> dict[str, Any]:
 
 
 def _trigger_price(value: Any) -> str:
-    trigger = _order_payload(value).get("trigger") or {}
-    return str(trigger.get("price") or "")
+    payload = _order_payload(value)
+    trigger = payload.get("trigger") or {}
+    return str(payload.get("planned_price") or trigger.get("price") or "")
 
 
 def intent_from_history(row: dict[str, Any]) -> dict[str, Any] | None:

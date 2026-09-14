@@ -10,8 +10,10 @@ from pathlib import Path
 from dataclasses import replace
 from dotenv import load_dotenv
 
-from .client import GateFuturesClient
+from .client import AmbiguousOrderError, GateFuturesClient
 from .config import load_settings
+from .execution_journal import ExecutionJournal
+from .execution_reconciler import JOURNAL_PATH as EXECUTION_JOURNAL, reconcile_intent
 from .risk import RiskLimits
 from .service import GateTradingService, protection_coverage_status
 from .risk_profiles import get_risk_profile
@@ -460,6 +462,14 @@ def run_cycle() -> dict:
         private_context["positions"], private_context["pending_orders"], private_context["protections"],
         max_pending_age_seconds=settings.max_pending_order_age_seconds,
     )
+    pending_executions = ExecutionJournal(EXECUTION_JOURNAL).active(settings.environment)
+    if pending_executions:
+        reconciliation["issues"].append({
+            "code": "execution_reconciliation_pending",
+            "count": len(pending_executions),
+            "contracts": sorted({str(row.get("contract") or "") for row in pending_executions}),
+        })
+        reconciliation["safe_for_new_risk"] = False
     equity = float(private_context["account"].get("total") or private_context["account"].get("available") or 0)
     daily_loss = daily_loss_state(LEDGER, max_loss_usd=settings.max_daily_loss_usd, max_loss_ratio=settings.max_daily_loss_ratio, equity=equity)
     cooldowns = {symbol: cooldown_state(LEDGER, cooldown_seconds=settings.stop_cooldown_seconds, contract=symbol) for symbol in SYMBOLS}
@@ -858,10 +868,38 @@ def run_cycle() -> dict:
             position = {}
         cross_margin = str(position.get("pos_margin_mode") or "cross").lower() == "cross" or float(position.get("leverage") or 0) == 0
         limit_price = _round_price(entry_price, contract.get("order_price_round") or contract.get("mark_price_round") or "0")
+        tp = float(decision["decision"].get("take_profit_price") or (last + 2 * trade_feature["atr14"] if size > 0 else last - 2 * trade_feature["atr14"]))
+        sl = float(decision["decision"].get("stop_loss_price") or (last - trade_feature["atr14"] if size > 0 else last + trade_feature["atr14"]))
+        tick = contract.get("order_price_round") or contract.get("mark_price_round") or "0"
+        rounded_tp = _round_price(tp, tick)
+        rounded_sl = _round_price(sl, tick)
+        journal = ExecutionJournal(EXECUTION_JOURNAL)
+        intent = journal.prepare({
+            "client_id": client_id,
+            "environment": settings.environment,
+            "contract": trade_symbol,
+            "requested_size": str(size),
+            "baseline_position_size": str(existing_size),
+            "entry_price": limit_price,
+            "take_profit_price": rounded_tp,
+            "stop_loss_price": rounded_sl,
+            "created_at_ms": now,
+            "policy_version": policy_snapshot["policy_version"],
+            "policy_hash": policy_snapshot["policy_hash"],
+        })
         try:
             leverage_result = client.update_position_leverage(contract=trade_symbol, leverage=leverage, cross_margin=cross_margin)
             order = GateTradingService(client, limits).place_order(contract=trade_symbol, size=size, price=limit_price, tif="gtc", client_id=client_id, risk=risk)
+        except AmbiguousOrderError as order_error:
+            journal.update(client_id, "prepared", last_error=str(order_error))
+            reason = f"Gate entry submission is ambiguous and will only be reconciled by client order id: {order_error}"
+            result["trade"] = {"status": "order_submission_ambiguous", "contract": trade_symbol, "client_id": client_id, "reason": reason}
+            payload = {**decisions_payload, "generated_at_ms": now, "exchange": "gate", "environment": settings.environment, "policy_snapshot": policy_snapshot, "risk_snapshot": risk_snapshot, "position_management": position_management, "pending_orders_management": pending_management, "private_context": private_context, "trade": result["trade"]}
+            _save_decision_payload(payload, decisions_payload, result["trade"], now, settings.environment, risk_snapshot)
+            result["decisions"] = decisions_payload
+            return result
         except Exception as order_error:
+            journal.update(client_id, "order_rejected", last_error=str(order_error))
             reason = f"Gate entry order rejected safely: {order_error}"
             decision["decision"].update({"action": "WAIT", "entry_price": 0.0, "take_profit_price": 0.0, "stop_loss_price": 0.0, "rejection_reason": reason})
             result["trade"] = {"status": "order_rejected_safe_wait", "contract": trade_symbol, "client_id": client_id, "reason": reason}
@@ -869,52 +907,50 @@ def run_cycle() -> dict:
             _save_decision_payload(payload, decisions_payload, result["trade"], now, settings.environment, risk_snapshot)
             result["decisions"] = decisions_payload
             return result
-        tp = float(decision["decision"].get("take_profit_price") or (last + 2 * trade_feature["atr14"] if size > 0 else last - 2 * trade_feature["atr14"]))
-        sl = float(decision["decision"].get("stop_loss_price") or (last - trade_feature["atr14"] if size > 0 else last + trade_feature["atr14"]))
-        close_size = -size
-        tick = contract.get("order_price_round") or contract.get("mark_price_round") or "0"
-        tp_order = None
-        sl_order = None
+        raw_order = order.get("orders") if isinstance(order, dict) and order.get("reconciled") else order
+        raw_order = raw_order if isinstance(raw_order, dict) else {}
+        intent = journal.update(
+            client_id,
+            "submitted",
+            order_id=str(raw_order.get("id") or ""),
+            order_status=str(raw_order.get("status") or "unknown"),
+        )
+        record_protection_intent(PROTECTION_INTENTS, {
+            "environment": settings.environment, "contract": trade_symbol, "entry_client_id": client_id,
+            "position_side": "long" if size > 0 else "short", "entry_size": str(abs(size)),
+            "entry_price": limit_price, "take_profit_price": rounded_tp, "stop_loss_price": rounded_sl,
+            "created_at_ms": now, "policy_version": policy_snapshot["policy_version"], "policy_hash": policy_snapshot["policy_hash"],
+        })
         try:
-            tp_order = client.create_protection_order(contract=trade_symbol, size=close_size, trigger_price=_round_price(tp, tick), rule=1 if size > 0 else 2, client_id=f"t-gate-tp-{now}")
-            sl_order = client.create_protection_order(contract=trade_symbol, size=close_size, trigger_price=_round_price(sl, tick), rule=2 if size > 0 else 1, client_id=f"t-gate-sl-{now}")
-            protections = client.protection_orders(trade_symbol)
-            tp_rule = 1 if size > 0 else 2
-            sl_rule = 2 if size > 0 else 1
-            tp_covered = _protection_matches(protections, client_id=f"t-gate-tp-{now}", size=close_size, rule=tp_rule)
-            sl_covered = _protection_matches(protections, client_id=f"t-gate-sl-{now}", size=close_size, rule=sl_rule)
-            expected_position_size = existing_size + size
-            total_coverage = protection_coverage_status(protections, expected_position_size)
-            if not tp_covered or not sl_covered or not total_coverage["fully_protected"]:
-                raise RuntimeError(f"Gate {settings.environment.title()} protection coverage verification failed (new_tp={tp_covered}, new_sl={sl_covered}, total={total_coverage['fully_protected']})")
-            result["trade"] = {"status": f"submitted_{settings.environment}", "environment": settings.environment, "contract": trade_symbol, "client_id": client_id, "position_operation": "add" if is_add_on else "open", "order_type": "limit", "price": limit_price, "size": GateFuturesClient._api_size(size), "expected_position_size": GateFuturesClient._api_size(expected_position_size), "configured_leverage": leverage, "risk_snapshot": risk_snapshot, "estimated_margin_usdt": estimated_margin, "leverage_update": leverage_result, "order": order, "take_profit": tp_order, "stop_loss": sl_order, "protection_covered": True, "take_profit_covered": True, "stop_loss_covered": True}
-            record_protection_intent(PROTECTION_INTENTS, {
-                "environment": settings.environment, "contract": trade_symbol, "entry_client_id": client_id,
-                "position_side": "long" if size > 0 else "short", "entry_size": str(abs(size)),
-                "entry_price": limit_price,
-                "take_profit_price": _round_price(tp, tick), "stop_loss_price": _round_price(sl, tick),
-                "created_at_ms": now, "policy_version": policy_snapshot["policy_version"], "policy_hash": policy_snapshot["policy_hash"],
-            })
-        except Exception as protection_error:
-            cleanup = {}
-            try:
-                raw_order = order.get("orders") if isinstance(order, dict) and order.get("reconciled") else order
-                entry_order_id = str((raw_order or {}).get("id") or client_id)
-                cleanup["entry_order"] = client.cancel_order(entry_order_id, trade_symbol)
-            except Exception as cancel_error:
-                cleanup["entry_order"] = f"cancel failed: {cancel_error}"
-            for created in (tp_order, sl_order):
-                raw_created = created.get("order") if isinstance(created, dict) and created.get("reconciled") else created
-                if isinstance(raw_created, dict) and raw_created.get("id"):
-                    try:
-                        cleanup[str(raw_created["id"])] = client.cancel_protection_order(str(raw_created["id"]))
-                    except Exception as cancel_error:
-                        cleanup[str(raw_created["id"])] = f"cancel failed: {cancel_error}"
-            try:
-                cleanup["close_order"] = client.close_position(contract=trade_symbol, client_id=f"t-gate-close-{now}")
-            except Exception as close_error:
-                cleanup["close_order"] = f"close failed: {close_error}"
-            result["trade"] = {"status": "protection_failed_flatten_attempted", "contract": trade_symbol, "client_id": client_id, "order": order, "error": str(protection_error), "cleanup": cleanup}
+            lifecycle = reconcile_intent(client, journal, intent, settings, now_ms=now)
+        except Exception as reconcile_error:
+            journal.update(client_id, last_error=f"initial reconciliation: {reconcile_error}")
+            lifecycle = {"status": "reconciliation_pending", "last_error": str(reconcile_error)}
+        expected_position_size = existing_size + size
+        protected_now = str(lifecycle.get("status") or "") in {"filled_protected", "partially_filled"}
+        terminal_failure = str(lifecycle.get("status") or "") in {"stop_failed_flatten_attempted", "flattened_invalid_protection"}
+        result["trade"] = {
+            "status": "protection_failed_flatten_attempted" if terminal_failure else f"submitted_{settings.environment}",
+            "environment": settings.environment,
+            "contract": trade_symbol,
+            "client_id": client_id,
+            "position_operation": "add" if is_add_on else "open",
+            "order_type": "limit",
+            "price": limit_price,
+            "size": GateFuturesClient._api_size(size),
+            "expected_position_size": GateFuturesClient._api_size(expected_position_size),
+            "configured_leverage": leverage,
+            "risk_snapshot": risk_snapshot,
+            "estimated_margin_usdt": estimated_margin,
+            "leverage_update": leverage_result,
+            "order": order,
+            "take_profit": {"planned_price": rounded_tp},
+            "stop_loss": {"planned_price": rounded_sl},
+            "execution_lifecycle": lifecycle,
+            "protection_covered": protected_now,
+            "take_profit_covered": protected_now,
+            "stop_loss_covered": protected_now or str(lifecycle.get("status") or "") == "stop_protected_tp_pending",
+        }
     if execution_enabled and symbol_cooldown["active"] and result["trade"].get("status") == "not_submitted":
         result["trade"] = {"status": "blocked_symbol_cooldown", "contract": trade_symbol, "reason": f"{trade_symbol} is in post-stop cooldown; other contracts remain eligible", "cooldown": symbol_cooldown}
     elif execution_enabled and not safety_status["safe_for_new_risk"] and result["trade"].get("status") == "not_submitted":

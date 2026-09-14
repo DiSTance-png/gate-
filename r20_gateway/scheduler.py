@@ -32,6 +32,7 @@ class JobSpec:
 
 JOBS = (
     JobSpec("trader", "-m gate_quant.ai_worker", 15 * 60, 840),
+    JobSpec("execution_reconcile", "-m gate_quant.execution_reconciler", 10, 120),
     JobSpec("factor_library", "-m gate_quant.factor_worker", 60, 300),
     JobSpec("news", "-m gate_quant.news_worker", 10 * 60, 120, offset_seconds=180),
     JobSpec("gate_ledger", "sync_gate_ledger.py", 15 * 60, 180, offset_seconds=60),
@@ -65,7 +66,7 @@ def scheduler_snapshot(store: GatewayStore) -> dict[str, Any]:
             last = None
         value = schedule.get(spec.schedule_key) if spec.schedule_key else None
         times = tuple(str(item) for item in value) if isinstance(value, list) else ((str(value),) if isinstance(value, str) else spec.default_times)
-        schedule_text = f"每 {spec.interval_seconds // 60} 分钟 (错峰 +{spec.offset_seconds // 60}m)" if (spec.interval_seconds and spec.offset_seconds) else (f"每 {spec.interval_seconds // 60} 分钟" if spec.interval_seconds else "、".join(times))
+        schedule_text = (f"每 {spec.interval_seconds} 秒" if spec.interval_seconds and spec.interval_seconds < 60 else (f"每 {spec.interval_seconds // 60} 分钟 (错峰 +{spec.offset_seconds // 60}m)" if (spec.interval_seconds and spec.offset_seconds) else (f"每 {spec.interval_seconds // 60} 分钟" if spec.interval_seconds else "、".join(times))))
         jobs.append({
             "name": spec.name,
             "script": spec.script,
@@ -125,7 +126,7 @@ class GatewayScheduler:
             if spec.name == "trader":
                 slot = int(now.timestamp()) // spec.interval_seconds
                 last_slot = int(last.timestamp()) // spec.interval_seconds if last else -1
-                return slot > last_slot and int(now.timestamp()) % spec.interval_seconds < 10
+                return slot > last_slot and int(now.timestamp()) % spec.interval_seconds < 60
             if spec.offset_seconds:
                 # Staggered execution aligned to clock with offset to prevent resource collisions
                 ts = int(now.timestamp())
@@ -189,6 +190,12 @@ class GatewayScheduler:
         for spec in current_jobs():
             if spec.name in self.running or not self.due(spec, now, schedule):
                 continue
+            # Both jobs can write Gate orders and protections. Keep them in one
+            # scheduler-owned lane so a protection gap cannot be repaired twice.
+            if spec.name in {"trader", "execution_reconcile"} and any(
+                name in self.running for name in {"trader", "execution_reconcile"}
+            ):
+                continue
             self.store.set_state(f"job.last.{spec.name}", now.isoformat())
             self.running[spec.name] = self.executor.submit(self._execute, spec)
             launched.append(spec.name)
@@ -200,7 +207,7 @@ class GatewayScheduler:
         now = datetime.now(BJ_TZ)
         for spec in current_jobs():
             last = self._last_at(spec.name)
-            schedule_text = f"每 {spec.interval_seconds // 60} 分钟 (错峰 +{spec.offset_seconds // 60}m)" if (spec.interval_seconds and spec.offset_seconds) else (f"每 {spec.interval_seconds // 60} 分钟" if spec.interval_seconds else "、".join(self._scheduled_times(spec, schedule)))
+            schedule_text = (f"每 {spec.interval_seconds} 秒" if spec.interval_seconds and spec.interval_seconds < 60 else (f"每 {spec.interval_seconds // 60} 分钟 (错峰 +{spec.offset_seconds // 60}m)" if (spec.interval_seconds and spec.offset_seconds) else (f"每 {spec.interval_seconds // 60} 分钟" if spec.interval_seconds else "、".join(self._scheduled_times(spec, schedule)))))
             result.append({
                 "name": spec.name,
                 "script": spec.script,

@@ -83,10 +83,17 @@ def _bool(name: str, default: bool = False) -> bool:
 
 
 def load_settings() -> GateSettings:
+    try:
+        from r20_gateway.secrets import load_secrets
+        encrypted = load_secrets()
+    except Exception:
+        encrypted = {}
+    environment = os.getenv("GATE_ENVIRONMENT", "testnet").strip().lower()
+    prefix = "GATE_TESTNET" if environment == "testnet" else "GATE_LIVE"
     s = GateSettings(
-        environment=os.getenv("GATE_ENVIRONMENT", "testnet").strip().lower(),
-        api_key=os.getenv("GATE_TESTNET_API_KEY", "") if os.getenv("GATE_ENVIRONMENT", "testnet").strip().lower() == "testnet" else os.getenv("GATE_LIVE_API_KEY", ""),
-        api_secret=os.getenv("GATE_TESTNET_API_SECRET", "") if os.getenv("GATE_ENVIRONMENT", "testnet").strip().lower() == "testnet" else os.getenv("GATE_LIVE_API_SECRET", ""),
+        environment=environment,
+        api_key=str(encrypted.get(f"{prefix}_API_KEY") or os.getenv(f"{prefix}_API_KEY", "")),
+        api_secret=str(encrypted.get(f"{prefix}_API_SECRET") or os.getenv(f"{prefix}_API_SECRET", "")),
         settle=os.getenv("GATE_SETTLE", "usdt"),
         proxy_url=os.getenv("GATE_PROXY_URL") or None,
         timeout_seconds=float(os.getenv("GATE_TIMEOUT_SECONDS", "10")),

@@ -7,6 +7,7 @@ from urllib.parse import urlencode
 import requests
 
 from .config import GateSettings
+from .exchange_write_lock import gate_write_lock
 from .signing import gate_signature
 
 
@@ -26,6 +27,12 @@ class GateFuturesClient:
             self.session.proxies.update({"http": self.settings.proxy_url, "https": self.settings.proxy_url})
 
     def _request(self, method: str, endpoint: str, *, params: dict | None = None, payload: dict | None = None, private: bool = False):
+        if private and method.upper() in {"POST", "PUT", "PATCH", "DELETE"}:
+            with gate_write_lock():
+                return self._request_unlocked(method, endpoint, params=params, payload=payload, private=private)
+        return self._request_unlocked(method, endpoint, params=params, payload=payload, private=private)
+
+    def _request_unlocked(self, method: str, endpoint: str, *, params: dict | None = None, payload: dict | None = None, private: bool = False):
         body = json.dumps(payload, separators=(",", ":")) if payload is not None else ""
         query = urlencode(params or {})
         path = "/api/v4" + endpoint

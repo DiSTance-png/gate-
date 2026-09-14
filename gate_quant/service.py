@@ -24,7 +24,10 @@ def protection_coverage_status(protections: list[dict], position_size: int | flo
             continue
         if rule not in coverage:
             continue
-        if bool(initial.get("close")):
+        reduce_only = bool(initial.get("reduce_only", initial.get("is_reduce_only", False)))
+        if not reduce_only and not bool(initial.get("close") or initial.get("is_close")):
+            continue
+        if bool(initial.get("close") or initial.get("is_close")):
             coverage[rule] = required
         elif size != 0 and (1 if size > 0 else -1) == expected_close_sign:
             coverage[rule] += abs(size)
@@ -61,6 +64,24 @@ class GateTradingService:
     def close_position_safely(self, *, contract: str, client_id: str):
         try:
             return self.client.close_position(contract=contract, client_id=client_id)
+        except AmbiguousOrderError:
+            found = self.client.find_by_client_id(client_id, contract)
+            if found:
+                return {"reconciled": True, "order": found}
+            raise
+
+    def reduce_position_safely(self, *, contract: str, size: int | float | Decimal, client_id: str):
+        """Reduce only the requested signed amount; never flatten a pre-existing add-on baseline."""
+        try:
+            return self.client.create_order(
+                contract=contract,
+                size=size,
+                price="0",
+                tif="ioc",
+                client_id=client_id,
+                reduce_only=True,
+                close=False,
+            )
         except AmbiguousOrderError:
             found = self.client.find_by_client_id(client_id, contract)
             if found:

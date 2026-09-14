@@ -275,7 +275,7 @@ const quickNav = [
         </div>
       </div>
 
-      <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+      <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
         <div class="rounded-xl border p-4" :style="{ backgroundColor: 'var(--bg-card)', borderColor: runtime.safety_status?.safe_for_new_risk ? 'var(--color-up-border)' : 'var(--color-down-border)' }">
           <div class="flex items-center gap-2 text-xs font-bold font-mono">
             <ShieldCheck class="w-4 h-4" />
@@ -301,6 +301,15 @@ const quickNav = [
             {{ runtime.trader_heartbeat?.fresh ? 'FRESH' : 'STALE' }}
           </div>
           <div class="mt-1 text-[11px]" style="color: var(--text-muted);">{{ duration(runtime.trader_heartbeat?.age_seconds) }} 前 · PID {{ runtime.trader_heartbeat?.pid || '--' }}</div>
+        </div>
+        <div class="rounded-xl border p-4" :style="{ backgroundColor: 'var(--bg-card)', borderColor: runtime.execution_reconciler?.healthy ? 'var(--color-up-border)' : 'var(--color-down-border)' }">
+          <div class="text-xs font-bold font-mono" style="color: var(--text-muted);">成交与保护对账</div>
+          <div class="mt-2 text-lg font-black font-mono" :style="{ color: runtime.execution_reconciler?.healthy ? 'var(--color-up)' : 'var(--color-down)' }">
+            {{ runtime.execution_reconciler?.healthy ? '正常' : '待检查' }}
+          </div>
+          <div class="mt-1 text-[11px]" style="color: var(--text-muted);">
+            待处理 {{ runtime.execution_reconciler?.active_count || 0 }} · 异常 {{ runtime.execution_reconciler?.error_count || 0 }} · {{ duration(runtime.execution_reconciler?.age_seconds) }} 前
+          </div>
         </div>
       </div>
 
