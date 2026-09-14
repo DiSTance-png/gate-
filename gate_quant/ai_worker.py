@@ -514,6 +514,26 @@ def run_cycle() -> dict:
             private_context["positions"] = client.positions() or []
             private_context["pending_orders"] = client.open_orders() or []
             private_context["protections"] = client.protection_orders() or []
+            # A max-age close can turn all protections for that contract into
+            # orphans. Reconcile once more after the close and remove only
+            # Gate-created protections; manual/unknown orders remain visible
+            # and keep fail-closed protection.
+            post_close_reconciliation = reconcile_exchange_state(
+                private_context["positions"], private_context["pending_orders"], private_context["protections"],
+                max_pending_age_seconds=settings.max_pending_order_age_seconds,
+            )
+            for orphan in post_close_reconciliation["orphan_protections"]:
+                order_id = str(orphan.get("id_string") or orphan.get("id") or "")
+                contract_name = str((orphan.get("initial") or {}).get("contract") or orphan.get("contract") or "").upper()
+                if not order_id or not is_system_protection(orphan):
+                    lifecycle_actions.append({"action": "KEEP_UNVERIFIED_ORPHAN", "contract": contract_name, "order_id": order_id, "reason": "not_created_by_gate_quant"})
+                    continue
+                try:
+                    lifecycle_actions.append({"action": "CANCEL_SYSTEM_ORPHAN_AFTER_CLOSE", "contract": contract_name, **service.cancel_protection_confirmed(order_id=order_id)})
+                except Exception as exc:
+                    lifecycle_actions.append({"action": "CANCEL_SYSTEM_ORPHAN_AFTER_CLOSE", "contract": contract_name, "order_id": order_id, "error": str(exc), "category": classify_error(exc)})
+            if post_close_reconciliation["orphan_protections"]:
+                private_context["protections"] = client.protection_orders() or []
         except Exception as exc:
             recovery_source_available = False
             lifecycle_actions.append({"action": "REFRESH_BEFORE_PROTECTION_REPAIR", "error": str(exc), "category": classify_error(exc)})

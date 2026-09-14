@@ -28,13 +28,28 @@ if (-not (Test-Path -LiteralPath $pythonw)) {
     exit 1
 }
 
-# Remove only stale Gate Web launchers from this project. Never match the OKX path.
-$projectPattern = [regex]::Escape($projectRoot)
+# Remove every stale Gate Web launcher, including older launchers that used the
+# system Python and therefore did not include the project path in CommandLine.
+# The module name is Gate-specific and cannot match the OKX service.
 $stale = Get-CimInstance Win32_Process | Where-Object {
-    $_.CommandLine -match $projectPattern -and $_.CommandLine -match 'gate_quant\.web'
+    $_.CommandLine -match '(?i)(?:-m\s+uvicorn\s+)?gate_quant\.web:app'
 }
 foreach ($process in $stale) {
     try { Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop } catch {}
+}
+
+# Wait briefly for 8081 to be released before starting the single owner of the
+# Web service and its managed SSH tunnel.
+$portDeadline = (Get-Date).AddSeconds(5)
+do {
+    $listener = Get-NetTCPConnection -State Listen -LocalPort 8081 -ErrorAction SilentlyContinue
+    if (-not $listener) { break }
+    Start-Sleep -Milliseconds 200
+} while ((Get-Date) -lt $portDeadline)
+
+if ($listener) {
+    Write-WatchdogLog 'restart failed: Gate Web port 8081 is still occupied after stale-process cleanup'
+    exit 1
 }
 
 Start-Process -FilePath $pythonw `
