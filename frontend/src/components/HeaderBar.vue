@@ -136,7 +136,6 @@ const tabs = computed(() => [
         <!-- Control Plane / Admin Settings Button (Icon only) -->
         <a
           href="/admin"
-          target="_blank"
           class="flex items-center justify-center w-7 h-7 sm:w-7.5 sm:h-7.5 rounded-lg border transition-all cursor-pointer shadow-xs shrink-0 group"
           style="background-color: var(--bg-card); border-color: var(--border-subtle); color: var(--text-main);"
           :title="t('nav.controlPlane')"

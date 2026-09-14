@@ -415,7 +415,6 @@ const showAboutModal = ref(false)
           <!-- Back to Terminal -->
           <a
             href="/"
-            target="_blank"
             class="flex items-center space-x-1 sm:space-x-1.5 px-2 sm:px-2.5 h-8 rounded-lg border transition-all cursor-pointer shadow-xs text-[11px] sm:text-xs shrink-0"
             style="background-color: var(--bg-card); border-color: var(--border-subtle); color: var(--text-muted);"
             :title="isEn ? 'Trading Terminal' : '实盘终端'"

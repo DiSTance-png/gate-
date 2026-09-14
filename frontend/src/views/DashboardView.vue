@@ -31,6 +31,22 @@ const route = useRoute()
 const store = useDashboardStore()
 const { t } = useI18n()
 const layoutMode = ref<'dual' | 'stacked'>('stacked')
+const dashboardInstanceId = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+let dashboardChannel: BroadcastChannel | null = null
+
+function claimDashboardPolling() {
+  if (document.hidden) return
+  dashboardChannel?.postMessage({ type: 'claim', instanceId: dashboardInstanceId })
+  store.startPolling(5000)
+}
+
+function handleDashboardVisibility() {
+  if (document.hidden) {
+    store.stopPolling()
+  } else {
+    claimDashboardPolling()
+  }
+}
 
 // Sync initial tab from route path
 function syncTabFromRoute() {
@@ -57,7 +73,16 @@ watch(() => store.activeTab, (newTab) => {
 
 onMounted(() => {
   syncTabFromRoute()
-  store.startPolling(3000)
+  if ('BroadcastChannel' in window) {
+    dashboardChannel = new BroadcastChannel('gate-dashboard-single-instance')
+    dashboardChannel.onmessage = (event) => {
+      if (event.data?.type === 'claim' && event.data?.instanceId !== dashboardInstanceId) {
+        store.stopPolling()
+      }
+    }
+  }
+  document.addEventListener('visibilitychange', handleDashboardVisibility)
+  claimDashboardPolling()
   try {
     const saved = localStorage.getItem('r20_dashboard_layout_v2')
     if (saved === 'dual' || saved === 'stacked') {
@@ -72,6 +97,9 @@ onMounted(() => {
 
 onUnmounted(() => {
   store.stopPolling()
+  document.removeEventListener('visibilitychange', handleDashboardVisibility)
+  dashboardChannel?.close()
+  dashboardChannel = null
 })
 
 function setLayout(mode: 'dual' | 'stacked') {

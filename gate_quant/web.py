@@ -5,6 +5,7 @@ import json
 import socket
 import time
 import datetime as dt
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
@@ -165,7 +166,8 @@ if (ROOT / "frontend" / "dist" / "assets").exists():
 @app.middleware("http")
 async def no_cache_frontend_assets(request: Request, call_next):
     response = await call_next(request)
-    if request.url.path == "/" or request.url.path.startswith(("/assets/", "/static/")):
+    content_type = response.headers.get("content-type", "").lower()
+    if content_type.startswith("text/html") or request.url.path.startswith(("/assets/", "/static/")):
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         response.headers["Pragma"] = "no-cache"
     return response
@@ -356,17 +358,32 @@ def dashboard():
 def all_dashboard():
     """Unified Gate-native payload for the migrated control console."""
     s = load_settings()
-    c = client()
-    try:
-        ticker_rows = market_client().tickers()
-    except Exception as exc:
-        ticker_rows = []
-        store.add("gate.market.error", {"error": str(exc)[:300]}, "ERROR")
-    account, account_error = safe_private(c.account, {})
-    positions_raw, position_error = safe_private(c.positions, [])
-    orders_raw, order_error = safe_private(c.open_orders, [])
-    protections_raw, protection_error = safe_private(c.protection_orders, [])
-    account_book, account_book_error = safe_private(lambda: c.account_book(from_time=int(time.time()) - 172800, to_time=int(time.time()), limit=1000), [])
+    now = int(time.time())
+    # Keep slow or unavailable Gate endpoints from serially blocking the whole
+    # dashboard. Each worker owns its client/session because requests.Session
+    # is not guaranteed to be thread-safe.
+    private_clients = [GateFuturesClient(s) for _ in range(5)]
+    with ThreadPoolExecutor(max_workers=6, thread_name_prefix="gate-dashboard") as executor:
+        ticker_future = executor.submit(market_client().tickers)
+        account_future = executor.submit(safe_private, private_clients[0].account, {})
+        positions_future = executor.submit(safe_private, private_clients[1].positions, [])
+        orders_future = executor.submit(safe_private, private_clients[2].open_orders, [])
+        protections_future = executor.submit(safe_private, private_clients[3].protection_orders, [])
+        account_book_future = executor.submit(
+            safe_private,
+            lambda: private_clients[4].account_book(from_time=now - 172800, to_time=now, limit=1000),
+            [],
+        )
+        try:
+            ticker_rows = ticker_future.result()
+        except Exception as exc:
+            ticker_rows = []
+            store.add("gate.market.error", {"error": str(exc)[:300]}, "ERROR")
+        account, account_error = account_future.result()
+        positions_raw, position_error = positions_future.result()
+        orders_raw, order_error = orders_future.result()
+        protections_raw, protection_error = protections_future.result()
+        account_book, account_book_error = account_book_future.result()
     positions = []
     for p in positions_raw or []:
         size = float(p.get("size") or 0)

@@ -12,6 +12,7 @@ export const useDashboardStore = defineStore('dashboard', () => {
   const isConnected = ref<boolean>(true)
   const pollingTimer = ref<any>(null)
   const showAboutModal = ref<boolean>(false)
+  let requestController: AbortController | null = null
 
   // Getters
   const account = computed(() => data.value?.account || null)
@@ -86,11 +87,20 @@ export const useDashboardStore = defineStore('dashboard', () => {
 
   // Actions
   async function fetchDashboard(silent = false) {
+    if (requestController) return
+    const controller = new AbortController()
+    requestController = controller
+    let timedOut = false
+    const timeoutTimer = window.setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, 20_000)
     if (!silent) {
       isRefreshing.value = true
     }
     try {
       const resp = await fetch(`/api/all?_t=${Date.now()}`, {
+        signal: controller.signal,
         headers: {
           'Accept-Encoding': 'gzip, deflate, br',
         },
@@ -104,10 +114,15 @@ export const useDashboardStore = defineStore('dashboard', () => {
       isConnected.value = true
       error.value = null
     } catch (err: any) {
+      if (controller.signal.aborted && !timedOut) return
       console.error('[DashboardStore] fetch failed:', err)
-      error.value = err.message || '获取数据失败'
+      error.value = timedOut ? '仪表盘数据请求超时，请稍后重试' : (err.message || '获取数据失败')
       isConnected.value = false
     } finally {
+      window.clearTimeout(timeoutTimer)
+      if (requestController === controller) {
+        requestController = null
+      }
       loading.value = false
       if (!silent) {
         setTimeout(() => {
@@ -117,7 +132,7 @@ export const useDashboardStore = defineStore('dashboard', () => {
     }
   }
 
-  function startPolling(intervalMs = 3000) {
+  function startPolling(intervalMs = 5000) {
     stopPolling()
     fetchDashboard(false)
     pollingTimer.value = setInterval(() => {
@@ -130,6 +145,8 @@ export const useDashboardStore = defineStore('dashboard', () => {
       clearInterval(pollingTimer.value)
       pollingTimer.value = null
     }
+    requestController?.abort()
+    requestController = null
   }
 
   return {
