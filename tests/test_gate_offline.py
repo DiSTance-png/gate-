@@ -50,6 +50,7 @@ def test_gate_position_close_maps_native_lifecycle_fields():
     assert row["fee"] == pytest.approx(-4.42752016)
     assert row["funding_fee"] == pytest.approx(-0.65835591)
     assert row["hold_duration"] == "16小时13分"
+    assert row["exit_reason"] == "超过最大持仓时间自动平仓"
 
 
 def test_gateway_scheduler_includes_gate_ledger_and_self_improvement():

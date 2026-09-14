@@ -37,6 +37,21 @@ def _duration_text(start, end) -> str:
     return f"{hours}小时{minutes}分" if hours else (f"{minutes}分{secs}秒" if minutes else f"{secs}秒")
 
 
+def _exit_reason(row: dict) -> str:
+    text = str(row.get("text") or "")
+    if text.startswith("t-gate-time-"):
+        return "超过最大持仓时间自动平仓"
+    if text.startswith("t-gate-close-"):
+        return "系统安全平仓"
+    if text.startswith("t-gate-cleanup-"):
+        return "系统清理平仓"
+    if text.startswith("t-gate-pclose-"):
+        return "保护单触发后安全平仓"
+    if text.startswith("ao-"):
+        return "Gate 原生保护单触发平仓"
+    return "Gate 原生平仓成交"
+
+
 def _ledger_row(row: dict, quanto_multiplier: float = 0.0) -> dict | None:
     close_id = str(row.get("id") or row.get("order_id") or row.get("text") or "")
     contract = str(row.get("contract") or row.get("name") or "")
@@ -67,7 +82,7 @@ def _ledger_row(row: dict, quanto_multiplier: float = 0.0) -> dict | None:
         "funding_fee": round(funding, 8), "pnl": round(net_pnl, 8),
         "net_pnl": round(net_pnl, 8), "roi": round(roi, 2), "roi_pct": round(roi, 2),
         "hold_duration": _duration_text(first_open_time, close_time),
-        "status": "closed", "exit_reason": "Gate position_close",
+        "status": "closed", "exit_reason": _exit_reason(row),
         "margin_mode": str(row.get("margin_mode") or ""),
         "source": "Gate Futures position_close",
     }
