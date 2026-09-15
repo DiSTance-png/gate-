@@ -34,6 +34,7 @@ from .execution_reconciler import JOURNAL_PATH as EXECUTION_JOURNAL
 from .exchange_write_lock import gate_write_lock
 from .risk import RiskLimits
 from .service import GateTradingService, protection_coverage_status
+from .protection_lifecycle import is_system_protection
 from .store import EventStore
 from .proxy_tunnel import gate_tunnel
 from .risk_profiles import get_risk_profile, profile_catalog
@@ -222,6 +223,7 @@ class GateAdminConfig(BaseModel):
     live_api_key: str | None = None
     live_api_secret: str | None = None
     live_trading_enabled: bool = False
+    live_confirmation: str | None = None
     testnet_execute_trades: bool = False
     leverage: float = Field(default=3, ge=1, le=100)
     risk_profile: str = Field(default="standard", pattern="^(observe|conservative|standard|active|aggressive)$")
@@ -251,6 +253,10 @@ class GateProtectionRequest(BaseModel):
     reduce_only: bool = True
     close: bool = False
     expiration: int = Field(default=86400, ge=60, le=2592000)
+
+
+class GateTestnetShutdownRequest(BaseModel):
+    confirmation: str = Field(min_length=1, max_length=64)
 
 
 def _require_control_admin(token: str | None):
@@ -307,6 +313,26 @@ def _save_gate_secrets(values: dict[str, str]) -> None:
     from r20_gateway.secrets import save_secrets
     save_secrets(values)
     os.environ.update(values)
+
+
+def _environment_risk_present(environment: str) -> bool:
+    """Return whether an environment still has positions or entry orders."""
+    try:
+        if environment not in {"testnet", "live"}:
+            raise ValueError("unsupported Gate environment")
+        prefix = "GATE_TESTNET" if environment == "testnet" else "GATE_LIVE"
+        target = replace(load_settings(), environment=environment, public_market_environment=environment, api_key=_stored_gate_credential(f"{prefix}_API_KEY"), api_secret=_stored_gate_credential(f"{prefix}_API_SECRET"), live_trading_enabled=False, testnet_execute_trades=False)
+        if not target.api_key or not target.api_secret:
+            return False
+        c = GateFuturesClient(target)
+        positions = c.positions() or []
+        orders = c.open_orders() or []
+        rows = positions if isinstance(positions, list) else [positions]
+        return any(float(row.get("size") or 0) != 0 for row in rows if isinstance(row, dict)) or any(
+            not bool(row.get("reduce_only")) and not bool(row.get("close")) for row in (orders if isinstance(orders, list) else []) if isinstance(row, dict)
+        )
+    except Exception as exc:
+        raise RuntimeError(f"无法确认 Gate {environment.upper()} 是否还有仓位或入场挂单：{exc}") from exc
 
 
 def _order_risk(c: GateFuturesClient, *, contract: str, size: float, leverage: float) -> dict[str, Any]:
@@ -801,6 +827,12 @@ def gate_admin_config(payload: GateAdminConfig, x_gate_session: str | None = Hea
         raise HTTPException(400, f"{profile.label}档位的杠杆上限为 {profile.max_leverage:g}x")
     if payload.live_trading_enabled and payload.environment != "live":
         raise HTTPException(400, "Gate Live 开关只能在已选择 Live 环境时显式启用")
+    if payload.environment == "testnet" and payload.live_trading_enabled:
+        raise HTTPException(400, "Testnet 环境不能同时启用 Live 交易")
+    if payload.environment == "live" and payload.testnet_execute_trades:
+        raise HTTPException(400, "Live 环境不能同时启用 Testnet 自动交易")
+    if payload.live_trading_enabled and (payload.live_confirmation or "").strip().upper() != "ENABLE GATE LIVE":
+        raise HTTPException(400, "开启 Gate Live 必须输入确认短语：ENABLE GATE LIVE")
     testnet_key = (payload.testnet_api_key or _stored_gate_credential("GATE_TESTNET_API_KEY")).strip()
     testnet_secret = (payload.testnet_api_secret or _stored_gate_credential("GATE_TESTNET_API_SECRET")).strip()
     live_key = (payload.live_api_key or _stored_gate_credential("GATE_LIVE_API_KEY")).strip()
@@ -809,6 +841,16 @@ def gate_admin_config(payload: GateAdminConfig, x_gate_session: str | None = Hea
         raise HTTPException(400, "启用 Gate Testnet 自动交易前必须配置完整 Testnet Key/Secret")
     if payload.environment == "live" and payload.live_trading_enabled and not (live_key and live_secret):
         raise HTTPException(400, "启用 Gate Live 实盘前必须配置完整 Live Key/Secret")
+    current_settings = load_settings()
+    if payload.environment != current_settings.environment:
+        try:
+            if _environment_risk_present(current_settings.environment):
+                instruction = "请先使用“停止 Testnet 自动交易并平仓”" if current_settings.environment == "testnet" else "请先关闭 Live 新增交易并单独确认实盘持仓已平仓"
+                raise HTTPException(409, f"当前 {current_settings.environment.upper()} 仍有持仓或入场挂单；{instruction}")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(409, str(exc)) from exc
     managed_proxy = os.getenv("GATE_PROXY_URL", "") if gate_tunnel.enabled else (payload.proxy_url or "")
     values = {"GATE_ENVIRONMENT": payload.environment, "GATE_PUBLIC_MARKET_ENV": payload.environment, "GATE_TESTNET_EXECUTE_TRADES": str(payload.testnet_execute_trades).lower(), "GATE_LIVE_TRADING_ENABLED": str(payload.live_trading_enabled).lower(), "GATE_RISK_PROFILE": payload.risk_profile, "GATE_LEVERAGE": str(payload.leverage), "GATE_PROXY_URL": managed_proxy, "GATE_MAX_POSITION_NOTIONAL_USD": str(payload.max_position_notional_usd), "GATE_MAX_TOTAL_MARGIN_USD": str(payload.max_total_margin_usd), "GATE_MAX_ORDER_MARGIN_USD": str(payload.max_order_margin_usd)}
     # Keep market data, credentials and order writes on the selected cluster.
@@ -818,7 +860,7 @@ def gate_admin_config(payload: GateAdminConfig, x_gate_session: str | None = Hea
     for env_key, value in (("GATE_TESTNET_API_KEY", payload.testnet_api_key), ("GATE_TESTNET_API_SECRET", payload.testnet_api_secret), ("GATE_LIVE_API_KEY", payload.live_api_key), ("GATE_LIVE_API_SECRET", payload.live_api_secret)):
         if value:
             secret_updates[env_key] = value.strip()
-    current = load_settings()
+    current = current_settings
     candidate = replace(
         current,
         environment=payload.environment,
@@ -838,6 +880,13 @@ def gate_admin_config(payload: GateAdminConfig, x_gate_session: str | None = Hea
         candidate.validate()
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    if payload.live_trading_enabled:
+        try:
+            account = GateFuturesClient(candidate).account() or {}
+            if not isinstance(account, dict):
+                raise RuntimeError("Gate Live 账户响应格式无效")
+        except Exception as exc:
+            raise HTTPException(400, f"Gate Live 私有 API 只读检测失败，未开启实盘：{exc}") from exc
     _update_env(values)
     if secret_updates:
         _save_gate_secrets(secret_updates)
@@ -845,6 +894,66 @@ def gate_admin_config(payload: GateAdminConfig, x_gate_session: str | None = Hea
     snapshot = get_risk_profile(updated.risk_profile).snapshot(leverage=updated.leverage, environment=updated.environment)
     store.add("gate.config.updated", {"actor": actor.get("username"), "environment": payload.environment, "risk_snapshot": snapshot})
     return {"updated": True, "environment": payload.environment, "risk_snapshot": snapshot}
+
+
+@app.post("/api/v1/admin/gate/testnet/stop-and-flatten")
+def stop_and_flatten_testnet(payload: GateTestnetShutdownRequest, x_gate_session: str | None = Header(default=None, alias="X-R20-Session")):
+    """Disable Testnet entries, cancel entries, flatten and verify Testnet only."""
+    actor = _require_control_admin(x_gate_session)
+    if payload.confirmation.strip().upper() != "STOP TESTNET AND FLATTEN":
+        raise HTTPException(400, "确认短语必须精确为：STOP TESTNET AND FLATTEN")
+    with gate_write_lock():
+        settings = load_settings()
+        if settings.environment != "testnet":
+            raise HTTPException(409, "当前环境不是 Gate Testnet，拒绝执行模拟盘平仓")
+        # Disable new Testnet risk before querying or mutating any exchange state.
+        _update_env({"GATE_TESTNET_EXECUTE_TRADES": "false"})
+        client_instance = GateFuturesClient(load_settings())
+        result: dict[str, Any] = {"ok": False, "environment": "testnet", "trading_disabled": True, "cancelled_orders": [], "closed_positions": [], "cancelled_protections": [], "retained_protections": []}
+        try:
+            orders = client_instance.open_orders() or []
+            for order in orders if isinstance(orders, list) else []:
+                if bool(order.get("reduce_only")) or bool(order.get("close")):
+                    continue
+                contract = str(order.get("contract") or "").upper()
+                order_id = str(order.get("id") or "")
+                if not contract or not order_id:
+                    raise RuntimeError("发现无法识别的 Testnet 入场挂单，已停止后续操作")
+                result["cancelled_orders"].append(GateTradingService(client_instance, RiskLimits(settings.max_position_notional_usd, settings.max_total_margin_usd, settings.max_order_margin_usd)).cancel_order_confirmed(contract=contract, order_id=order_id))
+            positions = client_instance.positions() or []
+            rows = positions if isinstance(positions, list) else [positions]
+            for position in rows:
+                contract = str(position.get("contract") or "").upper()
+                if not contract or not float(position.get("size") or 0):
+                    continue
+                client_id = f"t-gate-tsclose-{str(int(time.time() * 1000))[-9:]}-{len(result['closed_positions'])}"
+                result["closed_positions"].append({"contract": contract, "size_before": str(position.get("size")), "result": GateTradingService(client_instance, RiskLimits(settings.max_position_notional_usd, settings.max_total_margin_usd, settings.max_order_margin_usd)).close_position_safely(contract=contract, client_id=client_id)})
+            remaining = []
+            for attempt in range(6):
+                refreshed = client_instance.positions() or []
+                remaining = [row for row in (refreshed if isinstance(refreshed, list) else [refreshed]) if float(row.get("size") or 0)]
+                if not remaining:
+                    break
+                if attempt < 5:
+                    time.sleep(0.5)
+            if remaining:
+                raise RuntimeError("Testnet 平仓请求已发送，但持仓仍未确认归零")
+            protections = client_instance.protection_orders() or []
+            service = GateTradingService(client_instance, RiskLimits(settings.max_position_notional_usd, settings.max_total_margin_usd, settings.max_order_margin_usd))
+            for protection in protections if isinstance(protections, list) else []:
+                if not is_system_protection(protection):
+                    result["retained_protections"].append(str(protection.get("id_string") or protection.get("id") or "unknown"))
+                    continue
+                order_id = str(protection.get("id_string") or protection.get("id") or "")
+                if order_id:
+                    result["cancelled_protections"].append(service.cancel_protection_confirmed(order_id=order_id))
+            result["ok"] = True
+            store.add("gate.testnet.stop_and_flatten", {"actor": actor.get("username"), "cancelled_orders": len(result["cancelled_orders"]), "closed_positions": len(result["closed_positions"]), "cancelled_protections": len(result["cancelled_protections"]), "retained_protections": len(result["retained_protections"])})
+            return result
+        except Exception as exc:
+            result["error"] = str(exc)
+            store.add("gate.testnet.stop_and_flatten_failed", {"actor": actor.get("username"), "error": str(exc)[:300]}, "ERROR")
+            raise HTTPException(502, f"Testnet 已关闭新增交易，但平仓流程未完成：{exc}") from exc
 
 
 @app.get("/api/v1/admin/gate/check")

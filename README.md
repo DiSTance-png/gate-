@@ -52,6 +52,8 @@ pytest -q
 
 面板保存配置时会先在内存中构造并校验完整候选配置，验证失败不会写入 `.env` 或加密凭证仓库。自动交易、成交对账和 Web 手工下单/撤单/保护单共用独立的跨进程 Gate 写锁；并发请求拿不到锁时会明确返回“未发送到交易所”，不会绕过对账并重复写单。
 
+系统同一时间只允许一个交易环境生效。切换环境前会只读检查当前环境的持仓和入场挂单；仍有风险时拒绝切换。Web 开启 Live 必须输入 `ENABLE GATE LIVE`，并在保存前使用候选 Live 凭证完成私有账户只读检测。关闭 Live 只阻止新增风险，不自动平仓。Testnet 提供独立的“停止自动交易并平仓”按钮，必须输入 `STOP TESTNET AND FLATTEN`：系统先关闭 Testnet 新增交易，再撤入场挂单、逐合约平仓、重复确认持仓归零，最后只清理由本系统创建的保护单；任何步骤无法确认时保持 Testnet 关闭并返回失败。
+
 AI 的 `entry_price` 使用 Gate 原生 GTC 限价单；只有明确的市价操作才使用 `price=0` 与 `tif=ioc`。下单张数按 `floor(margin_usdt × GATE_LEVERAGE ÷ (entry_price × quanto_multiplier))` 计算，并按 Gate 合约元数据的 `enable_decimal` 与 `order_size_min` 向下对齐。Testnet 的整数合约仍至少 1 张；Live 支持的合约可使用 0.1 等小数张。舍入后会重新计算实际名义价值和保证金，再接受单仓名义价值、总保证金和单笔保证金三重上限校验。
 
 每轮最近 200 条摘要保存在 `data/ai_decision_history.json`，完整追加审计写入 `data/ai_decision_audit.jsonl`。每条记录包含环境、原始/最终动作、拦截原因、交易结果和当轮风险快照，Testnet 与 Live 可明确区分。

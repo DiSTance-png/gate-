@@ -1,5 +1,6 @@
 import importlib
 import sys
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -240,6 +241,127 @@ def test_gate_admin_validation_failure_does_not_persist_config(monkeypatch):
 
     assert exc.value.status_code == 400
     assert persisted == {}
+
+
+def test_enabling_live_requires_confirmation_and_read_only_probe(monkeypatch):
+    import gate_quant.web as web
+
+    persisted = {}
+    probes = []
+    monkeypatch.setattr(web, "_require_control_admin", lambda token: {"username": "tester"})
+    monkeypatch.setattr(web, "_update_env", lambda values: persisted.update(values))
+    monkeypatch.setattr(web, "_save_gate_secrets", lambda values: None)
+    monkeypatch.setattr(web.store, "add", lambda *args, **kwargs: None)
+    monkeypatch.setattr(web, "load_settings", lambda: configured_settings(environment="live", public_market_environment="live", live_trading_enabled=False))
+
+    class Probe:
+        def __init__(self, settings):
+            probes.append(settings.environment)
+        def account(self):
+            return {"total": "1"}
+
+    monkeypatch.setattr(web, "GateFuturesClient", Probe)
+    payload = web.GateAdminConfig(environment="live", live_api_key="live-key", live_api_secret="live-secret", live_trading_enabled=True, max_position_notional_usd=1000, max_total_margin_usd=100, max_order_margin_usd=25)
+    with pytest.raises(web.HTTPException, match="ENABLE GATE LIVE"):
+        web.gate_admin_config(payload, None)
+    assert persisted == {}
+
+    payload.live_confirmation = "ENABLE GATE LIVE"
+    web.gate_admin_config(payload, None)
+    assert probes == ["live"]
+    assert persisted["GATE_LIVE_TRADING_ENABLED"] == "true"
+    assert persisted["GATE_TESTNET_EXECUTE_TRADES"] == "false"
+
+
+def test_environment_switch_is_blocked_when_current_environment_has_risk(monkeypatch):
+    import gate_quant.web as web
+
+    monkeypatch.setattr(web, "_require_control_admin", lambda token: {"username": "tester"})
+    monkeypatch.setattr(web, "load_settings", lambda: configured_settings(environment="testnet", public_market_environment="testnet"))
+    monkeypatch.setattr(web, "_environment_risk_present", lambda environment: True)
+    payload = web.GateAdminConfig(environment="live", live_trading_enabled=False, max_position_notional_usd=1000, max_total_margin_usd=100, max_order_margin_usd=25)
+    with pytest.raises(web.HTTPException, match="停止 Testnet 自动交易并平仓") as exc:
+        web.gate_admin_config(payload, None)
+    assert exc.value.status_code == 409
+
+
+def test_testnet_stop_and_flatten_orders_actions_and_confirms_zero(monkeypatch):
+    import gate_quant.web as web
+
+    config_updates = {}
+    monkeypatch.setattr(web, "_require_control_admin", lambda token: {"username": "tester"})
+    monkeypatch.setattr(web, "_update_env", lambda values: config_updates.update(values))
+    monkeypatch.setattr(web, "load_settings", lambda: configured_settings(environment="testnet", public_market_environment="testnet", testnet_execute_trades=False))
+    monkeypatch.setattr(web, "gate_write_lock", lambda: nullcontext())
+    monkeypatch.setattr(web.store, "add", lambda *args, **kwargs: None)
+    monkeypatch.setattr(web.time, "sleep", lambda seconds: None)
+
+    class FakeGate:
+        def __init__(self):
+            self.entry_open = True
+            self.position_open = True
+            self.protections = [{"id": "p1", "initial": {"text": "t-gate-sl-1"}}]
+            self.actions = []
+        def open_orders(self, contract=None):
+            return ([{"id": "o1", "contract": "BTC_USDT", "reduce_only": False, "close": False}] if self.entry_open else [])
+        def cancel_order(self, order_id, contract=None):
+            self.actions.append(("cancel", contract, order_id)); self.entry_open = False; return {"id": order_id}
+        def positions(self, contract=None):
+            return ([{"contract": "BTC_USDT", "size": "2"}] if self.position_open else [])
+        def close_position(self, contract, client_id):
+            self.actions.append(("close", contract, client_id)); self.position_open = False; return {"id": "close-1"}
+        def find_by_client_id(self, client_id, contract):
+            return None
+        def protection_orders(self, contract=None):
+            return list(self.protections)
+        def cancel_protection_order(self, order_id):
+            self.actions.append(("cancel_protection", order_id)); self.protections = []; return {"id": order_id}
+
+    fake = FakeGate()
+    monkeypatch.setattr(web, "GateFuturesClient", lambda settings: fake)
+    result = web.stop_and_flatten_testnet(web.GateTestnetShutdownRequest(confirmation="STOP TESTNET AND FLATTEN"), None)
+    assert result["ok"] is True
+    assert config_updates == {"GATE_TESTNET_EXECUTE_TRADES": "false"}
+    assert [action[0] for action in fake.actions] == ["cancel", "close", "cancel_protection"]
+    close_client_id = next(action[2] for action in fake.actions if action[0] == "close")
+    assert len(close_client_id) <= 28
+
+
+def test_testnet_stop_and_flatten_wrong_phrase_never_disables_or_writes(monkeypatch):
+    import gate_quant.web as web
+
+    touched = []
+    monkeypatch.setattr(web, "_require_control_admin", lambda token: {"username": "tester"})
+    monkeypatch.setattr(web, "_update_env", lambda values: touched.append(values))
+    with pytest.raises(web.HTTPException, match="STOP TESTNET AND FLATTEN") as exc:
+        web.stop_and_flatten_testnet(web.GateTestnetShutdownRequest(confirmation="wrong"), None)
+    assert exc.value.status_code == 400
+    assert touched == []
+
+
+def test_testnet_stop_failure_keeps_trading_disabled_and_protections(monkeypatch):
+    import gate_quant.web as web
+
+    updates = {}
+    monkeypatch.setattr(web, "_require_control_admin", lambda token: {"username": "tester"})
+    monkeypatch.setattr(web, "_update_env", lambda values: updates.update(values))
+    monkeypatch.setattr(web, "load_settings", lambda: configured_settings(environment="testnet", public_market_environment="testnet"))
+    monkeypatch.setattr(web, "gate_write_lock", lambda: nullcontext())
+    monkeypatch.setattr(web.store, "add", lambda *args, **kwargs: None)
+    monkeypatch.setattr(web.time, "sleep", lambda seconds: None)
+
+    class StuckGate:
+        def open_orders(self, contract=None): return []
+        def positions(self, contract=None): return [{"contract": "ETH_USDT", "size": "1"}]
+        def close_position(self, contract, client_id): return {"id": "close-unknown"}
+        def find_by_client_id(self, client_id, contract): return None
+        def protection_orders(self, contract=None): raise AssertionError("protection cleanup must wait for confirmed zero positions")
+
+    monkeypatch.setattr(web, "GateFuturesClient", lambda settings: StuckGate())
+    with pytest.raises(web.HTTPException, match="持仓仍未确认归零") as exc:
+        web.stop_and_flatten_testnet(web.GateTestnetShutdownRequest(confirmation="STOP TESTNET AND FLATTEN"), None)
+    assert exc.value.status_code == 502
+    assert updates == {"GATE_TESTNET_EXECUTE_TRADES": "false"}
 
 
 def test_gate_import_does_not_start_legacy_dashboard_worker():
