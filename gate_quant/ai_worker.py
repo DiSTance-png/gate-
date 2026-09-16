@@ -422,7 +422,11 @@ def _execute_entry_candidate(client: GateFuturesClient, envelope: dict, *, setti
 
     client_id = f"t-gate-ai-{now_ms}-{sequence}"
     try:
-        position = client.positions(trade_symbol) or {}
+        position_response = client.positions(trade_symbol) or {}
+        if isinstance(position_response, list):
+            position = next((row for row in position_response if isinstance(row, dict) and float(row.get("size") or 0) != 0), {})
+        else:
+            position = position_response if isinstance(position_response, dict) else {}
     except RuntimeError as exc:
         if "POSITION_NOT_FOUND" not in str(exc):
             raise

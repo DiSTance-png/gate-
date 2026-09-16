@@ -125,6 +125,13 @@ def test_serial_candidates_ambiguous_order_stops_following_entries():
     assert submitted == []
 
 
+def test_position_response_list_is_normalized_before_leverage_lookup():
+    response = [{"contract": "BTC_USDT", "size": "2", "pos_margin_mode": "cross", "leverage": "5"}]
+    position = next((row for row in response if isinstance(row, dict) and float(row.get("size") or 0) != 0), {})
+    assert position["contract"] == "BTC_USDT"
+    assert position["pos_margin_mode"] == "cross"
+
+
 def test_risk_profile_limits_entries_per_cycle():
     assert get_risk_profile("standard").max_entries_per_cycle == 1
     assert get_risk_profile("aggressive").max_entries_per_cycle == 2
