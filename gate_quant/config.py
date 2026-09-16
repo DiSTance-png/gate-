@@ -22,6 +22,7 @@ class GateSettings:
     testnet_execute_trades: bool = False
     leverage: float = 3.0
     risk_profile: str = "standard"
+    max_entries_per_cycle: int = 1
     max_position_notional_usd: float = 0.0
     max_total_margin_usd: float = 0.0
     max_order_margin_usd: float = 0.0
@@ -60,6 +61,10 @@ class GateSettings:
         profile = get_risk_profile(self.risk_profile)
         if self.leverage > profile.max_leverage:
             raise ValueError(f"GATE_LEVERAGE cannot exceed {profile.max_leverage:g}x for risk profile {profile.key}")
+        if not 0 <= self.max_entries_per_cycle <= 2:
+            raise ValueError("GATE_MAX_ENTRIES_PER_CYCLE must be between 0 and 2")
+        if self.max_entries_per_cycle > profile.max_entries_per_cycle:
+            raise ValueError(f"GATE_MAX_ENTRIES_PER_CYCLE cannot exceed {profile.max_entries_per_cycle} for risk profile {profile.key}")
         for name, value in (("max_position_notional_usd", self.max_position_notional_usd), ("max_total_margin_usd", self.max_total_margin_usd), ("max_order_margin_usd", self.max_order_margin_usd)):
             if value < 0:
                 raise ValueError(f"{name} cannot be negative")
@@ -101,6 +106,7 @@ def load_settings() -> GateSettings:
         testnet_execute_trades=_bool("GATE_TESTNET_EXECUTE_TRADES"),
         leverage=float(os.getenv("GATE_LEVERAGE", "3")),
         risk_profile=os.getenv("GATE_RISK_PROFILE", "standard").strip().lower(),
+        max_entries_per_cycle=int(os.getenv("GATE_MAX_ENTRIES_PER_CYCLE", "1")),
         max_position_notional_usd=float(os.getenv("GATE_MAX_POSITION_NOTIONAL_USD", "0")),
         max_total_margin_usd=float(os.getenv("GATE_MAX_TOTAL_MARGIN_USD", "0")),
         max_order_margin_usd=float(os.getenv("GATE_MAX_ORDER_MARGIN_USD", "0")),

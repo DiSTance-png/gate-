@@ -34,16 +34,27 @@ PROTECTION_INTENTS = DATA / "protection_intents.json"
 PENDING_REQUOTES = DATA / "pending_requotes.json"
 PENDING_REQUOTE_TTL_SECONDS = 20 * 60
 
+TRADE_STATUS_LABELS = {
+    "blocked_pending_reconfirmation": "等待下一轮确认",
+    "blocked_price_deviation": "报价偏差过大，未下单",
+    "blocked_extreme_deviation": "价格波动过大，未下单",
+    "blocked_by_strategy_interceptor": "被策略风控拦截",
+    "blocked_safety_fail_closed": "安全门关闭，未下单",
+    "blocked_cycle_entry_limit": "达到单轮开仓上限，本轮未提交",
+}
+
 
 def _save_decision_payload(payload: dict, decisions_payload: dict, trade: dict, now: int, environment: str, risk_snapshot: dict | None = None) -> None:
     risk_snapshot = risk_snapshot or {}
     trade.setdefault("policy_version", risk_snapshot.get("policy_version", "gate@unknown"))
     trade.setdefault("policy_hash", risk_snapshot.get("policy_hash", "unknown"))
+    trade.setdefault("status_label", TRADE_STATUS_LABELS.get(str(trade.get("status") or ""), str(trade.get("status") or "未下单")))
     DECISIONS.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     history_item = {
         "generated_at_ms": now,
         "environment": environment,
         "trade": trade,
+        "trades": payload.get("trades") or [trade],
         "policy_version": risk_snapshot.get("policy_version", "gate@unknown"),
         "policy_hash": risk_snapshot.get("policy_hash", "unknown"),
         "risk_snapshot": risk_snapshot,
@@ -88,6 +99,10 @@ def _console_summary(result: dict) -> str:
         action_text = f"[{trade.get('contract', '--')}] 信号被策略拦截"
     elif status == "protection_failed_flatten_attempted":
         action_text = f"[{trade.get('contract', '--')}] 保护单失败，已尝试平仓"
+    elif status == "blocked_pending_reconfirmation":
+        action_text = f"[{trade.get('contract', '--')}] 等待下一轮确认"
+    elif status == "blocked_price_deviation":
+        action_text = f"[{trade.get('contract', '--')}] 报价偏差过大，未下单"
     else:
         action_text = "无开平仓操作"
     action_labels = {"BUY_LONG": "做多", "SELL_SHORT": "做空", "WAIT": "观望"}
@@ -100,6 +115,10 @@ def _console_summary(result: dict) -> str:
         decision_parts.append(f"{short_symbol}:{action}({confidence:.0f}%)")
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     headline = f"[{stamp}] Gate Quantum Trader v0.2.0 巡检完成 | 持仓 {len(active)} (多{long_count}/空{short_count}) | 动作: {action_text}"
+    trades = result.get("trades") or payload.get("trades") or []
+    if len(trades) > 1:
+        status_parts = [f"{row.get('contract', '--')}:{TRADE_STATUS_LABELS.get(str(row.get('status') or ''), row.get('status') or '未下单')}" for row in trades]
+        headline += "\n候选执行 | " + " | ".join(status_parts)
     return headline + "\nAI决策 | " + " | ".join(decision_parts)
 SYMBOLS = ("BTC_USDT", "ETH_USDT", "SOL_USDT", "DOGE_USDT", "SUI_USDT", "XRP_USDT")
 
@@ -202,6 +221,50 @@ def _confirm_pending_requotes(rows: dict[str, dict], decisions_payload: dict,
     return confirmed
 
 
+def _preflight_candidate_quotes(client, candidates: list[dict], pending_requotes: dict[str, dict],
+                                confirmed_requotes: set[str], *, now_ms: int) -> tuple[list[dict], list[dict]]:
+    """Screen every candidate so one deferred quote cannot hide later signals."""
+    eligible: list[dict] = []
+    blocked: list[dict] = []
+    ordered = sorted(candidates, key=lambda row: float(row["decision"].get("confidence") or 0), reverse=True)
+    for envelope in ordered:
+        symbol = str(envelope["instId"])
+        item = envelope["decision"]
+        quote_rows = client.tickers(symbol) or []
+        quote = quote_rows[0] if isinstance(quote_rows, list) and quote_rows else (quote_rows if isinstance(quote_rows, dict) else {})
+        reference = float(quote.get("mark_price") or quote.get("last") or envelope["indicators"].get("last") or 0)
+        original = dict(item)
+        _, requote = _requote_decision(item, reference)
+        if symbol in confirmed_requotes or requote["requote_status"] == "unchanged":
+            envelope["quote_preflight"] = requote
+            eligible.append(envelope)
+            continue
+        if requote["requote_status"] == "requoted":
+            pending_requotes[symbol] = {
+                "contract": symbol, "action": original.get("action"),
+                "confidence": float(original.get("confidence") or 0),
+                "entry_price": requote["original_entry_price"],
+                "take_profit_price": original.get("take_profit_price"),
+                "stop_loss_price": original.get("stop_loss_price"),
+                "created_at_ms": now_ms,
+                "reason": "price_deviation_requires_next_cycle_confirmation",
+            }
+            reason = f"首次信号价格偏差 {requote['original_deviation_pct']:.3f}%；已保存，等待下一轮 AI 同方向确认"
+            status = "blocked_pending_reconfirmation"
+        else:
+            reason = (f"Gate limit price deviation {requote['original_deviation_pct']:.3f}% exceeds "
+                      f"safe re-quote ceiling {requote['requote_max_pct']:.1f}%; safe WAIT")
+            status = "blocked_price_deviation"
+        item.update({"action": "WAIT", "entry_price": 0.0, "take_profit_price": 0.0,
+                     "stop_loss_price": 0.0, "rejection_reason": reason})
+        blocked.append({"status": status, "contract": symbol, "reason": reason,
+                        "requested_entry": requote["original_entry_price"],
+                        "reference_price": requote["reference_price"],
+                        "deviation_pct": requote["original_deviation_pct"], "requote": requote})
+    _save_pending_requotes(pending_requotes)
+    return eligible, blocked
+
+
 def _account_committed_margin(account: dict) -> float:
     """Return Gate margin already committed by positions and open orders."""
     detailed_fields = (
@@ -239,6 +302,209 @@ def _portfolio_position_notional(client: GateFuturesClient, positions: list[dict
             raise RuntimeError(f"Cannot enforce total notional limit for {contract_name or 'unknown position'}")
         total += abs(size) * multiplier * mark_price
     return float(total)
+
+
+def _execute_entry_candidate(client: GateFuturesClient, envelope: dict, *, settings, risk_profile,
+                             risk_snapshot: dict, policy_snapshot: dict, confirmed_requotes: set[str],
+                             now_ms: int, sequence: int, risk_state: dict[str, float]) -> dict:
+    """Execute one candidate serially and return an isolated outcome.
+
+    Candidate-level rejections do not stop later symbols. An ambiguous order or
+    unresolved reconciliation does, because the true exchange exposure is then
+    unknown and the cycle must fail closed.
+    """
+    trade_symbol = str(envelope["instId"])
+    decision = envelope["decision"]
+    trade_feature = envelope["indicators"]
+    action = str(decision.get("action") or "WAIT")
+    confidence = float(decision.get("confidence") or 0)
+    cooldown = cooldown_state(LEDGER, cooldown_seconds=settings.stop_cooldown_seconds, contract=trade_symbol)
+    if cooldown["active"]:
+        return {"trade": {"status": "blocked_symbol_cooldown", "contract": trade_symbol,
+                          "reason": f"{trade_symbol} is in post-stop cooldown; other contracts remain eligible",
+                          "cooldown": cooldown}, "submitted": False, "stop_cycle": False}
+
+    limits = RiskLimits(settings.max_position_notional_usd, settings.max_total_margin_usd, settings.max_order_margin_usd)
+    contract = client.contracts(trade_symbol)
+    multiplier = float(contract.get("quanto_multiplier") or 0)
+    quote_rows = client.tickers(trade_symbol) or []
+    quote = quote_rows[0] if isinstance(quote_rows, list) and quote_rows else (quote_rows if isinstance(quote_rows, dict) else {})
+    gate_reference = float(quote.get("mark_price") or quote.get("last") or trade_feature.get("last") or 0)
+    repriced_decision, requote = _requote_decision(decision, gate_reference)
+    decision.update(repriced_decision)
+    if trade_symbol in confirmed_requotes:
+        requote["requote_status"] = "confirmed_after_deferred_signal"
+        requote["confirmed_at_ms"] = now_ms
+    if requote["requote_status"] in {"blocked_extreme_deviation", "requoted"} and trade_symbol not in confirmed_requotes:
+        status = "blocked_price_deviation" if requote["requote_status"] == "blocked_extreme_deviation" else "blocked_pending_reconfirmation"
+        reason = (f"Gate limit price deviation {requote['original_deviation_pct']:.3f}% exceeds safe re-quote ceiling; safe WAIT"
+                  if status == "blocked_price_deviation" else
+                  f"首次信号价格偏差 {requote['original_deviation_pct']:.3f}%；等待下一轮 AI 同方向确认")
+        decision.update({"action": "WAIT", "entry_price": 0.0, "take_profit_price": 0.0,
+                         "stop_loss_price": 0.0, "rejection_reason": reason})
+        return {"trade": {"status": status, "contract": trade_symbol, "reason": reason,
+                          "requested_entry": requote["original_entry_price"], "reference_price": requote["reference_price"],
+                          "deviation_pct": requote["original_deviation_pct"], "requote": requote},
+                "submitted": False, "stop_cycle": False}
+
+    entry_price = float(decision.get("entry_price") or 0)
+    planned_margin = float(decision.get("margin_usdt") or decision.get("margin_usd") or 0)
+    leverage = settings.leverage
+    if planned_margin <= 0:
+        return {"trade": {"status": "blocked_invalid_margin", "contract": trade_symbol,
+                          "reason": "AI did not provide a positive margin_usdt; no order was submitted"},
+                "submitted": False, "stop_cycle": False}
+    leverage_min = float(contract.get("leverage_min") or 1)
+    leverage_max = float(contract.get("leverage_max") or 0)
+    if leverage < leverage_min or (leverage_max > 0 and leverage > leverage_max):
+        return {"trade": {"status": "blocked_invalid_leverage", "contract": trade_symbol,
+                          "reason": f"Configured Gate leverage {leverage:g}x is outside contract range {leverage_min:g}x-{leverage_max:g}x"},
+                "submitted": False, "stop_cycle": False}
+    try:
+        contracts = _order_size_for_margin(margin_usdt=planned_margin, leverage=leverage, entry_price=entry_price,
+                                           multiplier=multiplier, minimum=contract.get("order_size_min") or 1,
+                                           maximum=contract.get("order_size_max") or 0,
+                                           enable_decimal=bool(contract.get("enable_decimal")))
+    except ValueError as exc:
+        return {"trade": {"status": "blocked_invalid_size", "contract": trade_symbol, "reason": str(exc),
+                          "planned_margin_usdt": planned_margin, "configured_leverage": leverage},
+                "submitted": False, "stop_cycle": False}
+    size = contracts if action == "BUY_LONG" else -contracts
+    order_notional = float(abs(size) * Decimal(str(multiplier)) * Decimal(str(entry_price)))
+    estimated_margin = order_notional / leverage
+
+    # Refresh exchange state for every candidate. The local reservation ensures
+    # the previous order is counted even if Gate account fields lag briefly.
+    account = client.account() or {}
+    positions = client.positions() or []
+    if isinstance(positions, dict):
+        positions = [positions] if positions else []
+    existing_position = next((p for p in positions if str(p.get("contract") or "").upper() == trade_symbol and float(p.get("size") or 0) != 0), None)
+    existing_size = Decimal(str((existing_position or {}).get("size") or 0))
+    is_add_on = existing_size != 0
+    if is_add_on and ((existing_size > 0) != (size > 0)):
+        return {"trade": {"status": "blocked_opposite_position", "contract": trade_symbol,
+                          "reason": "Existing Gate position direction conflicts with the proposed add-on"},
+                "submitted": False, "stop_cycle": False}
+    if is_add_on:
+        coverage = protection_coverage_status(client.protection_orders(trade_symbol) or [], existing_size)
+        if not coverage["fully_protected"]:
+            return {"trade": {"status": "blocked_add_unprotected_existing_position", "contract": trade_symbol,
+                              "reason": "Existing Gate position is not fully covered by both native take-profit and stop-loss orders; add-on blocked fail-closed",
+                              "required_size": GateFuturesClient._api_size(abs(existing_size)),
+                              "take_profit_covered_size": GateFuturesClient._api_size(coverage["take_profit"]),
+                              "stop_loss_covered_size": GateFuturesClient._api_size(coverage["stop_loss"])},
+                    "submitted": False, "stop_cycle": False}
+
+    current_margin = max(_account_committed_margin(account), risk_state["baseline_margin"] + risk_state["reserved_margin"])
+    current_notional = max(_portfolio_position_notional(client, positions), risk_state["baseline_notional"] + risk_state["reserved_notional"])
+    risk = {"order_margin_usd": estimated_margin, "current_margin_usd": current_margin,
+            "current_position_notional_usd": current_notional, "order_notional_usd": order_notional,
+            "environment": settings.environment, "live_enabled": settings.live_trading_enabled}
+    try:
+        limits.check_order(**risk)
+    except (PermissionError, ValueError) as exc:
+        return {"trade": {"status": "blocked_risk_limit", "contract": trade_symbol, "reason": str(exc), "risk": risk},
+                "submitted": False, "stop_cycle": False}
+    try:
+        from .strategy_adapter import validate_decision
+        active_positions = {str(p.get("contract")): p for p in positions if float(p.get("size") or 0) != 0}
+        active_sides = {symbol: "long" if float(position.get("size") or 0) > 0 else "short" for symbol, position in active_positions.items()}
+        package = {**trade_feature, "instId": trade_symbol, "data_quality": "valid", "macro_4h": trade_feature.get("macro_4h", "RANGE")}
+        gated_action, gate_reason, rr = validate_decision(package, decision, active_inst_ids=set(active_positions), active_position_sides=active_sides, risk_snapshot=risk_snapshot)
+        if gated_action != action:
+            return {"trade": {"status": "blocked_by_strategy_interceptor", "contract": trade_symbol,
+                              "reason": gate_reason or "Gate strategy interceptor rejected decision", "risk_reward": rr},
+                    "submitted": False, "stop_cycle": False}
+    except Exception as exc:
+        return {"trade": {"status": "blocked_by_strategy_interceptor_error", "contract": trade_symbol, "reason": str(exc)},
+                "submitted": False, "stop_cycle": False}
+
+    client_id = f"t-gate-ai-{now_ms}-{sequence}"
+    try:
+        position = client.positions(trade_symbol) or {}
+    except RuntimeError as exc:
+        if "POSITION_NOT_FOUND" not in str(exc):
+            raise
+        position = {}
+    cross_margin = str(position.get("pos_margin_mode") or "cross").lower() == "cross" or float(position.get("leverage") or 0) == 0
+    limit_price = _round_price(entry_price, contract.get("order_price_round") or contract.get("mark_price_round") or "0")
+    tp = float(decision.get("take_profit_price") or (gate_reference + 2 * trade_feature["atr14"] if size > 0 else gate_reference - 2 * trade_feature["atr14"]))
+    sl = float(decision.get("stop_loss_price") or (gate_reference - trade_feature["atr14"] if size > 0 else gate_reference + trade_feature["atr14"]))
+    tick = contract.get("order_price_round") or contract.get("mark_price_round") or "0"
+    rounded_tp, rounded_sl = _round_price(tp, tick), _round_price(sl, tick)
+    journal = ExecutionJournal(EXECUTION_JOURNAL)
+    intent = journal.prepare({"client_id": client_id, "environment": settings.environment, "contract": trade_symbol,
+                              "requested_size": str(size), "baseline_position_size": str(existing_size),
+                              "entry_price": limit_price, "take_profit_price": rounded_tp, "stop_loss_price": rounded_sl,
+                              "requote": requote, "created_at_ms": now_ms,
+                              "policy_version": policy_snapshot["policy_version"], "policy_hash": policy_snapshot["policy_hash"]})
+    try:
+        leverage_result = client.update_position_leverage(contract=trade_symbol, leverage=leverage, cross_margin=cross_margin)
+        order = GateTradingService(client, limits).place_order(contract=trade_symbol, size=size, price=limit_price,
+                                                                tif="gtc", client_id=client_id, risk=risk)
+    except AmbiguousOrderError as exc:
+        journal.update(client_id, "prepared", last_error=str(exc))
+        return {"trade": {"status": "order_submission_ambiguous", "contract": trade_symbol, "client_id": client_id,
+                          "reason": f"Gate entry submission is ambiguous and will only be reconciled by client order id: {exc}"},
+                "submitted": False, "stop_cycle": True}
+    except Exception as exc:
+        journal.update(client_id, "order_rejected", last_error=str(exc))
+        reason = f"Gate entry order rejected safely: {exc}"
+        decision.update({"action": "WAIT", "entry_price": 0.0, "take_profit_price": 0.0,
+                         "stop_loss_price": 0.0, "rejection_reason": reason})
+        return {"trade": {"status": "order_rejected_safe_wait", "contract": trade_symbol,
+                          "client_id": client_id, "reason": reason}, "submitted": False, "stop_cycle": False}
+
+    raw_order = order.get("orders") if isinstance(order, dict) and order.get("reconciled") else order
+    raw_order = raw_order if isinstance(raw_order, dict) else {}
+    intent = journal.update(client_id, "submitted", order_id=str(raw_order.get("id") or ""),
+                            order_status=str(raw_order.get("status") or "unknown"))
+    record_protection_intent(PROTECTION_INTENTS, {"environment": settings.environment, "contract": trade_symbol,
+        "entry_client_id": client_id, "position_side": "long" if size > 0 else "short", "entry_size": str(abs(size)),
+        "entry_price": limit_price, "take_profit_price": rounded_tp, "stop_loss_price": rounded_sl, "requote": requote,
+        "created_at_ms": now_ms, "policy_version": policy_snapshot["policy_version"], "policy_hash": policy_snapshot["policy_hash"]})
+    try:
+        lifecycle = reconcile_intent(client, journal, intent, settings, now_ms=now_ms)
+    except Exception as exc:
+        journal.update(client_id, last_error=f"initial reconciliation: {exc}")
+        lifecycle = {"status": "reconciliation_pending", "last_error": str(exc)}
+    risk_state["reserved_margin"] += estimated_margin
+    risk_state["reserved_notional"] += order_notional
+    lifecycle_status = str(lifecycle.get("status") or "")
+    protected_now = lifecycle_status in {"filled_protected", "partially_filled"}
+    terminal_failure = lifecycle_status in {"stop_failed_flatten_attempted", "flattened_invalid_protection"}
+    trade = {"status": "protection_failed_flatten_attempted" if terminal_failure else f"submitted_{settings.environment}",
+             "environment": settings.environment, "contract": trade_symbol, "client_id": client_id,
+             "position_operation": "add" if is_add_on else "open", "order_type": "limit", "price": limit_price,
+             "size": GateFuturesClient._api_size(size), "expected_position_size": GateFuturesClient._api_size(existing_size + size),
+             "configured_leverage": leverage, "risk_snapshot": risk_snapshot, "estimated_margin_usdt": estimated_margin,
+             "leverage_update": leverage_result, "order": order, "take_profit": {"planned_price": rounded_tp},
+             "stop_loss": {"planned_price": rounded_sl}, "execution_lifecycle": lifecycle,
+             "protection_covered": protected_now, "take_profit_covered": protected_now,
+             "stop_loss_covered": protected_now or lifecycle_status == "stop_protected_tp_pending"}
+    return {"trade": trade, "submitted": True,
+            "stop_cycle": terminal_failure or lifecycle_status == "reconciliation_pending"}
+
+
+def _run_serial_candidates(candidates: list[dict], max_entries: int, executor) -> tuple[list[dict], list[dict]]:
+    """Run candidates until the submitted-entry budget is consumed or fail-closed."""
+    outcomes: list[dict] = []
+    submitted: list[dict] = []
+    for sequence, candidate in enumerate(candidates, start=1):
+        if len(submitted) >= max_entries:
+            contract = str(candidate.get("instId") or candidate.get("contract") or "--") if isinstance(candidate, dict) else str(candidate)
+            outcomes.append({"contract": contract, "status": "blocked_cycle_entry_limit",
+                             "reason": f"Configured per-cycle entry limit {max_entries} was reached; signal was evaluated but not submitted"})
+            continue
+        outcome = executor(candidate, sequence)
+        trade = outcome["trade"]
+        outcomes.append(trade)
+        if outcome["submitted"]:
+            submitted.append(trade)
+        if outcome["stop_cycle"]:
+            break
+    return outcomes, submitted
 
 
 def _ema(values, period):
@@ -532,6 +798,7 @@ def run_cycle() -> dict:
     settings = load_settings()
     risk_profile = get_risk_profile(settings.risk_profile)
     risk_snapshot = risk_profile.snapshot(leverage=settings.leverage, environment=settings.environment)
+    risk_snapshot["configured_max_entries_per_cycle"] = settings.max_entries_per_cycle
     try:
         from r20_backend.policy_snapshot import generate_policy_snapshot
         policy_snapshot = generate_policy_snapshot(root_dir=ROOT)
@@ -710,10 +977,12 @@ def run_cycle() -> dict:
             available = float(private_context["account"].get("available") or 0)
             committed_margin = _account_committed_margin(private_context["account"])
             system_prompt, prompt = build_prompt(strategy_packages, positions=active_positions_detail, pending_orders=pending_orders_detail, available_usdt=available, execution_leverage=settings.leverage, max_order_margin_usdt=settings.max_order_margin_usd, max_total_margin_usdt=settings.max_total_margin_usd, current_margin_usdt=committed_margin, risk_snapshot=risk_snapshot)
+            prompt += (f"\n本轮最多允许实际提交 {settings.max_entries_per_cycle} 个开仓/加仓订单。"
+                       "每个合约应独立判断；某个合约等待二次报价确认或被风控拒绝，不代表其他合格合约必须观望。")
         except Exception:
             prompt = ('Output ONLY one compact final JSON object with top-level keys decisions, position_management, pending_orders_management. '
                       f'The decisions object must contain all six contracts and each item must include action BUY_LONG|SELL_SHORT|WAIT, confidence 0-100, entry_price, take_profit_price, stop_loss_price, leverage={settings.leverage:g}, margin_usdt (positive and <= {settings.max_order_margin_usd:.2f}), summary_reason. '
-                      f'Active Gate risk profile={risk_profile.label}: confidence>={risk_profile.min_confidence:g}%, DOGE>={risk_profile.doge_min_confidence:g}%, ADX>={risk_profile.min_adx:g}, R:R>={risk_profile.min_rr:g}, target R:R>={risk_profile.target_rr:g}, effective per-order margin cap={settings.max_order_margin_usd * risk_profile.margin_ratio:.2f} USDT, total margin cap={settings.max_total_margin_usd:.2f} USDT. Different Gate contracts may be held concurrently and an active contract may be added to only in the same direction, subject to aggregate limits and complete TP/SL coverage. '
+                      f'Active Gate risk profile={risk_profile.label}: confidence>={risk_profile.min_confidence:g}%, DOGE>={risk_profile.doge_min_confidence:g}%, ADX>={risk_profile.min_adx:g}, R:R>={risk_profile.min_rr:g}, target R:R>={risk_profile.target_rr:g}, effective per-order margin cap={settings.max_order_margin_usd * risk_profile.margin_ratio:.2f} USDT, total margin cap={settings.max_total_margin_usd:.2f} USDT, max actual entries this cycle={settings.max_entries_per_cycle}. Different Gate contracts may be held concurrently and an active contract may be added to only in the same direction, subject to aggregate limits and complete TP/SL coverage. A deferred or rejected symbol must not force unrelated qualified symbols to WAIT. '
                       'position_management actions are HOLD|CLOSE_MARKET|UPDATE_SL; pending_orders_management actions are KEEP|CANCEL. '
                       'Gate Futures data: ' + json.dumps({"instruments": features, "account": private_context["account"], "positions": private_context["positions"], "pending_orders": private_context["pending_orders"]}, ensure_ascii=False))
             system_prompt = "You are a Gate Futures risk-controlled trading decision model. Return the final JSON object only."
@@ -798,6 +1067,11 @@ def run_cycle() -> dict:
     result: dict = {"trade": {"status": "not_submitted", "reason": f"Gate {settings.environment.title()} automatic execution is disabled" if not execution_enabled else f"No qualifying {settings.environment.title()} signal"}}
     executable = [d for d in decisions_payload.values() if d["decision"].get("action") in {"BUY_LONG", "SELL_SHORT"} and float(d["decision"].get("confidence") or 0) >= risk_profile.min_confidence]
     confirmed_requotes = _confirm_pending_requotes(pending_requotes, decisions_payload, min_confidence=risk_profile.min_confidence, now_ms=now)
+    executable, quote_blocks = _preflight_candidate_quotes(client, executable, pending_requotes, confirmed_requotes, now_ms=now)
+    if quote_blocks:
+        result["trade_candidates_blocked"] = quote_blocks
+        if not executable:
+            result["trade"] = quote_blocks[0]
     confirmed_executable = [d for d in executable if d["instId"] in confirmed_requotes]
     decision = max(confirmed_executable or executable or decisions_payload.values(), key=lambda d: float(d["decision"].get("confidence") or 0))
     trade_symbol = decision["instId"]
@@ -848,248 +1122,64 @@ def run_cycle() -> dict:
             except Exception as exc:
                 management_result["pending_orders"].append({"contract": contract_name, "order_id": order_id, "error": str(exc)})
         result["management"] = management_result
-    symbol_cooldown = cooldown_state(LEDGER, cooldown_seconds=settings.stop_cooldown_seconds, contract=trade_symbol)
-    if execution_enabled and safety_status["safe_for_new_risk"] and not symbol_cooldown["active"] and llm_source == "gate-multifactor-llm" and action != "WAIT" and confidence >= risk_profile.min_confidence:
-        limits = RiskLimits(settings.max_position_notional_usd, settings.max_total_margin_usd, settings.max_order_margin_usd)
-        contract = client.contracts(trade_symbol)
-        multiplier = float(contract.get("quanto_multiplier") or 0)
-        # Refresh the exchange quote immediately before sizing/submission. A
-        # multi-minute AI response can otherwise leave a perfectly valid
-        # signal several percent away from the current market.
-        quote_rows = client.tickers(trade_symbol) or []
-        quote = quote_rows[0] if isinstance(quote_rows, list) and quote_rows else (quote_rows if isinstance(quote_rows, dict) else {})
-        gate_reference = float(quote.get("mark_price") or quote.get("last") or last or 0)
-        original_decision = dict(decision["decision"])
-        repriced_decision, requote = _requote_decision(decision["decision"], gate_reference)
-        decision["decision"].update(repriced_decision)
-        decisions_payload[trade_symbol]["decision"].update(repriced_decision)
-        if trade_symbol in confirmed_requotes:
-            requote["requote_status"] = "confirmed_after_deferred_signal"
-            requote["confirmed_at_ms"] = now
-        if requote["requote_status"] == "blocked_extreme_deviation":
-            reason = (f"Gate limit price deviation {requote['original_deviation_pct']:.3f}% exceeds "
-                      f"safe re-quote ceiling {requote['requote_max_pct']:.1f}% "
-                      f"(entry={requote['original_entry_price']:g}, mark={requote['reference_price']:g}); safe WAIT")
-            decision["decision"].update({"action": "WAIT", "entry_price": 0.0, "take_profit_price": 0.0, "stop_loss_price": 0.0, "rejection_reason": reason})
-            result["trade"] = {"status": "blocked_price_deviation", "contract": trade_symbol, "reason": reason, "requested_entry": requote["original_entry_price"], "reference_price": requote["reference_price"], "deviation_pct": requote["original_deviation_pct"], "requote": requote}
-            payload = {**decisions_payload, "generated_at_ms": now, "exchange": "gate", "environment": settings.environment, "risk_snapshot": risk_snapshot, "position_management": position_management, "pending_orders_management": pending_management, "private_context": private_context, "trade": result["trade"]}
-            _save_decision_payload(payload, decisions_payload, result["trade"], now, settings.environment, risk_snapshot)
-            result["decisions"] = decisions_payload
-            return result
-        if requote["requote_status"] == "requoted" and trade_symbol not in confirmed_requotes:
-            pending_requotes[trade_symbol] = {
-                "contract": trade_symbol,
-                "action": action,
-                "confidence": confidence,
-                "entry_price": requote["original_entry_price"],
-                "take_profit_price": original_decision.get("take_profit_price"),
-                "stop_loss_price": original_decision.get("stop_loss_price"),
-                "created_at_ms": now,
-                "reason": "price_deviation_requires_next_cycle_confirmation",
-            }
-            _save_pending_requotes(pending_requotes)
-            reason = (f"首次信号价格偏差 {requote['original_deviation_pct']:.3f}%；已保存，等待下一轮 AI 同方向确认")
-            decision["decision"].update({"action": "WAIT", "entry_price": 0.0, "take_profit_price": 0.0, "stop_loss_price": 0.0, "rejection_reason": reason})
-            result["trade"] = {"status": "blocked_pending_reconfirmation", "contract": trade_symbol, "reason": reason, "requested_entry": requote["original_entry_price"], "reference_price": requote["reference_price"], "deviation_pct": requote["original_deviation_pct"], "requote": requote}
-            payload = {**decisions_payload, "generated_at_ms": now, "exchange": "gate", "environment": settings.environment, "risk_snapshot": risk_snapshot, "position_management": position_management, "pending_orders_management": pending_management, "private_context": private_context, "trade": result["trade"]}
-            _save_decision_payload(payload, decisions_payload, result["trade"], now, settings.environment, risk_snapshot)
-            result["decisions"] = decisions_payload
-            return result
-        entry_price = float(decision["decision"].get("entry_price") or 0)
-        planned_margin = float(decision["decision"].get("margin_usdt") or decision["decision"].get("margin_usd") or 0)
-        leverage = settings.leverage
-        if planned_margin <= 0:
-            result["trade"] = {"status": "blocked_invalid_margin", "contract": trade_symbol, "reason": "AI did not provide a positive margin_usdt; no order was submitted"}
-            result["trade"].setdefault("policy_version", policy_snapshot["policy_version"])
-            result["trade"].setdefault("policy_hash", policy_snapshot["policy_hash"])
-            payload = {**decisions_payload, "generated_at_ms": now, "exchange": "gate", "environment": settings.environment, "policy_snapshot": policy_snapshot, "risk_snapshot": risk_snapshot, "position_management": position_management, "pending_orders_management": pending_management, "private_context": private_context, "trade": result["trade"]}
-            _save_decision_payload(payload, decisions_payload, result["trade"], now, settings.environment, risk_snapshot)
-            result["decisions"] = decisions_payload
-            return result
-        leverage_min = float(contract.get("leverage_min") or 1)
-        leverage_max = float(contract.get("leverage_max") or 0)
-        if leverage < leverage_min or (leverage_max > 0 and leverage > leverage_max):
-            raise RuntimeError(f"Configured Gate leverage {leverage:g}x is outside contract range {leverage_min:g}x-{leverage_max:g}x")
-        try:
-            contracts = _order_size_for_margin(margin_usdt=planned_margin, leverage=leverage, entry_price=entry_price, multiplier=multiplier, minimum=contract.get("order_size_min") or 1, maximum=contract.get("order_size_max") or 0, enable_decimal=bool(contract.get("enable_decimal")))
-        except ValueError as exc:
-            result["trade"] = {"status": "blocked_invalid_size", "contract": trade_symbol, "reason": str(exc), "planned_margin_usdt": planned_margin, "configured_leverage": leverage}
-            payload = {**decisions_payload, "generated_at_ms": now, "exchange": "gate", "environment": settings.environment, "risk_snapshot": risk_snapshot, "position_management": position_management, "pending_orders_management": pending_management, "private_context": private_context, "trade": result["trade"]}
-            _save_decision_payload(payload, decisions_payload, result["trade"], now, settings.environment, risk_snapshot)
-            result["decisions"] = decisions_payload
-            return result
-        size = contracts if action == "BUY_LONG" else -contracts
-        order_notional = float(abs(size) * Decimal(str(multiplier)) * Decimal(str(entry_price)))
-        estimated_margin = order_notional / leverage
-        account = client.account()
-        positions = private_context["positions"]
-        existing_position = next(
-            (p for p in positions or [] if str(p.get("contract") or "").upper() == trade_symbol and float(p.get("size") or 0) != 0),
-            None,
+    # Execute qualifying symbols independently. A deferred/rejected candidate is
+    # recorded but does not consume an entry slot or hide the next valid signal.
+    candidate_outcomes: list[dict] = []
+    submitted_trades: list[dict] = []
+    if execution_enabled and safety_status["safe_for_new_risk"] and llm_source == "gate-multifactor-llm":
+        ordered_candidates = sorted(
+            executable,
+            key=lambda row: (row["instId"] in confirmed_requotes, float(row["decision"].get("confidence") or 0)),
+            reverse=True,
         )
-        existing_size = Decimal(str((existing_position or {}).get("size") or 0))
-        is_add_on = existing_size != 0
-        if is_add_on and ((existing_size > 0) != (size > 0)):
-            result["trade"] = {"status": "blocked_opposite_position", "contract": trade_symbol, "reason": "Existing Gate position direction conflicts with the proposed add-on"}
-            payload = {**decisions_payload, "generated_at_ms": now, "exchange": "gate", "environment": settings.environment, "risk_snapshot": risk_snapshot, "position_management": position_management, "pending_orders_management": pending_management, "private_context": private_context, "trade": result["trade"]}
-            _save_decision_payload(payload, decisions_payload, result["trade"], now, settings.environment, risk_snapshot)
-            result["decisions"] = decisions_payload
-            return result
-        if is_add_on:
-            existing_protections = client.protection_orders(trade_symbol) or []
-            existing_coverage = protection_coverage_status(existing_protections, existing_size)
-            if not existing_coverage["fully_protected"]:
-                result["trade"] = {
-                    "status": "blocked_add_unprotected_existing_position",
-                    "contract": trade_symbol,
-                    "reason": "Existing Gate position is not fully covered by both native take-profit and stop-loss orders; add-on blocked fail-closed",
-                    "required_size": GateFuturesClient._api_size(abs(existing_size)),
-                    "take_profit_covered_size": GateFuturesClient._api_size(existing_coverage["take_profit"]),
-                    "stop_loss_covered_size": GateFuturesClient._api_size(existing_coverage["stop_loss"]),
-                }
-                payload = {**decisions_payload, "generated_at_ms": now, "exchange": "gate", "environment": settings.environment, "risk_snapshot": risk_snapshot, "position_management": position_management, "pending_orders_management": pending_management, "private_context": private_context, "trade": result["trade"]}
-                _save_decision_payload(payload, decisions_payload, result["trade"], now, settings.environment, risk_snapshot)
-                result["decisions"] = decisions_payload
-                return result
-        # Multiple different Gate contracts may be held concurrently. Capacity
-        # is governed by configured aggregate margin and notional limits.
-        current_margin = _account_committed_margin(account)
-        current_notional = _portfolio_position_notional(client, positions)
-        risk = {"order_margin_usd": estimated_margin, "current_margin_usd": current_margin, "current_position_notional_usd": current_notional, "order_notional_usd": order_notional, "environment": settings.environment, "live_enabled": settings.live_trading_enabled}
-        try:
-            limits.check_order(**risk)
-        except PermissionError as exc:
-            result["trade"] = {
-                "status": "blocked_risk_limit",
-                "contract": trade_symbol,
-                "reason": str(exc),
-                "risk": risk,
-            }
-            payload = {**decisions_payload, "generated_at_ms": now, "exchange": "gate", "environment": settings.environment, "policy_snapshot": policy_snapshot, "risk_snapshot": risk_snapshot, "position_management": position_management, "pending_orders_management": pending_management, "private_context": private_context, "trade": result["trade"]}
-            _save_decision_payload(payload, decisions_payload, result["trade"], now, settings.environment, risk_snapshot)
-            result["decisions"] = decisions_payload
-            return result
-        try:
-            from .strategy_adapter import validate_decision
-            package = {**trade_feature, "instId": trade_symbol, "data_quality": "valid", "macro_4h": trade_feature.get("macro_4h", "RANGE")}
-            active_positions = {str(p.get("contract")): p for p in positions or [] if float(p.get("size") or 0) != 0}
-            active_sides = {symbol: "long" if float(position.get("size") or 0) > 0 else "short" for symbol, position in active_positions.items()}
-            gated_action, gate_reason, rr = validate_decision(package, decision["decision"], active_inst_ids=set(active_positions), active_position_sides=active_sides, risk_snapshot=risk_snapshot)
-            if gated_action != action:
-                result["trade"] = {"status": "blocked_by_strategy_interceptor", "contract": trade_symbol, "reason": gate_reason or "Gate strategy interceptor rejected decision", "risk_reward": rr}
-                action = "WAIT"
-        except Exception as exc:
-            result["trade"] = {"status": "blocked_by_strategy_interceptor_error", "contract": trade_symbol, "reason": str(exc)}
-            action = "WAIT"
-        if action == "WAIT":
-            payload = {**decisions_payload, "generated_at_ms": now, "exchange": "gate", "environment": settings.environment, "risk_snapshot": risk_snapshot, "position_management": position_management, "pending_orders_management": pending_management, "private_context": private_context, "trade": result["trade"]}
-            _save_decision_payload(payload, decisions_payload, result["trade"], now, settings.environment, risk_snapshot)
-            result["decisions"] = decisions_payload
-            return result
-        client_id = f"t-gate-ai-{now}"
-        try:
-            position = client.positions(trade_symbol) or {}
-        except RuntimeError as exc:
-            if "POSITION_NOT_FOUND" not in str(exc):
-                raise
-            position = {}
-        cross_margin = str(position.get("pos_margin_mode") or "cross").lower() == "cross" or float(position.get("leverage") or 0) == 0
-        limit_price = _round_price(entry_price, contract.get("order_price_round") or contract.get("mark_price_round") or "0")
-        tp = float(decision["decision"].get("take_profit_price") or (gate_reference + 2 * trade_feature["atr14"] if size > 0 else gate_reference - 2 * trade_feature["atr14"]))
-        sl = float(decision["decision"].get("stop_loss_price") or (gate_reference - trade_feature["atr14"] if size > 0 else gate_reference + trade_feature["atr14"]))
-        tick = contract.get("order_price_round") or contract.get("mark_price_round") or "0"
-        rounded_tp = _round_price(tp, tick)
-        rounded_sl = _round_price(sl, tick)
-        journal = ExecutionJournal(EXECUTION_JOURNAL)
-        intent = journal.prepare({
-            "client_id": client_id,
-            "environment": settings.environment,
-            "contract": trade_symbol,
-            "requested_size": str(size),
-            "baseline_position_size": str(existing_size),
-            "entry_price": limit_price,
-            "take_profit_price": rounded_tp,
-            "stop_loss_price": rounded_sl,
-            "requote": requote,
-            "created_at_ms": now,
-            "policy_version": policy_snapshot["policy_version"],
-            "policy_hash": policy_snapshot["policy_hash"],
-        })
-        try:
-            leverage_result = client.update_position_leverage(contract=trade_symbol, leverage=leverage, cross_margin=cross_margin)
-            order = GateTradingService(client, limits).place_order(contract=trade_symbol, size=size, price=limit_price, tif="gtc", client_id=client_id, risk=risk)
-        except AmbiguousOrderError as order_error:
-            journal.update(client_id, "prepared", last_error=str(order_error))
-            reason = f"Gate entry submission is ambiguous and will only be reconciled by client order id: {order_error}"
-            result["trade"] = {"status": "order_submission_ambiguous", "contract": trade_symbol, "client_id": client_id, "reason": reason}
-            payload = {**decisions_payload, "generated_at_ms": now, "exchange": "gate", "environment": settings.environment, "policy_snapshot": policy_snapshot, "risk_snapshot": risk_snapshot, "position_management": position_management, "pending_orders_management": pending_management, "private_context": private_context, "trade": result["trade"]}
-            _save_decision_payload(payload, decisions_payload, result["trade"], now, settings.environment, risk_snapshot)
-            result["decisions"] = decisions_payload
-            return result
-        except Exception as order_error:
-            journal.update(client_id, "order_rejected", last_error=str(order_error))
-            reason = f"Gate entry order rejected safely: {order_error}"
-            decision["decision"].update({"action": "WAIT", "entry_price": 0.0, "take_profit_price": 0.0, "stop_loss_price": 0.0, "rejection_reason": reason})
-            result["trade"] = {"status": "order_rejected_safe_wait", "contract": trade_symbol, "client_id": client_id, "reason": reason}
-            payload = {**decisions_payload, "generated_at_ms": now, "exchange": "gate", "environment": settings.environment, "risk_snapshot": risk_snapshot, "position_management": position_management, "pending_orders_management": pending_management, "private_context": private_context, "trade": result["trade"]}
-            _save_decision_payload(payload, decisions_payload, result["trade"], now, settings.environment, risk_snapshot)
-            result["decisions"] = decisions_payload
-            return result
-        raw_order = order.get("orders") if isinstance(order, dict) and order.get("reconciled") else order
-        raw_order = raw_order if isinstance(raw_order, dict) else {}
-        intent = journal.update(
-            client_id,
-            "submitted",
-            order_id=str(raw_order.get("id") or ""),
-            order_status=str(raw_order.get("status") or "unknown"),
-        )
-        record_protection_intent(PROTECTION_INTENTS, {
-            "environment": settings.environment, "contract": trade_symbol, "entry_client_id": client_id,
-            "position_side": "long" if size > 0 else "short", "entry_size": str(abs(size)),
-            "entry_price": limit_price, "take_profit_price": rounded_tp, "stop_loss_price": rounded_sl,
-            "requote": requote,
-            "created_at_ms": now, "policy_version": policy_snapshot["policy_version"], "policy_hash": policy_snapshot["policy_hash"],
-        })
-        try:
-            lifecycle = reconcile_intent(client, journal, intent, settings, now_ms=now)
-        except Exception as reconcile_error:
-            journal.update(client_id, last_error=f"initial reconciliation: {reconcile_error}")
-            lifecycle = {"status": "reconciliation_pending", "last_error": str(reconcile_error)}
-        expected_position_size = existing_size + size
-        protected_now = str(lifecycle.get("status") or "") in {"filled_protected", "partially_filled"}
-        terminal_failure = str(lifecycle.get("status") or "") in {"stop_failed_flatten_attempted", "flattened_invalid_protection"}
-        result["trade"] = {
-            "status": "protection_failed_flatten_attempted" if terminal_failure else f"submitted_{settings.environment}",
-            "environment": settings.environment,
-            "contract": trade_symbol,
-            "client_id": client_id,
-            "position_operation": "add" if is_add_on else "open",
-            "order_type": "limit",
-            "price": limit_price,
-            "size": GateFuturesClient._api_size(size),
-            "expected_position_size": GateFuturesClient._api_size(expected_position_size),
-            "configured_leverage": leverage,
-            "risk_snapshot": risk_snapshot,
-            "estimated_margin_usdt": estimated_margin,
-            "leverage_update": leverage_result,
-            "order": order,
-            "take_profit": {"planned_price": rounded_tp},
-            "stop_loss": {"planned_price": rounded_sl},
-            "execution_lifecycle": lifecycle,
-            "protection_covered": protected_now,
-            "take_profit_covered": protected_now,
-            "stop_loss_covered": protected_now or str(lifecycle.get("status") or "") == "stop_protected_tp_pending",
+        fresh_account = client.account() or {}
+        fresh_positions = client.positions() or []
+        if isinstance(fresh_positions, dict):
+            fresh_positions = [fresh_positions] if fresh_positions else []
+        risk_state = {
+            "baseline_margin": _account_committed_margin(fresh_account),
+            "baseline_notional": _portfolio_position_notional(client, fresh_positions),
+            "reserved_margin": 0.0,
+            "reserved_notional": 0.0,
         }
-    if execution_enabled and symbol_cooldown["active"] and result["trade"].get("status") == "not_submitted":
-        result["trade"] = {"status": "blocked_symbol_cooldown", "contract": trade_symbol, "reason": f"{trade_symbol} is in post-stop cooldown; other contracts remain eligible", "cooldown": symbol_cooldown}
-    elif execution_enabled and not safety_status["safe_for_new_risk"] and result["trade"].get("status") == "not_submitted":
-        result["trade"] = {"status": "blocked_safety_fail_closed", "reason": "Gate reconciliation or daily-loss gate blocked new risk", "safety_status": safety_status}
+        def execute_candidate(candidate, sequence):
+            return _execute_entry_candidate(
+                client, candidate, settings=settings, risk_profile=risk_profile,
+                risk_snapshot=risk_snapshot, policy_snapshot=policy_snapshot,
+                confirmed_requotes=confirmed_requotes, now_ms=now, sequence=sequence,
+                risk_state=risk_state,
+            )
+
+        candidate_outcomes, submitted_trades = _run_serial_candidates(
+            ordered_candidates, settings.max_entries_per_cycle, execute_candidate
+        )
+        for trade_outcome in candidate_outcomes:
+            trade_outcome.setdefault("policy_version", policy_snapshot["policy_version"])
+            trade_outcome.setdefault("policy_hash", policy_snapshot["policy_hash"])
+    elif execution_enabled and not safety_status["safe_for_new_risk"]:
+        candidate_outcomes.append({"status": "blocked_safety_fail_closed",
+                                   "reason": "Gate reconciliation or daily-loss gate blocked new risk",
+                                   "safety_status": safety_status})
+
+    all_outcomes = [*(result.get("trade_candidates_blocked") or []), *candidate_outcomes]
+    if submitted_trades:
+        result["trade"] = submitted_trades[0]
+    elif candidate_outcomes:
+        result["trade"] = candidate_outcomes[0]
+    elif result.get("trade_candidates_blocked"):
+        result["trade"] = result["trade_candidates_blocked"][0]
+    result["trades"] = all_outcomes
+    result["submitted_trades"] = submitted_trades
     result["trade"].setdefault("policy_version", policy_snapshot["policy_version"])
     result["trade"].setdefault("policy_hash", policy_snapshot["policy_hash"])
-    payload = {**decisions_payload, "generated_at_ms": now, "exchange": "gate", "environment": settings.environment, "policy_snapshot": policy_snapshot, "risk_snapshot": risk_snapshot, "safety_status": safety_status, "position_management": position_management, "pending_orders_management": pending_management, "private_context": private_context, "trade": result["trade"]}
+    payload = {**decisions_payload, "generated_at_ms": now, "exchange": "gate", "environment": settings.environment,
+               "policy_snapshot": policy_snapshot, "risk_snapshot": risk_snapshot, "safety_status": safety_status,
+               "position_management": position_management, "pending_orders_management": pending_management,
+               "private_context": private_context, "trade": result["trade"], "trades": all_outcomes}
     _save_decision_payload(payload, decisions_payload, result["trade"], now, settings.environment, risk_snapshot)
     result["decisions"] = decisions_payload
     return result
+
 
 
 if __name__ == "__main__":

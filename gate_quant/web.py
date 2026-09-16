@@ -34,6 +34,19 @@ from .execution_reconciler import JOURNAL_PATH as EXECUTION_JOURNAL
 from .exchange_write_lock import gate_write_lock
 from .risk import RiskLimits
 from .service import GateTradingService, protection_coverage_status
+
+TRADE_STATUS_LABELS = {
+    "blocked_pending_reconfirmation": "等待下一轮确认",
+    "blocked_price_deviation": "报价偏差过大，未下单",
+    "blocked_extreme_deviation": "价格波动过大，未下单",
+    "blocked_by_strategy_interceptor": "被策略风控拦截",
+    "blocked_safety_fail_closed": "安全门关闭，未下单",
+    "blocked_invalid_margin": "保证金参数无效，未下单",
+    "blocked_invalid_size": "下单数量无效，未下单",
+    "blocked_risk_limit": "超过风险限额，未下单",
+    "blocked_opposite_position": "与现有持仓方向冲突",
+    "blocked_cycle_entry_limit": "达到单轮开仓上限，本轮未提交",
+}
 from .protection_lifecycle import is_system_protection
 from .store import EventStore
 from .proxy_tunnel import gate_tunnel
@@ -171,8 +184,16 @@ def _trader_log() -> str:
         except Exception:
             timestamp = "时间未记录"
         trade = cycle.get("trade") or {}
-        trade_label = {"not_submitted": "未下单", "submitted_testnet": "已提交测试网订单", "submitted_live": "已提交实盘订单", "blocked_by_strategy_interceptor": "被策略拦截", "protection_failed_flatten_attempted": "保护单失败，已尝试平仓"}.get(str(trade.get("status")), str(trade.get("status") or "未下单"))
+        trade_label = {"not_submitted": "未下单", "submitted_testnet": "已提交测试网订单", "submitted_live": "已提交实盘订单", "blocked_by_strategy_interceptor": "被策略拦截", "protection_failed_flatten_attempted": "保护单失败，已尝试平仓", **TRADE_STATUS_LABELS}.get(str(trade.get("status")), str(trade.get("status") or "未下单"))
         rows = [f"【交易巡检】{timestamp}", f"巡检状态：正常完成", f"执行结果：{trade_label}"]
+        trades = cycle.get("trades") or []
+        if len(trades) > 1:
+            candidate_labels = []
+            for candidate in trades:
+                status = str(candidate.get("status") or "not_submitted")
+                label = {"submitted_testnet": "已提交测试网订单", "submitted_live": "已提交实盘订单", **TRADE_STATUS_LABELS}.get(status, status)
+                candidate_labels.append(f"{candidate.get('contract') or '--'}：{label}")
+            rows.append("候选明细：" + "；".join(candidate_labels))
         for symbol, decision in (cycle.get("decisions") or {}).items():
             if not isinstance(decision, dict):
                 continue
@@ -227,6 +248,7 @@ class GateAdminConfig(BaseModel):
     testnet_execute_trades: bool = False
     leverage: float = Field(default=3, ge=1, le=100)
     risk_profile: str = Field(default="standard", pattern="^(observe|conservative|standard|active|aggressive)$")
+    max_entries_per_cycle: int = Field(default=1, ge=0, le=2)
     proxy_url: str | None = None
     max_position_notional_usd: float = Field(gt=0)
     max_total_margin_usd: float = Field(gt=0)
@@ -525,7 +547,8 @@ def all_dashboard():
     history_view = []
     for row in reversed(decision_history[-200:]):
         stamp = int(row.get("generated_at_ms") or 0) if isinstance(row, dict) else 0
-        history_view.append({**row, "time": dt.datetime.fromtimestamp(stamp / 1000).strftime("%Y-%m-%d %H:%M:%S") if stamp else "时间未记录", "macro_assessment": f"{(row.get('risk_snapshot') or {}).get('label', profile.label)}档位 · Gate {(row.get('environment') or s.environment).upper()} · {(row.get('trade') or {}).get('status', 'not_submitted')}"})
+        trade_status = str((row.get("trade") or {}).get("status") or "not_submitted")
+        history_view.append({**row, "time": dt.datetime.fromtimestamp(stamp / 1000).strftime("%Y-%m-%d %H:%M:%S") if stamp else "时间未记录", "macro_assessment": f"{(row.get('risk_snapshot') or {}).get('label', profile.label)}档位 · Gate {(row.get('environment') or s.environment).upper()} · {TRADE_STATUS_LABELS.get(trade_status, {'not_submitted': '未下单'}.get(trade_status, trade_status))}", "trade_status_label": TRADE_STATUS_LABELS.get(trade_status, {'not_submitted': '未下单'}.get(trade_status, trade_status))})
     ledger_rows = _read_json_file("trading_ledger.json", [])
     if not isinstance(ledger_rows, list):
         ledger_rows = []
@@ -695,7 +718,7 @@ def gate_admin_runtime(x_gate_session: str | None = Header(default=None, alias="
     tunnel_payload = {**tunnel.__dict__, "running": bool(tunnel.running or shared_tunnel_ready), "pid": tunnel.pid or None}
     profile = get_risk_profile(s.risk_profile)
     snapshot = profile.snapshot(leverage=s.leverage, environment=s.environment)
-    return {"exchange": "gate", "environment": s.environment, "ready": bool(s.api_key and s.api_secret), "base_url": s.base_url, "public_market_environment": s.public_market_environment, "proxy_configured": bool(s.proxy_url), "proxy_url": s.proxy_url or "", "proxy_required": s.require_proxy, "tunnel": tunnel_payload, "testnet_execute_trades": bool(s.testnet_execute_trades), "live_trading_enabled": bool(s.environment == "live" and s.live_trading_enabled), "credentials": {"testnet_configured": bool(_stored_gate_credential("GATE_TESTNET_API_KEY") and _stored_gate_credential("GATE_TESTNET_API_SECRET")), "live_configured": bool(_stored_gate_credential("GATE_LIVE_API_KEY") and _stored_gate_credential("GATE_LIVE_API_SECRET"))}, "risk_profiles": profile_catalog(), "risk_snapshot": snapshot, "risk": {"risk_profile": s.risk_profile, "leverage": s.leverage, "max_position_notional_usd": s.max_position_notional_usd, "max_total_margin_usd": s.max_total_margin_usd, "max_order_margin_usd": s.max_order_margin_usd}}
+    return {"exchange": "gate", "environment": s.environment, "ready": bool(s.api_key and s.api_secret), "base_url": s.base_url, "public_market_environment": s.public_market_environment, "proxy_configured": bool(s.proxy_url), "proxy_url": s.proxy_url or "", "proxy_required": s.require_proxy, "tunnel": tunnel_payload, "testnet_execute_trades": bool(s.testnet_execute_trades), "live_trading_enabled": bool(s.environment == "live" and s.live_trading_enabled), "credentials": {"testnet_configured": bool(_stored_gate_credential("GATE_TESTNET_API_KEY") and _stored_gate_credential("GATE_TESTNET_API_SECRET")), "live_configured": bool(_stored_gate_credential("GATE_LIVE_API_KEY") and _stored_gate_credential("GATE_LIVE_API_SECRET"))}, "risk_profiles": profile_catalog(), "risk_snapshot": snapshot, "risk": {"risk_profile": s.risk_profile, "max_entries_per_cycle": s.max_entries_per_cycle, "leverage": s.leverage, "max_position_notional_usd": s.max_position_notional_usd, "max_total_margin_usd": s.max_total_margin_usd, "max_order_margin_usd": s.max_order_margin_usd}}
 
 
 @app.get("/api/v1/admin/runtime")
@@ -720,7 +743,7 @@ def gate_admin_runtime_overview(x_gate_session: str | None = Header(default=None
         llm_runtime = {key: raw_llm.get(key) for key in ("model", "name", "provider_name", "provider_id", "api_format", "reasoning_effort", "reasoning_type", "thinking_timeout")}
     except Exception:
         llm_runtime = {"model": os.getenv("LLM_MODEL", ""), "provider_name": "Gate AI Worker", "reasoning_effort": os.getenv("LLM_REASONING_EFFORT", "high")}
-    configuration = {"Gate 当前环境": settings.environment.upper(), "Gate API 凭证": "已配置" if settings.api_key and settings.api_secret else "未配置", "AI 风险档位": get_risk_profile(settings.risk_profile).label, "Gate Testnet 自动交易": "已启用" if settings.testnet_execute_trades else "关闭", "Gate Live 交易开关": "显式启用" if settings.environment == "live" and settings.live_trading_enabled else "关闭 (FAIL-CLOSED)", "Gate VPS 独立代理": "已配置" if settings.proxy_url else "未配置", "执行杠杆": f"{settings.leverage:g}x", "原生保护单覆盖": "Gate price_orders 双保护校验", "总持仓名义敞口上限": f"{settings.max_position_notional_usd:.2f} USDT", "总保证金上限": f"{settings.max_total_margin_usd:.2f} USDT", "单笔保证金上限": f"{settings.max_order_margin_usd:.2f} USDT"}
+    configuration = {"Gate 当前环境": settings.environment.upper(), "Gate API 凭证": "已配置" if settings.api_key and settings.api_secret else "未配置", "AI 风险档位": get_risk_profile(settings.risk_profile).label, "单轮最大开仓数": str(settings.max_entries_per_cycle), "Gate Testnet 自动交易": "已启用" if settings.testnet_execute_trades else "关闭", "Gate Live 交易开关": "显式启用" if settings.environment == "live" and settings.live_trading_enabled else "关闭 (FAIL-CLOSED)", "Gate VPS 独立代理": "已配置" if settings.proxy_url else "未配置", "执行杠杆": f"{settings.leverage:g}x", "原生保护单覆盖": "Gate price_orders 双保护校验", "总持仓名义敞口上限": f"{settings.max_position_notional_usd:.2f} USDT", "总保证金上限": f"{settings.max_total_margin_usd:.2f} USDT", "单笔保证金上限": f"{settings.max_order_margin_usd:.2f} USDT"}
     gateway_store = GatewayStore(GATEWAY_DB_PATH)
     gateway_pid = current_pid()
     return {"service": {"version": app.version, "pid": os.getpid(), "uptime_seconds": int(time.time() - STARTED_AT)}, "exchange": "gate", "environment": settings.environment, "credentials": {"gate": bool(settings.api_key and settings.api_secret), "llm": bool(os.getenv("LLM_API_KEY"))}, "configuration": configuration, "data_health": {"overall": "LIVE" if all(item["fresh"] for item in health_files) else "STALE", "files": health_files}, "safety_status": _safety_status(), "execution_reconciler": _execution_status(settings.environment), "trader_heartbeat": _heartbeat_status(), "gateway": {"running": bool(gateway_pid or _worker_lock_held()), "pid": gateway_pid or None, "scheduler": scheduler_snapshot(gateway_store)}, "full_decisions": full, "decisions": full, "decision_history": list(reversed(history)), "decision_history_total": len(history), "recent_logs": [], "logs": {"trader": _tail_log("gate_trader.log", 18), "backend": _tail_log("gate_backend.log", 18), "scheduler": _tail_log("r20_gateway.log", 18)}, "llm_runtime": llm_runtime}
@@ -825,6 +848,8 @@ def gate_admin_config(payload: GateAdminConfig, x_gate_session: str | None = Hea
     profile = get_risk_profile(payload.risk_profile)
     if payload.leverage > profile.max_leverage:
         raise HTTPException(400, f"{profile.label}档位的杠杆上限为 {profile.max_leverage:g}x")
+    if payload.max_entries_per_cycle > profile.max_entries_per_cycle:
+        raise HTTPException(400, f"{profile.label}档位单轮最多允许 {profile.max_entries_per_cycle} 单")
     if payload.live_trading_enabled and payload.environment != "live":
         raise HTTPException(400, "Gate Live 开关只能在已选择 Live 环境时显式启用")
     if payload.environment == "testnet" and payload.live_trading_enabled:
@@ -852,7 +877,7 @@ def gate_admin_config(payload: GateAdminConfig, x_gate_session: str | None = Hea
         except Exception as exc:
             raise HTTPException(409, str(exc)) from exc
     managed_proxy = os.getenv("GATE_PROXY_URL", "") if gate_tunnel.enabled else (payload.proxy_url or "")
-    values = {"GATE_ENVIRONMENT": payload.environment, "GATE_PUBLIC_MARKET_ENV": payload.environment, "GATE_TESTNET_EXECUTE_TRADES": str(payload.testnet_execute_trades).lower(), "GATE_LIVE_TRADING_ENABLED": str(payload.live_trading_enabled).lower(), "GATE_RISK_PROFILE": payload.risk_profile, "GATE_LEVERAGE": str(payload.leverage), "GATE_PROXY_URL": managed_proxy, "GATE_MAX_POSITION_NOTIONAL_USD": str(payload.max_position_notional_usd), "GATE_MAX_TOTAL_MARGIN_USD": str(payload.max_total_margin_usd), "GATE_MAX_ORDER_MARGIN_USD": str(payload.max_order_margin_usd)}
+    values = {"GATE_ENVIRONMENT": payload.environment, "GATE_PUBLIC_MARKET_ENV": payload.environment, "GATE_TESTNET_EXECUTE_TRADES": str(payload.testnet_execute_trades).lower(), "GATE_LIVE_TRADING_ENABLED": str(payload.live_trading_enabled).lower(), "GATE_RISK_PROFILE": payload.risk_profile, "GATE_MAX_ENTRIES_PER_CYCLE": str(payload.max_entries_per_cycle), "GATE_LEVERAGE": str(payload.leverage), "GATE_PROXY_URL": managed_proxy, "GATE_MAX_POSITION_NOTIONAL_USD": str(payload.max_position_notional_usd), "GATE_MAX_TOTAL_MARGIN_USD": str(payload.max_total_margin_usd), "GATE_MAX_ORDER_MARGIN_USD": str(payload.max_order_margin_usd)}
     # Keep market data, credentials and order writes on the selected cluster.
     # In particular, a Live order must never be priced from Testnet data.
     values["GATE_PUBLIC_MARKET_ENV"] = payload.environment
@@ -870,6 +895,7 @@ def gate_admin_config(payload: GateAdminConfig, x_gate_session: str | None = Hea
         testnet_execute_trades=payload.testnet_execute_trades,
         live_trading_enabled=payload.live_trading_enabled,
         risk_profile=payload.risk_profile,
+        max_entries_per_cycle=payload.max_entries_per_cycle,
         leverage=payload.leverage,
         proxy_url=managed_proxy or None,
         max_position_notional_usd=payload.max_position_notional_usd,

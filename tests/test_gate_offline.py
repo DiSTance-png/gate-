@@ -7,7 +7,7 @@ from gate_quant.client import GateFuturesClient, AmbiguousOrderError
 from gate_quant.config import GateSettings
 from gate_quant.risk import RiskLimits
 from gate_quant.service import GateTradingService, protection_coverage_status
-from gate_quant.ai_worker import _extract_decision_object, _extract_response_object, _as_instruction_list, _order_size_for_margin, _protection_matches, _execution_enabled, _account_committed_margin, _portfolio_position_notional, _requote_decision, _confirm_pending_requotes
+from gate_quant.ai_worker import _extract_decision_object, _extract_response_object, _as_instruction_list, _order_size_for_margin, _protection_matches, _execution_enabled, _account_committed_margin, _portfolio_position_notional, _requote_decision, _confirm_pending_requotes, _preflight_candidate_quotes, _run_serial_candidates
 from gate_quant.strategy_adapter import validate_decision
 from gate_quant.risk_profiles import get_risk_profile
 from r20_gateway.scheduler import JOBS, GatewayScheduler
@@ -69,6 +69,68 @@ def test_deferred_signal_requires_same_direction_next_cycle(monkeypatch, tmp_pat
     pending = {"ETH_USDT": {"action": "BUY_LONG", "created_at_ms": 1000}}
     decisions["ETH_USDT"]["decision"] = {"action": "BUY_LONG", "confidence": 90}
     assert _confirm_pending_requotes(pending, decisions, min_confidence=50, now_ms=2000) == {"ETH_USDT"}
+
+
+def test_deferred_high_confidence_candidate_does_not_hide_next_signal(monkeypatch, tmp_path):
+    import gate_quant.ai_worker as worker
+    monkeypatch.setattr(worker, "PENDING_REQUOTES", tmp_path / "pending.json")
+    class Quotes:
+        def tickers(self, symbol):
+            return [{"mark_price": {"ETH_USDT": "95", "SOL_USDT": "100"}[symbol]}]
+    candidates = [
+        {"instId": "ETH_USDT", "indicators": {"last": 95}, "decision": {"action": "BUY_LONG", "confidence": 80, "entry_price": 100, "take_profit_price": 110, "stop_loss_price": 95}},
+        {"instId": "SOL_USDT", "indicators": {"last": 100}, "decision": {"action": "BUY_LONG", "confidence": 78, "entry_price": 101, "take_profit_price": 110, "stop_loss_price": 97}},
+    ]
+    pending = {}
+    eligible, blocked = _preflight_candidate_quotes(Quotes(), candidates, pending, set(), now_ms=2000)
+    assert [row["instId"] for row in eligible] == ["SOL_USDT"]
+    assert blocked[0]["contract"] == "ETH_USDT"
+    assert blocked[0]["status"] == "blocked_pending_reconfirmation"
+    assert "ETH_USDT" in pending
+
+
+def test_rejected_eth_reconfirmation_does_not_block_other_second_cycle_signal(monkeypatch, tmp_path):
+    import gate_quant.ai_worker as worker
+    monkeypatch.setattr(worker, "PENDING_REQUOTES", tmp_path / "pending.json")
+    pending = {"ETH_USDT": {"contract": "ETH_USDT", "action": "BUY_LONG", "confidence": 80,
+                            "entry_price": 2500, "created_at_ms": 1000}}
+    decisions = {
+        "ETH_USDT": {"decision": {"action": "WAIT", "confidence": 82}},
+        "BTC_USDT": {"decision": {"action": "BUY_LONG", "confidence": 79}},
+    }
+    confirmed = _confirm_pending_requotes(pending, decisions, min_confidence=72, now_ms=2000)
+    assert confirmed == set()
+    assert "ETH_USDT" not in pending
+    assert decisions["BTC_USDT"]["decision"]["action"] == "BUY_LONG"
+
+
+def test_serial_candidates_block_does_not_consume_two_entry_budget():
+    candidates = [{"id": "ETH", "instId": "ETH_USDT"}, {"id": "SOL", "instId": "SOL_USDT"}, {"id": "BTC", "instId": "BTC_USDT"}, {"id": "XRP", "instId": "XRP_USDT"}]
+    def execute(candidate, sequence):
+        if candidate["id"] == "ETH":
+            return {"trade": {"contract": "ETH", "status": "blocked_pending_reconfirmation"}, "submitted": False, "stop_cycle": False}
+        return {"trade": {"contract": candidate["id"], "status": "submitted_live", "client_id": f"t-{sequence}"}, "submitted": True, "stop_cycle": False}
+    outcomes, submitted = _run_serial_candidates(candidates, 2, execute)
+    assert [row["contract"] for row in outcomes] == ["ETH", "SOL", "BTC", "XRP_USDT"]
+    assert [row["contract"] for row in submitted] == ["SOL", "BTC"]
+    assert submitted[0]["client_id"] != submitted[1]["client_id"]
+    assert outcomes[-1]["status"] == "blocked_cycle_entry_limit"
+
+
+def test_serial_candidates_ambiguous_order_stops_following_entries():
+    def execute(candidate, sequence):
+        return {"trade": {"contract": candidate, "status": "order_submission_ambiguous"}, "submitted": False, "stop_cycle": True}
+    outcomes, submitted = _run_serial_candidates(["ETH", "SOL"], 2, execute)
+    assert [row["contract"] for row in outcomes] == ["ETH"]
+    assert submitted == []
+
+
+def test_risk_profile_limits_entries_per_cycle():
+    assert get_risk_profile("standard").max_entries_per_cycle == 1
+    assert get_risk_profile("aggressive").max_entries_per_cycle == 2
+    GateSettings(environment="testnet", risk_profile="standard", max_entries_per_cycle=1).validate()
+    with pytest.raises(ValueError, match="cannot exceed 1"):
+        GateSettings(environment="testnet", risk_profile="standard", max_entries_per_cycle=2).validate()
 
 
 def test_gate_position_close_maps_native_lifecycle_fields():
