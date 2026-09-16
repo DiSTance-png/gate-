@@ -48,8 +48,15 @@ const tradeStatusText: Record<string, string> = {
   blocked_opposite_position: '与现有持仓方向冲突，已阻止下单',
   blocked_by_strategy_interceptor: '未通过策略风控，已阻止下单',
   blocked_by_strategy_interceptor_error: '策略风控检查异常，已阻止下单',
+  blocked_pending_reconfirmation: '等待下一轮同方向信号确认',
   blocked_price_deviation: '报价偏差过大，已阻止下单',
+  blocked_extreme_deviation: '价格波动过大，已阻止下单',
+  blocked_add_unprotected_existing_position: '现有持仓保护不完整，已阻止加仓',
+  blocked_invalid_leverage: '杠杆不符合合约范围，已阻止下单',
+  blocked_cycle_entry_limit: '达到单轮开仓上限，本轮未提交',
   order_rejected_safe_wait: '交易所拒绝订单，已转为安全观望',
+  order_submission_ambiguous: '订单提交结果不明确，等待客户端订单号对账',
+  reconciliation_pending: '订单正在等待对账确认',
   protection_failed_flatten_attempted: '保护单创建失败，已尝试安全平仓',
 }
 
@@ -64,7 +71,7 @@ function cycleTime(value: unknown) {
 }
 
 function cycleTradeText(trade: any) {
-  return tradeStatusText[trade?.status] || (trade?.status ? `未知执行状态（${trade.status}）` : '未下单')
+  return trade?.status_label || tradeStatusText[trade?.status] || (trade?.status ? `未知执行状态（${trade.status}）` : '未下单')
 }
 
 function formatTraderLog(raw: string) {
