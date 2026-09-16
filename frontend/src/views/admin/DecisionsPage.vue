@@ -17,6 +17,7 @@ const historyPages = ref(1)
 const decisionTotal = ref(0)
 const tradeHistory = ref<any[]>([])
 const tradeTotal = ref(0)
+const incompleteDecisions = ref<any[]>([])
 
 const actionText: Record<string, string> = {
   BUY_LONG: '做多',
@@ -143,6 +144,8 @@ async function loadDecisions() {
   try {
     const res = await api('/api/v1/admin/runtime')
     logs.value = res.recent_logs || []
+    const incomplete = await api('/api/v1/admin/incomplete-decisions')
+    incompleteDecisions.value = incomplete.items || []
     await loadHistory()
     await fetchLogStream('trader')
   } catch (e: any) {
@@ -201,6 +204,20 @@ onMounted(() => {
         日常运行 · 决策与审计
       </span>
     </div>
+
+    <section v-if="incompleteDecisions.length" class="border rounded-lg overflow-hidden" style="background-color: var(--bg-card); border-color: #f59e0b;">
+      <div class="px-4 py-3 border-b" style="border-color: var(--border-subtle);">
+        <h2 class="text-xs font-black text-amber-300">未完成 AI 决策巡查</h2>
+        <p class="text-[11px] mt-1" style="color: var(--text-muted);">发现任务异常或超时；这里只记录和对账，不会自动重跑或下单。</p>
+      </div>
+      <div class="divide-y" style="border-color: var(--border-subtle);">
+        <div v-for="item in incompleteDecisions" :key="item.run_id" class="px-4 py-3 text-xs">
+          <div class="flex flex-wrap justify-between gap-2"><b class="text-amber-300">{{ item.status_label }}</b><span class="font-mono" style="color: var(--text-muted);">{{ item.started_at || '--' }}</span></div>
+          <div class="mt-1" style="color: var(--text-muted);">失败阶段：{{ item.failure_stage }} · 返回码：{{ item.return_code ?? '--' }}</div>
+          <pre class="mt-2 whitespace-pre-wrap text-[11px] text-red-300">{{ item.error_summary }}</pre>
+        </div>
+      </div>
+    </section>
 
     <section class="border rounded-lg overflow-hidden" style="background-color: var(--bg-card); border-color: var(--border-subtle);">
       <div class="px-4 py-3 border-b" style="border-color: var(--border-subtle);">

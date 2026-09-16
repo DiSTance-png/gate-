@@ -120,6 +120,37 @@ def _execution_status(environment: str) -> dict[str, Any]:
     }
 
 
+def _incomplete_decision_runs(limit: int = 100) -> list[dict[str, Any]]:
+    """Return trader runs that did not produce a complete decision cycle."""
+    rows = GatewayStore(GATEWAY_DB_PATH).job_runs(max(20, min(limit, 200)))
+    now = time.time()
+    incomplete = []
+    for row in rows:
+        if row.get("job_name") != "trader":
+            continue
+        status = str(row.get("status") or "")
+        started = str(row.get("started_at") or "")
+        age_seconds = None
+        try:
+            age_seconds = max(0, int(now - dt.datetime.fromisoformat(started).timestamp())) if started else None
+        except (TypeError, ValueError, OSError):
+            pass
+        if status == "success":
+            continue
+        if status == "running" and age_seconds is not None and age_seconds <= 20 * 60:
+            continue
+        status_label = "任务超时未完成" if status == "running" else "决策任务异常未完成"
+        incomplete.append({
+            "run_id": row.get("id"), "job_name": "trader", "status": "incomplete",
+            "status_label": status_label, "started_at": started,
+            "finished_at": row.get("finished_at") or "", "return_code": row.get("return_code"),
+            "age_seconds": age_seconds, "failure_stage": "AI 决策或执行阶段",
+            "error_summary": str(row.get("detail") or "未记录错误摘要")[-2000:],
+            "repair_policy": "只允许对账或标记已处理，不自动重跑交易",
+        })
+    return incomplete
+
+
 def _dashboard_protection_orders(protections: list[dict], positions: list[dict]) -> list[dict[str, Any]]:
     active = {
         str(row.get("contract") or "").upper(): float(row.get("size") or 0)
@@ -796,6 +827,13 @@ def gate_admin_history(page: int = 1, page_size: int = 20, query: str = "", x_ga
     store.upsert_trade_records(records)
     trade_page = store.trade_history(environment=settings.environment, page=page, page_size=page_size, query=query)
     return {"decision_history": decision_page, "decision_total": len(decision_items), "decision_pages": max(1, (len(decision_items) + size - 1) // size), "trade_history": trade_page}
+
+
+@app.get("/api/v1/admin/incomplete-decisions")
+def gate_admin_incomplete_decisions(limit: int = 100, x_gate_session: str | None = Header(default=None, alias="X-R20-Session")):
+    _require_control_admin(x_gate_session)
+    rows = _incomplete_decision_runs(limit)
+    return {"items": rows, "total": len(rows), "repair_policy": "只读查看与对账；不会自动重跑 AI 或提交订单"}
 
 
 @app.get("/api/v1/admin/config")
