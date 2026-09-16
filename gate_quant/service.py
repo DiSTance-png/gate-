@@ -25,9 +25,17 @@ def protection_coverage_status(protections: list[dict], position_size: int | flo
         if rule not in coverage:
             continue
         reduce_only = bool(initial.get("reduce_only", initial.get("is_reduce_only", False)))
-        if not reduce_only and not bool(initial.get("close") or initial.get("is_close")):
+        close_all_side = str(initial.get("auto_size") or "").lower()
+        order_type = str(protection.get("order_type") or "").lower()
+        expected_side = "long" if signed_position > 0 else "short"
+        full_close = (
+            bool(initial.get("close") or initial.get("is_close"))
+            or close_all_side == f"close_{expected_side}"
+            or order_type == f"close-{expected_side}-position"
+        )
+        if not reduce_only and not full_close:
             continue
-        if bool(initial.get("close") or initial.get("is_close")):
+        if full_close:
             coverage[rule] = required
         elif size != 0 and (1 if size > 0 else -1) == expected_close_sign:
             coverage[rule] += abs(size)

@@ -128,13 +128,17 @@ def test_gate_limit_order_and_cross_leverage_use_native_fields():
     assert '"tif":"gtc"' in payload
 
 
-def test_gate_decimal_size_is_sent_as_native_json_number():
+def test_gate_decimal_entry_uses_native_number_but_protection_uses_full_close_int64_form():
     session = CaptureSession({"id": "1"})
     client = GateFuturesClient(configured_settings(), session)
     client.create_order(contract="SOL_USDT", size=0.4, price="103.5", tif="gtc", client_id="t-decimal")
     client.create_protection_order(contract="SOL_USDT", size=-0.4, trigger_price="100", rule=2, client_id="t-decimal-sl")
     assert '"size":0.4' in session.calls[0][2]["data"]
-    assert '"size":-0.4' in session.calls[1][2]["data"]
+    protection_payload = session.calls[1][2]["data"]
+    assert '"size":0' in protection_payload
+    assert '"auto_size":"close_long"' in protection_payload
+    assert '"order_type":"close-long-position"' in protection_payload
+    assert '"size":-0.4' not in protection_payload
 
 
 def test_position_not_found_is_a_gate_empty_position_condition():

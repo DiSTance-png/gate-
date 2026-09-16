@@ -7,7 +7,7 @@ from gate_quant.client import GateFuturesClient, AmbiguousOrderError
 from gate_quant.config import GateSettings
 from gate_quant.risk import RiskLimits
 from gate_quant.service import GateTradingService, protection_coverage_status
-from gate_quant.ai_worker import _extract_decision_object, _extract_response_object, _as_instruction_list, _order_size_for_margin, _protection_matches, _execution_enabled, _account_committed_margin, _portfolio_position_notional
+from gate_quant.ai_worker import _extract_decision_object, _extract_response_object, _as_instruction_list, _order_size_for_margin, _protection_matches, _execution_enabled, _account_committed_margin, _portfolio_position_notional, _requote_decision, _confirm_pending_requotes
 from gate_quant.strategy_adapter import validate_decision
 from gate_quant.risk_profiles import get_risk_profile
 from r20_gateway.scheduler import JOBS, GatewayScheduler
@@ -29,6 +29,46 @@ class FakeSession:
 
 
 def settings(): return GateSettings(environment="testnet", api_key="offline-key", api_secret="offline-secret", max_order_margin_usd=10, max_total_margin_usd=20, max_position_notional_usd=100)
+
+
+def test_requote_repairs_stale_long_without_market_conversion():
+    updated, meta = _requote_decision({
+        "action": "BUY_LONG", "entry_price": 2500, "take_profit_price": 2600,
+        "stop_loss_price": 2450,
+    }, 2400)
+    assert meta["requote_status"] == "requoted"
+    assert updated["entry_price"] == pytest.approx(2400)
+    assert updated["take_profit_price"] == pytest.approx(2500)
+    assert updated["stop_loss_price"] == pytest.approx(2350)
+
+
+def test_requote_repairs_stale_short_and_preserves_limit_intent():
+    updated, meta = _requote_decision({
+        "action": "SELL_SHORT", "entry_price": 2400, "take_profit_price": 2300,
+        "stop_loss_price": 2450,
+    }, 2500)
+    assert meta["requote_status"] == "requoted"
+    assert updated["entry_price"] == pytest.approx(2500)
+    assert updated["take_profit_price"] == pytest.approx(2400)
+    assert updated["stop_loss_price"] == pytest.approx(2550)
+
+
+def test_requote_extreme_move_fails_closed():
+    updated, meta = _requote_decision({"action": "BUY_LONG", "entry_price": 2500}, 2200)
+    assert meta["requote_status"] == "blocked_extreme_deviation"
+    assert updated["entry_price"] == 2500
+
+
+def test_deferred_signal_requires_same_direction_next_cycle(monkeypatch, tmp_path):
+    import gate_quant.ai_worker as worker
+    monkeypatch.setattr(worker, "PENDING_REQUOTES", tmp_path / "pending.json")
+    pending = {"ETH_USDT": {"action": "BUY_LONG", "created_at_ms": 1000}}
+    decisions = {"ETH_USDT": {"decision": {"action": "SELL_SHORT", "confidence": 90}}}
+    assert _confirm_pending_requotes(pending, decisions, min_confidence=50, now_ms=2000) == set()
+    assert pending == {}
+    pending = {"ETH_USDT": {"action": "BUY_LONG", "created_at_ms": 1000}}
+    decisions["ETH_USDT"]["decision"] = {"action": "BUY_LONG", "confidence": 90}
+    assert _confirm_pending_requotes(pending, decisions, min_confidence=50, now_ms=2000) == {"ETH_USDT"}
 
 
 def test_gate_position_close_maps_native_lifecycle_fields():
@@ -287,6 +327,25 @@ def test_protection_coverage_requires_both_tp_and_sl_for_full_position():
     assert not coverage["fully_protected"]
     rows.append({"initial": {"size": -2, "is_reduce_only": True}, "trigger": {"rule": 2}})
     assert protection_coverage_status(rows, 4)["fully_protected"]
+
+
+def test_full_close_protections_cover_decimal_hedge_position():
+    rows = [
+        {"order_type": "close-long-position", "initial": {"size": 0, "auto_size": "close_long", "is_reduce_only": True}, "trigger": {"rule": 1}},
+        {"order_type": "close-long-position", "initial": {"size": 0, "auto_size": "close_long", "is_reduce_only": True}, "trigger": {"rule": 2}},
+    ]
+    coverage = protection_coverage_status(rows, Decimal("7.7"))
+    assert coverage["take_profit"] == Decimal("7.7")
+    assert coverage["stop_loss"] == Decimal("7.7")
+    assert coverage["fully_protected"]
+
+
+def test_wrong_side_full_close_does_not_cover_position():
+    rows = [
+        {"order_type": "close-short-position", "initial": {"size": 0, "auto_size": "close_short", "is_reduce_only": True}, "trigger": {"rule": 1}},
+        {"order_type": "close-short-position", "initial": {"size": 0, "auto_size": "close_short", "is_reduce_only": True}, "trigger": {"rule": 2}},
+    ]
+    assert not protection_coverage_status(rows, Decimal("7.7"))["fully_protected"]
 
 
 def test_non_reduce_only_trigger_cannot_count_as_position_protection():

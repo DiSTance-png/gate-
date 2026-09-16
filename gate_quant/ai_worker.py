@@ -31,6 +31,8 @@ SAFETY_STATUS = DATA / "gate_safety_status.json"
 RUNTIME_HEARTBEAT = DATA / "gate_trader_heartbeat.json"
 LEDGER = DATA / "trading_ledger.json"
 PROTECTION_INTENTS = DATA / "protection_intents.json"
+PENDING_REQUOTES = DATA / "pending_requotes.json"
+PENDING_REQUOTE_TTL_SECONDS = 20 * 60
 
 
 def _save_decision_payload(payload: dict, decisions_payload: dict, trade: dict, now: int, environment: str, risk_snapshot: dict | None = None) -> None:
@@ -102,12 +104,102 @@ def _console_summary(result: dict) -> str:
 SYMBOLS = ("BTC_USDT", "ETH_USDT", "SOL_USDT", "DOGE_USDT", "SUI_USDT", "XRP_USDT")
 
 GATE_LIMIT_PRICE_DEVIATION = 0.02
+# A stale AI quote may be repaired, but an extreme move is still rejected
+# rather than chased.  This is deliberately wider than the normal execution
+# band and can be tightened in a future risk profile.
+GATE_MAX_REQUOTE_DEVIATION = 0.06
 
 
 def _quote_deviation(entry_price: float, reference_price: float) -> float:
     if entry_price <= 0 or reference_price <= 0:
         return 0.0
     return abs(entry_price - reference_price) / reference_price
+
+
+def _requote_decision(decision: dict, reference_price: float, *,
+                      limit: float = GATE_LIMIT_PRICE_DEVIATION,
+                      max_requote: float = GATE_MAX_REQUOTE_DEVIATION) -> tuple[dict, dict]:
+    """Reprice a stale limit decision while preserving its planned distances.
+
+    This is intentionally a limit-price repair, never a conversion to market.
+    TP/SL offsets are carried from the AI's original entry when they are
+    directionally valid; the caller must run the normal strategy/risk gates
+    again after applying the returned decision.
+    """
+    original = dict(decision)
+    entry = float(original.get("entry_price") or 0)
+    reference = float(reference_price or 0)
+    deviation = _quote_deviation(entry, reference)
+    meta = {
+        "original_entry_price": entry,
+        "reference_price": reference,
+        "original_deviation_pct": deviation * 100,
+        "requote_limit_pct": limit * 100,
+        "requote_max_pct": max_requote * 100,
+        "requote_status": "unchanged",
+    }
+    if not entry or not reference or deviation <= limit:
+        return original, meta
+    if deviation > max_requote:
+        meta["requote_status"] = "blocked_extreme_deviation"
+        return original, meta
+
+    action = str(original.get("action") or "WAIT")
+    sign = 1 if action == "BUY_LONG" else -1 if action == "SELL_SHORT" else 0
+    updated = dict(original)
+    updated["entry_price"] = reference
+    for field, favorable in (("take_profit_price", 1), ("stop_loss_price", -1)):
+        planned = float(original.get(field) or 0)
+        delta = planned - entry if planned and entry else 0.0
+        # Long TP / short SL should be above entry; the inverse is below.
+        # Invalid or missing AI levels are left at zero for the caller's
+        # existing ATR fallback logic.
+        valid = bool(sign and delta and ((delta * sign * favorable) > 0))
+        updated[field] = reference + delta if valid else 0.0
+    meta.update({
+        "requote_status": "requoted",
+        "repriced_entry_price": reference,
+        "repriced_take_profit_price": updated["take_profit_price"],
+        "repriced_stop_loss_price": updated["stop_loss_price"],
+    })
+    return updated, meta
+
+
+def _load_pending_requotes(now_ms: int) -> dict[str, dict]:
+    try:
+        raw = json.loads(PENDING_REQUOTES.read_text(encoding="utf-8")) if PENDING_REQUOTES.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    cutoff = now_ms - PENDING_REQUOTE_TTL_SECONDS * 1000
+    return {symbol: row for symbol, row in raw.items()
+            if isinstance(row, dict) and int(row.get("created_at_ms") or 0) >= cutoff}
+
+
+def _save_pending_requotes(rows: dict[str, dict]) -> None:
+    atomic_json(PENDING_REQUOTES, rows)
+
+
+def _confirm_pending_requotes(rows: dict[str, dict], decisions_payload: dict,
+                              *, min_confidence: float, now_ms: int) -> set[str]:
+    """Confirm deferred signals only when the next AI cycle agrees in direction."""
+    confirmed: set[str] = set()
+    for symbol, row in list(rows.items()):
+        current = (decisions_payload.get(symbol) or {}).get("decision") or {}
+        action = str(current.get("action") or "WAIT")
+        same_direction = action == str(row.get("action") or "")
+        confidence_ok = float(current.get("confidence") or 0) >= min_confidence
+        if same_direction and confidence_ok:
+            row["confirmed_at_ms"] = now_ms
+            row["second_decision"] = dict(current)
+            confirmed.add(symbol)
+        else:
+            # A contrary/WAIT/low-confidence second decision invalidates the
+            # deferred entry signal instead of carrying it into later cycles.
+            rows.pop(symbol, None)
+    _save_pending_requotes(rows)
+    return confirmed
 
 
 def _account_committed_margin(account: dict) -> float:
@@ -392,12 +484,18 @@ def _order_size_for_margin(*, margin_usdt: float, leverage: float, entry_price: 
 
 
 def _protection_matches(rows: list[dict], *, client_id: str, size: int | float | Decimal, rule: int) -> bool:
+    signed_size = Decimal(str(size))
+    expected_side = "long" if signed_size < 0 else "short"
     for row in rows or []:
         initial = row.get("initial") or {}
         trigger = row.get("trigger") or {}
         covered = abs(Decimal(str(initial.get("size") or 0)))
-        required = abs(Decimal(str(size)))
-        if str(initial.get("text") or "") == client_id and covered >= required and int(trigger.get("rule") or 0) == rule:
+        required = abs(signed_size)
+        full_close = (
+            str(initial.get("auto_size") or "").lower() == f"close_{expected_side}"
+            or str(row.get("order_type") or "").lower() == f"close-{expected_side}-position"
+        )
+        if str(initial.get("text") or "") == client_id and (covered >= required or full_close) and int(trigger.get("rule") or 0) == rule:
             return True
     return False
 
@@ -672,6 +770,7 @@ def run_cycle() -> dict:
     position_management = _as_instruction_list(management.get("position_management"))
     pending_management = _as_instruction_list(management.get("pending_orders_management"))
     decisions_payload = {symbol: {"instId": symbol, "decision_timestamp_ms": now, "decision": item, "source": llm_source, "llm_error": llm_error, "llm_preview": llm_preview, "policy_version": policy_snapshot["policy_version"], "policy_hash": policy_snapshot["policy_hash"], "risk_snapshot": risk_snapshot, "indicators": next(f for f in features if f["contract"] == symbol)} for symbol, item in decisions.items()}
+    pending_requotes = _load_pending_requotes(now)
     # Apply the inherited deterministic quote gate before selecting a candidate.
     try:
         from .strategy_adapter import validate_decision
@@ -698,7 +797,9 @@ def run_cycle() -> dict:
                 envelope["decision"].update({"action": "WAIT", "entry_price": 0.0, "take_profit_price": 0.0, "stop_loss_price": 0.0, "rejection_reason": f"strategy gate unavailable: {exc}"})
     result: dict = {"trade": {"status": "not_submitted", "reason": f"Gate {settings.environment.title()} automatic execution is disabled" if not execution_enabled else f"No qualifying {settings.environment.title()} signal"}}
     executable = [d for d in decisions_payload.values() if d["decision"].get("action") in {"BUY_LONG", "SELL_SHORT"} and float(d["decision"].get("confidence") or 0) >= risk_profile.min_confidence]
-    decision = max(executable or decisions_payload.values(), key=lambda d: float(d["decision"].get("confidence") or 0))
+    confirmed_requotes = _confirm_pending_requotes(pending_requotes, decisions_payload, min_confidence=risk_profile.min_confidence, now_ms=now)
+    confirmed_executable = [d for d in executable if d["instId"] in confirmed_requotes]
+    decision = max(confirmed_executable or executable or decisions_payload.values(), key=lambda d: float(d["decision"].get("confidence") or 0))
     trade_symbol = decision["instId"]
     trade_feature = next(f for f in features if f["contract"] == trade_symbol)
     action = decision["decision"]["action"]
@@ -752,6 +853,48 @@ def run_cycle() -> dict:
         limits = RiskLimits(settings.max_position_notional_usd, settings.max_total_margin_usd, settings.max_order_margin_usd)
         contract = client.contracts(trade_symbol)
         multiplier = float(contract.get("quanto_multiplier") or 0)
+        # Refresh the exchange quote immediately before sizing/submission. A
+        # multi-minute AI response can otherwise leave a perfectly valid
+        # signal several percent away from the current market.
+        quote_rows = client.tickers(trade_symbol) or []
+        quote = quote_rows[0] if isinstance(quote_rows, list) and quote_rows else (quote_rows if isinstance(quote_rows, dict) else {})
+        gate_reference = float(quote.get("mark_price") or quote.get("last") or last or 0)
+        original_decision = dict(decision["decision"])
+        repriced_decision, requote = _requote_decision(decision["decision"], gate_reference)
+        decision["decision"].update(repriced_decision)
+        decisions_payload[trade_symbol]["decision"].update(repriced_decision)
+        if trade_symbol in confirmed_requotes:
+            requote["requote_status"] = "confirmed_after_deferred_signal"
+            requote["confirmed_at_ms"] = now
+        if requote["requote_status"] == "blocked_extreme_deviation":
+            reason = (f"Gate limit price deviation {requote['original_deviation_pct']:.3f}% exceeds "
+                      f"safe re-quote ceiling {requote['requote_max_pct']:.1f}% "
+                      f"(entry={requote['original_entry_price']:g}, mark={requote['reference_price']:g}); safe WAIT")
+            decision["decision"].update({"action": "WAIT", "entry_price": 0.0, "take_profit_price": 0.0, "stop_loss_price": 0.0, "rejection_reason": reason})
+            result["trade"] = {"status": "blocked_price_deviation", "contract": trade_symbol, "reason": reason, "requested_entry": requote["original_entry_price"], "reference_price": requote["reference_price"], "deviation_pct": requote["original_deviation_pct"], "requote": requote}
+            payload = {**decisions_payload, "generated_at_ms": now, "exchange": "gate", "environment": settings.environment, "risk_snapshot": risk_snapshot, "position_management": position_management, "pending_orders_management": pending_management, "private_context": private_context, "trade": result["trade"]}
+            _save_decision_payload(payload, decisions_payload, result["trade"], now, settings.environment, risk_snapshot)
+            result["decisions"] = decisions_payload
+            return result
+        if requote["requote_status"] == "requoted" and trade_symbol not in confirmed_requotes:
+            pending_requotes[trade_symbol] = {
+                "contract": trade_symbol,
+                "action": action,
+                "confidence": confidence,
+                "entry_price": requote["original_entry_price"],
+                "take_profit_price": original_decision.get("take_profit_price"),
+                "stop_loss_price": original_decision.get("stop_loss_price"),
+                "created_at_ms": now,
+                "reason": "price_deviation_requires_next_cycle_confirmation",
+            }
+            _save_pending_requotes(pending_requotes)
+            reason = (f"首次信号价格偏差 {requote['original_deviation_pct']:.3f}%；已保存，等待下一轮 AI 同方向确认")
+            decision["decision"].update({"action": "WAIT", "entry_price": 0.0, "take_profit_price": 0.0, "stop_loss_price": 0.0, "rejection_reason": reason})
+            result["trade"] = {"status": "blocked_pending_reconfirmation", "contract": trade_symbol, "reason": reason, "requested_entry": requote["original_entry_price"], "reference_price": requote["reference_price"], "deviation_pct": requote["original_deviation_pct"], "requote": requote}
+            payload = {**decisions_payload, "generated_at_ms": now, "exchange": "gate", "environment": settings.environment, "risk_snapshot": risk_snapshot, "position_management": position_management, "pending_orders_management": pending_management, "private_context": private_context, "trade": result["trade"]}
+            _save_decision_payload(payload, decisions_payload, result["trade"], now, settings.environment, risk_snapshot)
+            result["decisions"] = decisions_payload
+            return result
         entry_price = float(decision["decision"].get("entry_price") or 0)
         planned_margin = float(decision["decision"].get("margin_usdt") or decision["decision"].get("margin_usd") or 0)
         leverage = settings.leverage
@@ -843,21 +986,6 @@ def run_cycle() -> dict:
             _save_decision_payload(payload, decisions_payload, result["trade"], now, settings.environment, risk_snapshot)
             result["decisions"] = decisions_payload
             return result
-        quote_rows = client.tickers(trade_symbol) or []
-        quote = quote_rows[0] if isinstance(quote_rows, list) and quote_rows else (quote_rows if isinstance(quote_rows, dict) else {})
-        gate_reference = float(quote.get("mark_price") or quote.get("last") or last or 0)
-        requested_entry = float(decision["decision"].get("entry_price") or 0)
-        deviation = _quote_deviation(requested_entry, gate_reference)
-        if deviation > GATE_LIMIT_PRICE_DEVIATION:
-            reason = (f"Gate limit price deviation {deviation * 100:.3f}% exceeds "
-                      f"{GATE_LIMIT_PRICE_DEVIATION * 100:.1f}% band "
-                      f"(entry={requested_entry:g}, mark={gate_reference:g}); safe WAIT")
-            decision["decision"].update({"action": "WAIT", "entry_price": 0.0, "take_profit_price": 0.0, "stop_loss_price": 0.0, "rejection_reason": reason})
-            result["trade"] = {"status": "blocked_price_deviation", "contract": trade_symbol, "reason": reason, "requested_entry": requested_entry, "reference_price": gate_reference, "deviation_pct": deviation * 100}
-            payload = {**decisions_payload, "generated_at_ms": now, "exchange": "gate", "environment": settings.environment, "risk_snapshot": risk_snapshot, "position_management": position_management, "pending_orders_management": pending_management, "private_context": private_context, "trade": result["trade"]}
-            _save_decision_payload(payload, decisions_payload, result["trade"], now, settings.environment, risk_snapshot)
-            result["decisions"] = decisions_payload
-            return result
         client_id = f"t-gate-ai-{now}"
         try:
             position = client.positions(trade_symbol) or {}
@@ -867,8 +995,8 @@ def run_cycle() -> dict:
             position = {}
         cross_margin = str(position.get("pos_margin_mode") or "cross").lower() == "cross" or float(position.get("leverage") or 0) == 0
         limit_price = _round_price(entry_price, contract.get("order_price_round") or contract.get("mark_price_round") or "0")
-        tp = float(decision["decision"].get("take_profit_price") or (last + 2 * trade_feature["atr14"] if size > 0 else last - 2 * trade_feature["atr14"]))
-        sl = float(decision["decision"].get("stop_loss_price") or (last - trade_feature["atr14"] if size > 0 else last + trade_feature["atr14"]))
+        tp = float(decision["decision"].get("take_profit_price") or (gate_reference + 2 * trade_feature["atr14"] if size > 0 else gate_reference - 2 * trade_feature["atr14"]))
+        sl = float(decision["decision"].get("stop_loss_price") or (gate_reference - trade_feature["atr14"] if size > 0 else gate_reference + trade_feature["atr14"]))
         tick = contract.get("order_price_round") or contract.get("mark_price_round") or "0"
         rounded_tp = _round_price(tp, tick)
         rounded_sl = _round_price(sl, tick)
@@ -882,6 +1010,7 @@ def run_cycle() -> dict:
             "entry_price": limit_price,
             "take_profit_price": rounded_tp,
             "stop_loss_price": rounded_sl,
+            "requote": requote,
             "created_at_ms": now,
             "policy_version": policy_snapshot["policy_version"],
             "policy_hash": policy_snapshot["policy_hash"],
@@ -918,6 +1047,7 @@ def run_cycle() -> dict:
             "environment": settings.environment, "contract": trade_symbol, "entry_client_id": client_id,
             "position_side": "long" if size > 0 else "short", "entry_size": str(abs(size)),
             "entry_price": limit_price, "take_profit_price": rounded_tp, "stop_loss_price": rounded_sl,
+            "requote": requote,
             "created_at_ms": now, "policy_version": policy_snapshot["policy_version"], "policy_hash": policy_snapshot["policy_hash"],
         })
         try:

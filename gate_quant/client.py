@@ -138,7 +138,17 @@ class GateFuturesClient:
     def create_protection_order(self, *, contract: str, size: int | float | Decimal, trigger_price: str, rule: int, client_id: str, reduce_only: bool = True, close: bool = False, expiration: int = 86400):
         if rule not in {1, 2}:
             raise ValueError("Gate trigger rule must be 1 (>=) or 2 (<=)")
-        payload = {"initial": {"contract": contract, "size": self._api_size(size), "price": "0", "tif": "ioc", "reduce_only": reduce_only, "close": close, "text": client_id}, "trigger": {"price": trigger_price, "rule": rule, "expiration": expiration, "strategy_type": 0}}
+        requested_size = Decimal(str(size))
+        initial = {"contract": contract, "size": self._api_size(requested_size), "price": "0", "tif": "ioc", "reduce_only": reduce_only, "close": close, "text": client_id}
+        payload = {"initial": initial, "trigger": {"price": trigger_price, "rule": rule, "expiration": expiration, "strategy_type": 0}}
+        if requested_size != requested_size.to_integral_value():
+            # Gate Futures accepts decimal entry sizes for enabled contracts,
+            # while FuturesInitialOrder.size in /price_orders is int64. The
+            # documented hedge-mode full-close form protects the complete
+            # decimal position without sending an invalid fractional size.
+            side = "long" if requested_size < 0 else "short"
+            initial.update({"size": 0, "auto_size": f"close_{side}", "close": False})
+            payload["order_type"] = f"close-{side}-position"
         try:
             return self._request("POST", f"/futures/{self.settings.settle}/price_orders", payload=payload, private=True)
         except AmbiguousOrderError:

@@ -49,11 +49,15 @@ class FakeGate:
         self.created_rules.append(rule)
         if self.fail_rule == rule:
             raise RuntimeError(f"protection rule {rule} rejected")
+        signed_size = Decimal(str(size))
+        fractional = signed_size != signed_size.to_integral_value()
+        side = "long" if signed_size < 0 else "short"
         row = {
             "id": str(200 + len(self.protections)),
             "status": "open",
-            "initial": {"contract": contract, "size": float(size), "text": client_id, "is_reduce_only": True},
+            "initial": {"contract": contract, "size": 0 if fractional else float(size), "text": client_id, "is_reduce_only": True, **({"auto_size": f"close_{side}"} if fractional else {})},
             "trigger": {"price": trigger_price, "rule": rule},
+            **({"order_type": f"close-{side}-position"} if fractional else {}),
         }
         self.protections.append(row)
         return row
@@ -119,6 +123,20 @@ def test_restart_recovers_prepared_intent_by_client_order_id_without_resubmit(tm
     assert result["status"] == "filled_protected"
     assert result["order_id"] == "101"
     assert not gate.reductions
+
+
+def test_decimal_fill_is_covered_by_gate_full_close_price_orders(tmp_path):
+    journal = ExecutionJournal(tmp_path / "execution.db")
+    intent = prepared(journal, requested="7.7")
+    gate = FakeGate(size="7.7", left="0", position_size="7.7")
+
+    result = reconcile_intent(gate, journal, intent, settings(), now_ms=2000)
+
+    assert result["status"] == "filled_protected"
+    assert not gate.reductions
+    assert len(gate.protections) == 2
+    assert all(row["initial"]["size"] == 0 for row in gate.protections)
+    assert all(row["initial"]["auto_size"] == "close_long" for row in gate.protections)
 
 
 def test_missing_stop_cancels_remainder_and_reduces_only_new_add_on(tmp_path):
