@@ -36,6 +36,7 @@ from .risk import RiskLimits
 from .service import GateTradingService, protection_coverage_status
 
 TRADE_STATUS_LABELS = {
+    "not_submitted": "未下单",
     "blocked_pending_reconfirmation": "等待下一轮确认",
     "blocked_price_deviation": "报价偏差过大，未下单",
     "blocked_extreme_deviation": "价格波动过大，未下单",
@@ -191,7 +192,7 @@ def _trader_log() -> str:
             candidate_labels = []
             for candidate in trades:
                 status = str(candidate.get("status") or "not_submitted")
-                label = {"submitted_testnet": "已提交测试网订单", "submitted_live": "已提交实盘订单", **TRADE_STATUS_LABELS}.get(status, status)
+                label = {"submitted_testnet": "已提交测试网订单", "submitted_live": "已提交实盘订单", **TRADE_STATUS_LABELS}.get(status, "未知执行状态（" + status + "）")
                 candidate_labels.append(f"{candidate.get('contract') or '--'}：{label}")
             rows.append("候选明细：" + "；".join(candidate_labels))
         for symbol, decision in (cycle.get("decisions") or {}).items():

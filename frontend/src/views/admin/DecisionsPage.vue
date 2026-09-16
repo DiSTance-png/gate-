@@ -74,6 +74,11 @@ function cycleTradeText(trade: any) {
   return trade?.status_label || tradeStatusText[trade?.status] || (trade?.status ? `未知执行状态（${trade.status}）` : '未下单')
 }
 
+function historyStatusText(status: unknown) {
+  const value = String(status || '')
+  return tradeStatusText[value] || (value ? `未知状态（${value}）` : '--')
+}
+
 function formatTraderLog(raw: string) {
   const lines = raw.split(/\r?\n/)
   const chineseSummary: string[] = []
@@ -256,7 +261,7 @@ onMounted(() => {
       <div v-if="tradeHistory.length" class="overflow-x-auto">
         <table class="w-full text-xs">
           <thead><tr class="text-left" style="color: var(--text-muted);"><th class="px-4 py-2">时间</th><th class="px-4 py-2">类型</th><th class="px-4 py-2">合约</th><th class="px-4 py-2">状态</th><th class="px-4 py-2">Gate 编号</th></tr></thead>
-          <tbody><tr v-for="row in tradeHistory" :key="row.record_type + row.external_id" class="border-t" style="border-color: var(--border-subtle); color: var(--text-main);"><td class="px-4 py-2 whitespace-nowrap">{{ cycleTime(row.occurred_at) }}</td><td class="px-4 py-2">{{ row.record_type === 'account_book' ? '账户流水' : '订单' }}</td><td class="px-4 py-2">{{ row.contract || '--' }}</td><td class="px-4 py-2">{{ row.status || '--' }}</td><td class="px-4 py-2 font-mono">{{ row.external_id }}</td></tr></tbody>
+          <tbody><tr v-for="row in tradeHistory" :key="row.record_type + row.external_id" class="border-t" style="border-color: var(--border-subtle); color: var(--text-main);"><td class="px-4 py-2 whitespace-nowrap">{{ cycleTime(row.occurred_at) }}</td><td class="px-4 py-2">{{ row.record_type === 'account_book' ? '账户流水' : '订单' }}</td><td class="px-4 py-2">{{ row.contract || '--' }}</td><td class="px-4 py-2">{{ historyStatusText(row.status) }}</td><td class="px-4 py-2 font-mono">{{ row.external_id }}</td></tr></tbody>
         </table>
       </div>
       <div v-else class="px-4 py-6 text-xs text-center" style="color: var(--text-muted);">暂无 Gate 交易流水；系统会在下一次同步时自动补录。</div>
