@@ -55,6 +55,7 @@ const routes: RouteRecordRaw[] = [
     children: [
       { path: '', redirect: '/admin/overview' },
       { path: 'overview', name: 'admin-overview', component: () => import('../views/admin/OverviewPage.vue') },
+      { path: 'incomplete-decisions', name: 'admin-incomplete-decisions', component: () => import('../views/admin/IncompleteDecisionsPage.vue') },
       { path: 'security', name: 'admin-security', component: () => import('../views/admin/SecurityPage.vue') },
       { path: 'symbols', redirect: '/admin/security' },
       { path: 'manual-trade', redirect: '/admin/security' },

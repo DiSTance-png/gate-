@@ -33,6 +33,7 @@ import {
   X,
   Sparkles,
   Globe,
+  AlertTriangle,
 } from 'lucide-vue-next'
 
 const router = useRouter()
@@ -46,6 +47,7 @@ const navGroups = computed(() => [
     label: t('admin.sysOverview'),
     items: [
       { id: 'overview', label: t('admin.dashboard'), icon: LayoutDashboard },
+      { id: 'incomplete-decisions', label: '未完成决策', icon: AlertTriangle },
       { id: 'decisions', label: t('admin.runtimeTelemetry', '决策日志'), icon: Radio },
     ],
   },
@@ -135,6 +137,7 @@ function handleLogout() {
 const prefetchViews = () => {
   const loaders = [
     () => import('../views/admin/OverviewPage.vue'),
+    () => import('../views/admin/IncompleteDecisionsPage.vue'),
     () => import('../views/admin/SecurityPage.vue'),
     () => import('../views/admin/CouncilPage.vue'),
     () => import('../views/admin/LlmPage.vue'),
