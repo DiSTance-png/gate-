@@ -44,7 +44,9 @@
 ## 进程和端口事实
 
 - Gate Web 监听 `127.0.0.1:8081`。
-- Web lifespan 负责启动独立 SSH 隧道和 Gateway supervisor。
+- Linux VPS 标准目录为 `/opt/gate-quant`；Web 与 Gateway 分别由 `gate-quant-web.service`、`gate-quant-gateway.service` 管理，模板位于 `deploy/systemd/`。
+- VPS Web 不直接监听公网地址。配置 VPN/HTTPS 前通过 SSH 本地转发访问，不能通过纯 HTTP 公网页面提交 API 凭证。
+- Windows 默认由 Web lifespan 启动独立 SSH 隧道和 Gateway supervisor；Linux systemd 部署设置 `R20_GATEWAY_WORKER_ENABLED=false`，由独立 Gateway 服务持有调度所有权。
 - Gateway 运行 `r20_gateway.worker`，负责定时任务与通知，不负责保持交易所长连接，也不是“有信号才启动”。
 - Windows 虚拟环境启动器会表现为一对父子 `pythonw.exe` PID。Web 和 Gateway 各出现一对通常是正常现象，不能据此判断重复实例。
 - 单实例依据是：8081 只有一个监听者、`.r20_gateway.lock` 只有一个持有者、调度日志只有一套周期。
@@ -121,8 +123,8 @@ git diff --check
 
 ## 当前验证基线
 
-- 基线提交：`c417da4`。
-- 离线测试：71 项通过。
+- 基线提交：`17dc9ee`。
+- 离线测试：76 项通过。
 - 已在 Gate Testnet 正常链验证行情、账户、持仓、挂单、成交、撤单、保护单、过期撤单、最长持仓平仓和原生平仓台账。
 - 超时找回、部分成交递增保护、保护失败回滚和重启恢复已做离线故障注入，但尚未主动在 Testnet 制造这些异常。
 - Gate Live 从未执行过交易，不能声称已经完成实盘回归。

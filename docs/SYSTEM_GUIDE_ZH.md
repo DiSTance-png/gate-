@@ -452,9 +452,11 @@ git diff --check
 
 - 不影响现有仓位的受控 Testnet 异常写回归。
 - Gate Live 小额只读到写入的分阶段回归。
-- 长期服务器部署和服务管理脚本。
+- 手机公网访问所需的 VPN 或域名 HTTPS 接入。
 
-因此当前系统可以继续在本地 Testnet 稳定验证，但不能把“Testnet 正常链 + 离线异常测试”描述为“Gate Live 已验证”。实盘启用必须是单独、显式且可审计的操作。
+Linux VPS 使用 `/opt/gate-quant`、`gate-quant-web.service` 和 `gate-quant-gateway.service` 运行。Web 固定绑定服务器回环地址，Gateway 作为独立服务持续调度；模板见 `deploy/`。首次可以通过 `ssh -N -L 28081:127.0.0.1:8081 your-server-alias` 从电脑访问。Gate 凭证可以在 Web 后台保存到服务器加密仓库，但首次管理员密码和默认关闭的交易开关仍由服务器 `.env` 建立。手机外网访问必须另行配置 VPN 或有效 HTTPS，不能直接公开 8081。
+
+因此当前系统可以在 Testnet 稳定验证和长期服务器运行，但不能把“Testnet 正常链 + 离线异常测试”描述为“Gate Live 已验证”。实盘启用必须是单独、显式且可审计的操作。
 
 ## 21. 修改系统时的完成标准
 

@@ -24,6 +24,23 @@ pytest -q
 
 `GATE_TESTNET_BASE_URL` 和 `GATE_LIVE_BASE_URL` 可按 Gate 账户集群覆盖，必须是完整的 `/api/v4` 地址。当前默认 Testnet 地址已用本账户验证；Gate 官方 SDK 当前列出的 `fx-api-testnet.gateio.ws` 属于另一集群，切换前必须用同一凭证做只读检测。
 
+## Linux VPS 部署
+
+服务器建议把仓库放在 `/opt/gate-quant`，使用 Python 3.12、Node.js 20 LTS，并分别运行两个 systemd 服务：
+
+- `gate-quant-web.service`：FastAPI Web，仅监听 `127.0.0.1:8081`。
+- `gate-quant-gateway.service`：独立运行调度器、AI Worker 和成交保护对账。
+
+模板位于 `deploy/systemd/` 和 `deploy/env.server.example`。首次部署应复制服务器环境模板为 `.env`，设置强 `GATE_ADMIN_PASSWORD`，并保持 `GATE_TESTNET_EXECUTE_TRADES=false`、`GATE_LIVE_TRADING_ENABLED=false`。API Key/Secret 可以在后台“Gate 账户与合约池”中填写，保存后进入服务器本地加密仓库，不需要以明文写入 `.env`。
+
+在配置 HTTPS 或 VPN 前，不要把 8081 直接开放到公网。电脑可通过 SSH 本地转发访问：
+
+```powershell
+ssh -N -L 28081:127.0.0.1:8081 your-server-alias
+```
+
+然后打开 `http://127.0.0.1:28081/`。手机使用蜂窝网络时无法访问电脑的 `127.0.0.1` 隧道；应先配置 Tailscale/WireGuard，或配置域名、有效 HTTPS 证书和额外访问控制，再从手机填写敏感配置。纯 HTTP 公网页面不得用于提交 API Key/Secret。
+
 ## AI 风险档位与杠杆
 
 后台“Gate 账户与合约池”可选择 `GATE_RISK_PROFILE` 并修改 `GATE_LEVERAGE`。保存后，后端生成带版本和哈希的不可变风险快照；同一份快照同时进入 AI system/user prompt、置信度/ADX/R:R 拦截器、有效保证金额度、下单审计和历史记录。AI 输出的 leverage 不能覆盖系统配置；真正下单前仍调用 Gate 原生持仓杠杆接口。

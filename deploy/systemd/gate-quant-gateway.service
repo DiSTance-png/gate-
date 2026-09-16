@@ -1,0 +1,20 @@
+[Unit]
+Description=Gate Quant Scheduler and Reconciler
+After=network-online.target gate-quant-web.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/gate-quant
+EnvironmentFile=/opt/gate-quant/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/gate-quant/.venv/bin/python -m r20_gateway.worker
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target

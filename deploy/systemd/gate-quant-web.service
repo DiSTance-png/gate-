@@ -1,0 +1,20 @@
+[Unit]
+Description=Gate Quant Web
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/gate-quant
+EnvironmentFile=/opt/gate-quant/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/gate-quant/.venv/bin/python -m uvicorn gate_quant.web:app --host 127.0.0.1 --port 8081
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target

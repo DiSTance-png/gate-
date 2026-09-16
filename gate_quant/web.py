@@ -968,6 +968,8 @@ def gate_admin_check(x_gate_session: str | None = Header(default=None, alias="X-
         return {"ok": True, "environment": s.environment, "detail": "Gate 私有 API 读取成功", "account": {"total": account.get("total"), "available": account.get("available")}}
     except Exception as exc:
         store.add("gate.credentials.check_failed", {"environment": s.environment, "error": str(exc)[:300]}, "WARN")
+        if "USER_NOT_FOUND" in str(exc).upper():
+            return {"ok": False, "environment": s.environment, "authenticated": True, "detail": "Live API 请求已通过签名并到达 Gate，但该账户尚未创建 USDT Futures 账户；请先在 Gate 开通合约并向合约账户划转资金后重试"}
         return {"ok": False, "environment": s.environment, "detail": f"Gate 私有 API 检测失败：{exc}"}
 
 

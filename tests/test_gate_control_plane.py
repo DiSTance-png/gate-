@@ -1,4 +1,5 @@
 import importlib
+import os
 import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -405,3 +406,46 @@ def test_order_list_uses_official_offset_pagination():
     client = GateFuturesClient(configured_settings(), session)
     client.list_orders(status="finished", limit=25, page=3)
     assert session.calls[0][2]["params"] == {"status": "finished", "limit": 25, "offset": 50}
+
+
+def test_gate_runtime_fields_are_persisted_by_settings_store(monkeypatch, tmp_path):
+    from r20_backend import settings_store
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("GATE_ENVIRONMENT=testnet\nGATE_LIVE_TRADING_ENABLED=false\n", encoding="utf-8")
+    monkeypatch.setattr(settings_store, "ENV_FILE", env_file)
+    monkeypatch.setattr(settings_store, "refresh_settings", lambda: None)
+    values = {
+        "GATE_ENVIRONMENT": "live",
+        "GATE_PUBLIC_MARKET_ENV": "live",
+        "GATE_TESTNET_EXECUTE_TRADES": "false",
+        "GATE_LIVE_TRADING_ENABLED": "false",
+        "GATE_PROXY_URL": "",
+    }
+
+    settings_store.update_env(values)
+
+    persisted = env_file.read_text(encoding="utf-8")
+    for key, value in values.items():
+        assert f"{key}={value}" in persisted
+        assert os.environ[key] == value
+
+
+def test_gate_check_distinguishes_uninitialized_futures_account(monkeypatch):
+    import gate_quant.web as web
+
+    monkeypatch.setattr(web, "_require_control_admin", lambda token: {"username": "tester"})
+    monkeypatch.setattr(web, "load_settings", lambda: configured_settings(environment="live", api_key="key", api_secret="secret", public_market_environment="live"))
+
+    class UninitializedFuturesClient:
+        def account(self):
+            raise RuntimeError("Gate API USER_NOT_FOUND: please transfer funds first to create futures account (HTTP 400)")
+
+    monkeypatch.setattr(web, "client", lambda: UninitializedFuturesClient())
+    monkeypatch.setattr(web.store, "add", lambda *args, **kwargs: None)
+
+    result = web.gate_admin_check(None)
+
+    assert result["ok"] is False
+    assert result["authenticated"] is True
+    assert "尚未创建 USDT Futures 账户" in result["detail"]
