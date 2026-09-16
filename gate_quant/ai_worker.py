@@ -5,12 +5,13 @@ import os
 import time
 import re
 import requests
-from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
+from decimal import Decimal, ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, ROUND_HALF_UP
 from pathlib import Path
 from dataclasses import replace
+from typing import Any
 from dotenv import load_dotenv
 
-from .client import AmbiguousOrderError, GateFuturesClient
+from .client import AmbiguousOrderError, GateFuturesClient, PRICE_ORDER_EXPIRATION_QUANTUM_SECONDS
 from .config import load_settings
 from .execution_journal import ExecutionJournal
 from .execution_reconciler import JOURNAL_PATH as EXECUTION_JOURNAL, reconcile_intent
@@ -41,6 +42,13 @@ TRADE_STATUS_LABELS = {
     "blocked_by_strategy_interceptor": "被策略风控拦截",
     "blocked_safety_fail_closed": "安全门关闭，未下单",
     "blocked_cycle_entry_limit": "达到单轮开仓上限，本轮未提交",
+    "blocked_entry_intent_mismatch": "入场意图与盘口矛盾，未下单",
+    "blocked_invalid_trigger_size": "突破计划张数无效，未下单",
+    "blocked_invalid_protection_geometry": "止盈止损方向无效，未下单",
+    "existing_breakout_plan_kept": "保留现有突破计划单",
+    "breakout_cancelled_by_new_signal": "新信号已撤销突破计划单",
+    "breakout_triggered_reconciliation_pending": "突破已触发，等待成交保护对账",
+    "breakout_cancel_ambiguous": "突破计划撤单状态不明，安全暂停",
 }
 
 
@@ -63,6 +71,10 @@ def _save_decision_payload(payload: dict, decisions_payload: dict, trade: dict, 
                 "action": envelope["decision"].get("action", "WAIT"),
                 "raw_action": envelope["decision"].get("raw_action", envelope["decision"].get("action", "WAIT")),
                 "confidence": envelope["decision"].get("confidence", 0),
+                "entry_intent": envelope["decision"].get("entry_intent", ""),
+                "entry_price": envelope["decision"].get("entry_price", 0),
+                "take_profit_price": envelope["decision"].get("take_profit_price", 0),
+                "stop_loss_price": envelope["decision"].get("stop_loss_price", 0),
                 "summary_reason": envelope["decision"].get("summary_reason", ""),
                 "rejection_reason": envelope["decision"].get("rejection_reason", ""),
             }
@@ -127,12 +139,64 @@ GATE_LIMIT_PRICE_DEVIATION = 0.02
 # rather than chased.  This is deliberately wider than the normal execution
 # band and can be tightened in a future risk profile.
 GATE_MAX_REQUOTE_DEVIATION = 0.06
+ENTRY_INTENTS = {"immediate", "retracement", "breakout"}
 
 
 def _quote_deviation(entry_price: float, reference_price: float) -> float:
     if entry_price <= 0 or reference_price <= 0:
         return 0.0
     return abs(entry_price - reference_price) / reference_price
+
+
+def _entry_execution_plan(*, action: str, entry_intent: str, entry_price: float,
+                          quote: dict, max_slippage_pct: float, price_tick: str | float,
+                          expiration_seconds: int) -> dict:
+    """Validate explicit AI intent against the live book and map it to Gate semantics."""
+    intent = str(entry_intent or "").lower()
+    entry = float(entry_price or 0)
+    bid = float(quote.get("highest_bid") or quote.get("bid") or 0)
+    ask = float(quote.get("lowest_ask") or quote.get("ask") or 0)
+    if action not in {"BUY_LONG", "SELL_SHORT"} or intent not in ENTRY_INTENTS:
+        return {"valid": False, "reason": "入场意图缺失或不受支持"}
+    if entry <= 0 or bid <= 0 or ask <= 0 or bid > ask:
+        return {"valid": False, "reason": "Gate 买一/卖一盘口不可用，无法验证入场意图"}
+    slip = max(0.0, float(max_slippage_pct))
+    if intent == "immediate":
+        reference = ask if action == "BUY_LONG" else bid
+        if abs(entry - reference) / reference > slip:
+            return {"valid": False, "reason": "立即入场报价与当前盘口偏差超过滑点上限"}
+        capped = reference * (1 + slip if action == "BUY_LONG" else 1 - slip)
+        return {"valid": True, "order_type": "immediate", "tif": "ioc",
+                "price": _round_price(capped, price_tick, ROUND_FLOOR if action == "BUY_LONG" else ROUND_CEILING),
+                "reference_price": reference,
+                "max_slippage_pct": slip}
+    if intent == "retracement":
+        valid = entry < ask if action == "BUY_LONG" else entry > bid
+        if not valid:
+            return {"valid": False, "reason": "回调/反弹入场价与当前盘口方向矛盾"}
+        return {"valid": True, "order_type": "retracement", "tif": "gtc",
+                "price": _round_price(entry, price_tick, ROUND_FLOOR if action == "BUY_LONG" else ROUND_CEILING),
+                "reference_price": ask if action == "BUY_LONG" else bid,
+                "max_slippage_pct": 0.0}
+    valid = entry > ask if action == "BUY_LONG" else entry < bid
+    if not valid:
+        return {"valid": False, "reason": "突破/跌破触发价与当前盘口方向矛盾"}
+    capped = entry * (1 + slip if action == "BUY_LONG" else 1 - slip)
+    return {"valid": True, "order_type": "breakout", "tif": "ioc",
+            "price": _round_price(capped, price_tick, ROUND_FLOOR if action == "BUY_LONG" else ROUND_CEILING),
+            "trigger_price": _round_price(entry, price_tick, ROUND_CEILING if action == "BUY_LONG" else ROUND_FLOOR),
+            "trigger_rule": 1 if action == "BUY_LONG" else 2,
+            "reference_price": ask if action == "BUY_LONG" else bid,
+            "max_slippage_pct": slip, "expiration_seconds": int(expiration_seconds)}
+
+
+def _breakout_compatible_size(size: Decimal, minimum: Any = 1) -> Decimal:
+    """Gate price_orders documents an integer initial size; never round exposure up."""
+    sign = Decimal("1") if size > 0 else Decimal("-1")
+    integer_size = abs(size).to_integral_value(rounding=ROUND_DOWN)
+    if integer_size < max(Decimal("1"), Decimal(str(minimum or 1))):
+        raise ValueError("突破计划单按 Gate 整数张约束取整后低于最小下单量")
+    return sign * integer_size
 
 
 def _requote_decision(decision: dict, reference_price: float, *,
@@ -222,7 +286,8 @@ def _confirm_pending_requotes(rows: dict[str, dict], decisions_payload: dict,
 
 
 def _preflight_candidate_quotes(client, candidates: list[dict], pending_requotes: dict[str, dict],
-                                confirmed_requotes: set[str], *, now_ms: int) -> tuple[list[dict], list[dict]]:
+                                confirmed_requotes: set[str], *, now_ms: int,
+                                entry_intent_enabled: bool = False) -> tuple[list[dict], list[dict]]:
     """Screen every candidate so one deferred quote cannot hide later signals."""
     eligible: list[dict] = []
     blocked: list[dict] = []
@@ -234,6 +299,14 @@ def _preflight_candidate_quotes(client, candidates: list[dict], pending_requotes
         quote = quote_rows[0] if isinstance(quote_rows, list) and quote_rows else (quote_rows if isinstance(quote_rows, dict) else {})
         reference = float(quote.get("mark_price") or quote.get("last") or envelope["indicators"].get("last") or 0)
         original = dict(item)
+        if entry_intent_enabled and str(item.get("entry_intent") or "").lower() in ENTRY_INTENTS:
+            envelope["quote_preflight"] = {
+                "requote_status": "explicit_entry_intent",
+                "original_entry_price": float(item.get("entry_price") or 0),
+                "reference_price": reference,
+            }
+            eligible.append(envelope)
+            continue
         _, requote = _requote_decision(item, reference)
         if symbol in confirmed_requotes or requote["requote_status"] == "unchanged":
             envelope["quote_preflight"] = requote
@@ -304,6 +377,23 @@ def _portfolio_position_notional(client: GateFuturesClient, positions: list[dict
     return float(total)
 
 
+def _untracked_trigger_entries(trigger_entries: list[dict], execution_intents: list[dict]) -> list[dict]:
+    """Return non-reduce price orders that have no matching durable execution intent."""
+    known_client_ids = {str(row.get("client_id") or "") for row in execution_intents}
+    known_order_ids = {str(row.get("order_id") or "") for row in execution_intents if row.get("order_id")}
+    untracked = []
+    for row in trigger_entries or []:
+        if not isinstance(row, dict):
+            continue
+        initial = row.get("initial") or {}
+        client_id = str(initial.get("text") or "")
+        order_id = str(row.get("id_string") or row.get("id") or "")
+        if client_id not in known_client_ids and order_id not in known_order_ids:
+            untracked.append({"order_id": order_id, "client_id": client_id,
+                              "contract": str(initial.get("contract") or "").upper()})
+    return untracked
+
+
 def _execute_entry_candidate(client: GateFuturesClient, envelope: dict, *, settings, risk_profile,
                              risk_snapshot: dict, policy_snapshot: dict, confirmed_requotes: set[str],
                              now_ms: int, sequence: int, risk_state: dict[str, float]) -> dict:
@@ -330,22 +420,46 @@ def _execute_entry_candidate(client: GateFuturesClient, envelope: dict, *, setti
     quote_rows = client.tickers(trade_symbol) or []
     quote = quote_rows[0] if isinstance(quote_rows, list) and quote_rows else (quote_rows if isinstance(quote_rows, dict) else {})
     gate_reference = float(quote.get("mark_price") or quote.get("last") or trade_feature.get("last") or 0)
-    repriced_decision, requote = _requote_decision(decision, gate_reference)
-    decision.update(repriced_decision)
-    if trade_symbol in confirmed_requotes:
-        requote["requote_status"] = "confirmed_after_deferred_signal"
-        requote["confirmed_at_ms"] = now_ms
-    if requote["requote_status"] in {"blocked_extreme_deviation", "requoted"} and trade_symbol not in confirmed_requotes:
-        status = "blocked_price_deviation" if requote["requote_status"] == "blocked_extreme_deviation" else "blocked_pending_reconfirmation"
-        reason = (f"Gate limit price deviation {requote['original_deviation_pct']:.3f}% exceeds safe re-quote ceiling; safe WAIT"
-                  if status == "blocked_price_deviation" else
-                  f"首次信号价格偏差 {requote['original_deviation_pct']:.3f}%；等待下一轮 AI 同方向确认")
-        decision.update({"action": "WAIT", "entry_price": 0.0, "take_profit_price": 0.0,
-                         "stop_loss_price": 0.0, "rejection_reason": reason})
-        return {"trade": {"status": status, "contract": trade_symbol, "reason": reason,
-                          "requested_entry": requote["original_entry_price"], "reference_price": requote["reference_price"],
-                          "deviation_pct": requote["original_deviation_pct"], "requote": requote},
-                "submitted": False, "stop_cycle": False}
+    tick = contract.get("order_price_round") or contract.get("mark_price_round") or "0"
+    if settings.entry_intent_enabled:
+        entry_plan = _entry_execution_plan(
+            action=action,
+            entry_intent=str(decision.get("entry_intent") or ""),
+            entry_price=float(decision.get("entry_price") or 0),
+            quote=quote,
+            max_slippage_pct=settings.max_entry_slippage_pct,
+            price_tick=tick,
+            expiration_seconds=settings.breakout_expiration_seconds,
+        )
+        requote = {"requote_status": "explicit_entry_intent", "reference_price": gate_reference}
+        if not entry_plan.get("valid"):
+            reason = str(entry_plan.get("reason") or "入场意图与盘口关系不一致")
+            decision.update({"action": "WAIT", "entry_price": 0.0, "take_profit_price": 0.0,
+                             "stop_loss_price": 0.0, "rejection_reason": reason})
+            return {"trade": {"status": "blocked_entry_intent_mismatch", "contract": trade_symbol,
+                              "reason": reason, "entry_intent": decision.get("entry_intent"),
+                              "quote": {"bid": quote.get("highest_bid"), "ask": quote.get("lowest_ask")}},
+                    "submitted": False, "stop_cycle": False}
+    else:
+        repriced_decision, requote = _requote_decision(decision, gate_reference)
+        decision.update(repriced_decision)
+        entry_plan = {"valid": True, "order_type": "limit", "tif": "gtc",
+                      "price": _round_price(float(decision.get("entry_price") or 0), tick),
+                      "max_slippage_pct": 0.0}
+        if trade_symbol in confirmed_requotes:
+            requote["requote_status"] = "confirmed_after_deferred_signal"
+            requote["confirmed_at_ms"] = now_ms
+        if requote["requote_status"] in {"blocked_extreme_deviation", "requoted"} and trade_symbol not in confirmed_requotes:
+            status = "blocked_price_deviation" if requote["requote_status"] == "blocked_extreme_deviation" else "blocked_pending_reconfirmation"
+            reason = (f"Gate limit price deviation {requote['original_deviation_pct']:.3f}% exceeds safe re-quote ceiling; safe WAIT"
+                      if status == "blocked_price_deviation" else
+                      f"首次信号价格偏差 {requote['original_deviation_pct']:.3f}%；等待下一轮 AI 同方向确认")
+            decision.update({"action": "WAIT", "entry_price": 0.0, "take_profit_price": 0.0,
+                             "stop_loss_price": 0.0, "rejection_reason": reason})
+            return {"trade": {"status": status, "contract": trade_symbol, "reason": reason,
+                              "requested_entry": requote["original_entry_price"], "reference_price": requote["reference_price"],
+                              "deviation_pct": requote["original_deviation_pct"], "requote": requote},
+                    "submitted": False, "stop_cycle": False}
 
     entry_price = float(decision.get("entry_price") or 0)
     planned_margin = float(decision.get("margin_usdt") or decision.get("margin_usd") or 0)
@@ -370,7 +484,15 @@ def _execute_entry_candidate(client: GateFuturesClient, envelope: dict, *, setti
                           "planned_margin_usdt": planned_margin, "configured_leverage": leverage},
                 "submitted": False, "stop_cycle": False}
     size = contracts if action == "BUY_LONG" else -contracts
-    order_notional = float(abs(size) * Decimal(str(multiplier)) * Decimal(str(entry_price)))
+    if entry_plan["order_type"] == "breakout":
+        try:
+            size = _breakout_compatible_size(size, contract.get("order_size_min") or 1)
+        except ValueError as exc:
+            return {"trade": {"status": "blocked_invalid_trigger_size", "contract": trade_symbol,
+                              "reason": str(exc), "requested_size": str(size)},
+                    "submitted": False, "stop_cycle": False}
+    risk_price = max(entry_price, float(entry_plan.get("price") or entry_price))
+    order_notional = float(abs(size) * Decimal(str(multiplier)) * Decimal(str(risk_price)))
     estimated_margin = order_notional / leverage
 
     # Refresh exchange state for every candidate. The local reservation ensures
@@ -432,21 +554,47 @@ def _execute_entry_candidate(client: GateFuturesClient, envelope: dict, *, setti
             raise
         position = {}
     cross_margin = str(position.get("pos_margin_mode") or "cross").lower() == "cross" or float(position.get("leverage") or 0) == 0
-    limit_price = _round_price(entry_price, contract.get("order_price_round") or contract.get("mark_price_round") or "0")
+    limit_price = str(entry_plan["price"])
     tp = float(decision.get("take_profit_price") or (gate_reference + 2 * trade_feature["atr14"] if size > 0 else gate_reference - 2 * trade_feature["atr14"]))
     sl = float(decision.get("stop_loss_price") or (gate_reference - trade_feature["atr14"] if size > 0 else gate_reference + trade_feature["atr14"]))
-    tick = contract.get("order_price_round") or contract.get("mark_price_round") or "0"
     rounded_tp, rounded_sl = _round_price(tp, tick), _round_price(sl, tick)
+    tp_distance_pct = (tp - entry_price) / entry_price if entry_price else 0.0
+    sl_distance_pct = (sl - entry_price) / entry_price if entry_price else 0.0
+    valid_distances = ((size > 0 and tp_distance_pct > 0 and sl_distance_pct < 0)
+                       or (size < 0 and tp_distance_pct < 0 and sl_distance_pct > 0))
+    if not valid_distances:
+        return {"trade": {"status": "blocked_invalid_protection_geometry", "contract": trade_symbol,
+                          "reason": "AI 止盈止损与入场方向不一致，未提交订单"},
+                "submitted": False, "stop_cycle": False}
     journal = ExecutionJournal(EXECUTION_JOURNAL)
     intent = journal.prepare({"client_id": client_id, "environment": settings.environment, "contract": trade_symbol,
                               "requested_size": str(size), "baseline_position_size": str(existing_size),
                               "entry_price": limit_price, "take_profit_price": rounded_tp, "stop_loss_price": rounded_sl,
+                              "take_profit_distance_pct": str(tp_distance_pct), "stop_loss_distance_pct": str(sl_distance_pct),
+                              "order_type": entry_plan["order_type"], "entry_action": action,
+                              "max_slippage_pct": str(entry_plan.get("max_slippage_pct") or 0),
+                              "expiration_seconds": str(entry_plan.get("expiration_seconds") or settings.breakout_expiration_seconds),
+                              "order_notional_usdt": str(order_notional), "estimated_margin_usdt": str(estimated_margin),
+                              "price_tick": str(tick),
                               "requote": requote, "created_at_ms": now_ms,
                               "policy_version": policy_snapshot["policy_version"], "policy_hash": policy_snapshot["policy_hash"]})
     try:
         leverage_result = client.update_position_leverage(contract=trade_symbol, leverage=leverage, cross_margin=cross_margin)
-        order = GateTradingService(client, limits).place_order(contract=trade_symbol, size=size, price=limit_price,
-                                                                tif="gtc", client_id=client_id, risk=risk)
+        service = GateTradingService(client, limits)
+        if entry_plan["order_type"] == "breakout":
+            order = service.place_trigger_entry(
+                contract=trade_symbol,
+                size=size,
+                trigger_price=str(entry_plan["trigger_price"]),
+                execution_price=limit_price,
+                rule=int(entry_plan["trigger_rule"]),
+                client_id=client_id,
+                expiration=PRICE_ORDER_EXPIRATION_QUANTUM_SECONDS,
+                risk=risk,
+            )
+        else:
+            order = service.place_order(contract=trade_symbol, size=size, price=limit_price,
+                                        tif=str(entry_plan["tif"]), client_id=client_id, risk=risk)
     except AmbiguousOrderError as exc:
         journal.update(client_id, "prepared", last_error=str(exc))
         return {"trade": {"status": "order_submission_ambiguous", "contract": trade_symbol, "client_id": client_id,
@@ -460,13 +608,16 @@ def _execute_entry_candidate(client: GateFuturesClient, envelope: dict, *, setti
         return {"trade": {"status": "order_rejected_safe_wait", "contract": trade_symbol,
                           "client_id": client_id, "reason": reason}, "submitted": False, "stop_cycle": False}
 
-    raw_order = order.get("orders") if isinstance(order, dict) and order.get("reconciled") else order
+    raw_order = ((order.get("orders") or order.get("order")) if isinstance(order, dict) and order.get("reconciled") else order)
     raw_order = raw_order if isinstance(raw_order, dict) else {}
-    intent = journal.update(client_id, "submitted", order_id=str(raw_order.get("id") or ""),
-                            order_status=str(raw_order.get("status") or "unknown"))
+    submitted_status = "awaiting_trigger" if entry_plan["order_type"] == "breakout" else "submitted"
+    intent = journal.update(client_id, submitted_status, order_id=str(raw_order.get("id") or ""),
+                            order_status=str(raw_order.get("status") or ("waiting_trigger" if submitted_status == "awaiting_trigger" else "unknown")))
     record_protection_intent(PROTECTION_INTENTS, {"environment": settings.environment, "contract": trade_symbol,
         "entry_client_id": client_id, "position_side": "long" if size > 0 else "short", "entry_size": str(abs(size)),
-        "entry_price": limit_price, "take_profit_price": rounded_tp, "stop_loss_price": rounded_sl, "requote": requote,
+        "entry_price": limit_price, "requested_entry_price": entry_price, "take_profit_price": rounded_tp, "stop_loss_price": rounded_sl,
+        "take_profit_distance_pct": tp_distance_pct, "stop_loss_distance_pct": sl_distance_pct,
+        "entry_intent": decision.get("entry_intent"), "order_type": entry_plan["order_type"], "requote": requote,
         "created_at_ms": now_ms, "policy_version": policy_snapshot["policy_version"], "policy_hash": policy_snapshot["policy_hash"]})
     try:
         lifecycle = reconcile_intent(client, journal, intent, settings, now_ms=now_ms)
@@ -477,10 +628,15 @@ def _execute_entry_candidate(client: GateFuturesClient, envelope: dict, *, setti
     risk_state["reserved_notional"] += order_notional
     lifecycle_status = str(lifecycle.get("status") or "")
     protected_now = lifecycle_status in {"filled_protected", "partially_filled"}
-    terminal_failure = lifecycle_status in {"stop_failed_flatten_attempted", "flattened_invalid_protection"}
+    terminal_failure = lifecycle_status in {
+        "stop_failed_flatten_attempted",
+        "take_profit_failed_flatten_attempted",
+        "flattened_invalid_protection",
+    }
     trade = {"status": "protection_failed_flatten_attempted" if terminal_failure else f"submitted_{settings.environment}",
              "environment": settings.environment, "contract": trade_symbol, "client_id": client_id,
-             "position_operation": "add" if is_add_on else "open", "order_type": "limit", "price": limit_price,
+             "position_operation": "add" if is_add_on else "open", "order_type": entry_plan["order_type"], "price": limit_price,
+             "entry_intent": decision.get("entry_intent"), "trigger_price": entry_plan.get("trigger_price"),
              "size": GateFuturesClient._api_size(size), "expected_position_size": GateFuturesClient._api_size(existing_size + size),
              "configured_leverage": leverage, "risk_snapshot": risk_snapshot, "estimated_margin_usdt": estimated_margin,
              "leverage_update": leverage_result, "order": order, "take_profit": {"planned_price": rounded_tp},
@@ -509,6 +665,59 @@ def _run_serial_candidates(candidates: list[dict], max_entries: int, executor) -
         if outcome["stop_cycle"]:
             break
     return outcomes, submitted
+
+
+def _manage_breakout_plans(client: GateFuturesClient, journal: ExecutionJournal,
+                           intents: list[dict], decisions_payload: dict, settings) -> tuple[set[str], list[dict], bool]:
+    """Keep same-direction plans, or cancel them when the next AI decision withdraws the signal."""
+    kept: set[str] = set()
+    outcomes: list[dict] = []
+    stop_cycle = False
+    service = GateTradingService(
+        client,
+        RiskLimits(settings.max_position_notional_usd, settings.max_total_margin_usd, settings.max_order_margin_usd),
+    )
+    for intent in intents:
+        if str(intent.get("order_type") or "") != "breakout" or str(intent.get("status") or "") != "awaiting_trigger":
+            continue
+        contract = str(intent.get("contract") or "").upper()
+        decision = (decisions_payload.get(contract) or {}).get("decision") or {}
+        same_plan = (
+            str(decision.get("action") or "WAIT") == str(intent.get("entry_action") or "")
+            and str(decision.get("entry_intent") or "").lower() == "breakout"
+        )
+        if same_plan:
+            kept.add(contract)
+            outcomes.append({"status": "existing_breakout_plan_kept", "contract": contract,
+                             "client_id": intent.get("client_id"), "reason": "下一轮 AI 仍维持同方向突破意图"})
+            continue
+        order_id = str(intent.get("order_id") or "")
+        try:
+            plan = client.price_order(order_id) if order_id else client.find_trigger_entry_by_client_id(str(intent["client_id"]), contract)
+            if not isinstance(plan, dict):
+                raise RuntimeError("Gate 突破计划单状态不可见")
+            status = str(plan.get("status") or "").lower()
+            finish_as = str(plan.get("finish_as") or "").lower()
+            if status == "open":
+                result = service.cancel_trigger_entry_confirmed(contract=contract, order_id=str(plan.get("id") or order_id))
+                journal.update(str(intent["client_id"]), "trigger_cancelled", order_status="cancelled", last_error="")
+                outcomes.append({"status": "breakout_cancelled_by_new_signal", "contract": contract, "result": result})
+            elif finish_as == "succeeded" or plan.get("trade_id"):
+                journal.update(str(intent["client_id"]), "triggered_order_pending", order_status="triggered",
+                               last_error="计划单已触发，必须先完成成交与保护对账")
+                outcomes.append({"status": "breakout_triggered_reconciliation_pending", "contract": contract})
+                stop_cycle = True
+            else:
+                terminal = {"expired": "trigger_expired", "cancelled": "trigger_cancelled", "failed": "trigger_failed"}.get(finish_as, "manual_review")
+                journal.update(str(intent["client_id"]), terminal, order_status=finish_as or status,
+                               last_error=str(plan.get("reason") or ""))
+                outcomes.append({"status": terminal, "contract": contract})
+                stop_cycle = stop_cycle or terminal == "manual_review"
+        except Exception as exc:
+            journal.update(str(intent["client_id"]), "manual_review", last_error=str(exc))
+            outcomes.append({"status": "breakout_cancel_ambiguous", "contract": contract, "reason": str(exc)})
+            stop_cycle = True
+    return kept, outcomes, stop_cycle
 
 
 def _ema(values, period):
@@ -727,12 +936,12 @@ def _extract_decision_object(*parts):
     return response.get("decisions") if isinstance(response, dict) else None
 
 
-def _round_price(value: float, step: str | float) -> str:
+def _round_price(value: float, step: str | float, rounding=ROUND_HALF_UP) -> str:
     """Round a trigger to Gate's contract price unit without float drift."""
     quantum = Decimal(str(step or "0"))
     if quantum <= 0:
         return f"{value:.8g}"
-    rounded = (Decimal(str(value)) / quantum).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * quantum
+    rounded = (Decimal(str(value)) / quantum).quantize(Decimal("1"), rounding=rounding) * quantum
     return format(rounded, "f").rstrip("0").rstrip(".") or "0"
 
 
@@ -819,11 +1028,12 @@ def run_cycle() -> dict:
     ticker_by_symbol = {str(row.get("contract")): row for row in (tickers or []) if isinstance(row, dict)}
     features = [_features(market, symbol, ticker_by_symbol.get(symbol)) for symbol in SYMBOLS]
     strategy_packages = [_strategy_package(feature, ticker_by_symbol.get(feature["contract"])) for feature in features]
-    private_context = {"account": {}, "positions": [], "pending_orders": [], "protections": [], "private_errors": []}
+    private_context = {"account": {}, "positions": [], "pending_orders": [], "trigger_entries": [], "protections": [], "private_errors": []}
     try:
         private_context["account"] = client.account() or {}
         private_context["positions"] = client.positions() or []
         private_context["pending_orders"] = client.open_orders() or []
+        private_context["trigger_entries"] = client.trigger_entry_orders() or []
         private_context["protections"] = client.protection_orders() or []
     except Exception as exc:
         private_context["private_errors"].append({"category": classify_error(exc), "error": f"{type(exc).__name__}: {exc}"})
@@ -832,11 +1042,20 @@ def run_cycle() -> dict:
         max_pending_age_seconds=settings.max_pending_order_age_seconds,
     )
     pending_executions = ExecutionJournal(EXECUTION_JOURNAL).active(settings.environment)
-    if pending_executions:
+    unsafe_pending_executions = [row for row in pending_executions if str(row.get("status") or "") != "awaiting_trigger"]
+    if unsafe_pending_executions:
         reconciliation["issues"].append({
             "code": "execution_reconciliation_pending",
-            "count": len(pending_executions),
-            "contracts": sorted({str(row.get("contract") or "") for row in pending_executions}),
+            "count": len(unsafe_pending_executions),
+            "contracts": sorted({str(row.get("contract") or "") for row in unsafe_pending_executions}),
+        })
+        reconciliation["safe_for_new_risk"] = False
+    untracked_trigger_entries = _untracked_trigger_entries(private_context["trigger_entries"], pending_executions)
+    if untracked_trigger_entries:
+        reconciliation["issues"].append({
+            "code": "untracked_trigger_entry_orders",
+            "count": len(untracked_trigger_entries),
+            "orders": untracked_trigger_entries,
         })
         reconciliation["safe_for_new_risk"] = False
     equity = float(private_context["account"].get("total") or private_context["account"].get("available") or 0)
@@ -978,15 +1197,24 @@ def run_cycle() -> dict:
                     continue
                 active_positions_detail.append({"instId": str(position.get("contract") or "").replace("_USDT", "-USDT-SWAP"), "name": position.get("contract"), "side": "long" if size > 0 else "short", "pos": str(abs(size)), "lever": position.get("leverage") or position.get("lever") or "--", "avgPx": position.get("entry_price"), "lastPx": position.get("mark_price"), "upl": position.get("unrealised_pnl"), "uplRatio": 0.0})
             pending_orders_detail = [{"ordId": str(order.get("id")), "instId": str(order.get("contract") or "").replace("_USDT", "-USDT-SWAP"), "side": "buy" if float(order.get("size") or 0) > 0 else "sell", "posSide": "net", "px": order.get("price"), "sz": abs(float(order.get("size") or 0)), "state": order.get("status", "open"), "cTime": str(order.get("create_time_ms") or ""), "text": order.get("text", "")} for order in private_context["pending_orders"] if isinstance(order, dict)]
+            pending_orders_detail.extend([
+                {"ordId": str(order.get("id")), "instId": str((order.get("initial") or {}).get("contract") or "").replace("_USDT", "-USDT-SWAP"),
+                 "side": "buy" if float((order.get("initial") or {}).get("size") or 0) > 0 else "sell",
+                 "posSide": "net", "px": (order.get("trigger") or {}).get("price"),
+                 "sz": abs(float((order.get("initial") or {}).get("size") or 0)), "state": "waiting_breakout",
+                 "cTime": str(order.get("create_time") or ""), "text": (order.get("initial") or {}).get("text", "")}
+                for order in private_context["trigger_entries"] if isinstance(order, dict)
+            ])
             available = float(private_context["account"].get("available") or 0)
             committed_margin = _account_committed_margin(private_context["account"])
-            system_prompt, prompt = build_prompt(strategy_packages, positions=active_positions_detail, pending_orders=pending_orders_detail, available_usdt=available, execution_leverage=settings.leverage, max_order_margin_usdt=settings.max_order_margin_usd, max_total_margin_usdt=settings.max_total_margin_usd, current_margin_usdt=committed_margin, risk_snapshot=risk_snapshot)
+            system_prompt, prompt = build_prompt(strategy_packages, positions=active_positions_detail, pending_orders=pending_orders_detail, available_usdt=available, execution_leverage=settings.leverage, max_order_margin_usdt=settings.max_order_margin_usd, max_total_margin_usdt=settings.max_total_margin_usd, current_margin_usdt=committed_margin, risk_snapshot=risk_snapshot, entry_intent_enabled=settings.entry_intent_enabled)
             prompt += (f"\n本轮最多允许实际提交 {settings.max_entries_per_cycle} 个开仓/加仓订单。"
                        "每个合约应独立判断；某个合约等待二次报价确认或被风控拒绝，不代表其他合格合约必须观望。")
         except Exception:
             prompt = ('Output ONLY one compact final JSON object with top-level keys decisions, position_management, pending_orders_management. '
-                      f'The decisions object must contain all six contracts and each item must include action BUY_LONG|SELL_SHORT|WAIT, confidence 0-100, entry_price, take_profit_price, stop_loss_price, leverage={settings.leverage:g}, margin_usdt (positive and <= {settings.max_order_margin_usd:.2f}), summary_reason. '
-                      f'Active Gate risk profile={risk_profile.label}: confidence>={risk_profile.min_confidence:g}%, DOGE>={risk_profile.doge_min_confidence:g}%, ADX>={risk_profile.min_adx:g}, R:R>={risk_profile.min_rr:g}, target R:R>={risk_profile.target_rr:g}, effective per-order margin cap={settings.max_order_margin_usd * risk_profile.margin_ratio:.2f} USDT, total margin cap={settings.max_total_margin_usd:.2f} USDT, max actual entries this cycle={settings.max_entries_per_cycle}. Different Gate contracts may be held concurrently and an active contract may be added to only in the same direction, subject to aggregate limits and complete TP/SL coverage. A deferred or rejected symbol must not force unrelated qualified symbols to WAIT. '
+                      f'The decisions object must contain all six contracts and each item must include action BUY_LONG|SELL_SHORT|WAIT, confidence 0-100, entry_price, take_profit_price, stop_loss_price, leverage={settings.leverage:g}, margin_usdt (positive and <= {settings.max_order_margin_usd:.2f}), summary_reason'
+                      + (', and entry_intent immediate|retracement|breakout. ' if settings.entry_intent_enabled else '. ')
+                      + f'Active Gate risk profile={risk_profile.label}: confidence>={risk_profile.min_confidence:g}%, DOGE>={risk_profile.doge_min_confidence:g}%, ADX>={risk_profile.min_adx:g}, R:R>={risk_profile.min_rr:g}, target R:R>={risk_profile.target_rr:g}, effective per-order margin cap={settings.max_order_margin_usd * risk_profile.margin_ratio:.2f} USDT, total margin cap={settings.max_total_margin_usd:.2f} USDT, max actual entries this cycle={settings.max_entries_per_cycle}. Different Gate contracts may be held concurrently and an active contract may be added to only in the same direction, subject to aggregate limits and complete TP/SL coverage. A deferred or rejected symbol must not force unrelated qualified symbols to WAIT. '
                       'position_management actions are HOLD|CLOSE_MARKET|UPDATE_SL; pending_orders_management actions are KEEP|CANCEL. '
                       'Gate Futures data: ' + json.dumps({"instruments": features, "account": private_context["account"], "positions": private_context["positions"], "pending_orders": private_context["pending_orders"]}, ensure_ascii=False))
             system_prompt = "You are a Gate Futures risk-controlled trading decision model. Return the final JSON object only."
@@ -1029,7 +1257,9 @@ def run_cycle() -> dict:
             raw_margin = float(item.get("margin_usdt") or item.get("margin_usd") or 0)
             effective_margin_cap = settings.max_order_margin_usd * risk_profile.margin_ratio
             accepted_margin = max(0.0, min(raw_margin, effective_margin_cap, available))
-            decisions[feature["contract"]] = {"action": candidate, "raw_action": candidate, "confidence": max(0.0, min(100.0, float(item.get("confidence") or 0))), "entry_price": float(item.get("entry_price") or feature["last"]) if candidate != "WAIT" else 0.0, "take_profit_price": float(item.get("take_profit_price") or 0), "stop_loss_price": float(item.get("stop_loss_price") or 0), "leverage": settings.leverage, "margin_usdt": accepted_margin, "margin_usd": accepted_margin, "summary_reason": str(item.get("summary_reason") or "LLM decision")}
+            entry_intent = str(item.get("entry_intent") or "").lower()
+            intent_valid = candidate == "WAIT" or not settings.entry_intent_enabled or entry_intent in ENTRY_INTENTS
+            decisions[feature["contract"]] = {"action": candidate if intent_valid else "WAIT", "raw_action": candidate, "confidence": max(0.0, min(100.0, float(item.get("confidence") or 0))), "entry_intent": entry_intent if candidate != "WAIT" else "", "entry_price": float(item.get("entry_price") or feature["last"]) if candidate != "WAIT" and intent_valid else 0.0, "take_profit_price": float(item.get("take_profit_price") or 0) if intent_valid else 0.0, "stop_loss_price": float(item.get("stop_loss_price") or 0) if intent_valid else 0.0, "leverage": settings.leverage, "margin_usdt": accepted_margin, "margin_usd": accepted_margin, "summary_reason": str(item.get("summary_reason") or "LLM decision"), **({"rejection_reason": "AI 未返回合法 entry_intent，已安全转为观望"} if not intent_valid else {})}
         llm_source = "gate-multifactor-llm"
         if model_telemetry:
             model_telemetry.finish("success", response.json(), output_chars=len(content or reasoning))
@@ -1068,10 +1298,23 @@ def run_cycle() -> dict:
         for envelope in decisions_payload.values():
             if envelope["decision"].get("action") != "WAIT":
                 envelope["decision"].update({"action": "WAIT", "entry_price": 0.0, "take_profit_price": 0.0, "stop_loss_price": 0.0, "rejection_reason": f"strategy gate unavailable: {exc}"})
+    breakout_kept_contracts: set[str] = set()
+    breakout_lifecycle: list[dict] = []
+    breakout_stop_cycle = False
+    if execution_enabled and settings.entry_intent_enabled and llm_source == "gate-multifactor-llm" and not private_context["private_errors"]:
+        breakout_kept_contracts, breakout_lifecycle, breakout_stop_cycle = _manage_breakout_plans(
+            client,
+            ExecutionJournal(EXECUTION_JOURNAL),
+            pending_executions,
+            decisions_payload,
+            settings,
+        )
     result: dict = {"trade": {"status": "not_submitted", "reason": f"Gate {settings.environment.title()} automatic execution is disabled" if not execution_enabled else f"No qualifying {settings.environment.title()} signal"}}
     executable = [d for d in decisions_payload.values() if d["decision"].get("action") in {"BUY_LONG", "SELL_SHORT"} and float(d["decision"].get("confidence") or 0) >= risk_profile.min_confidence]
     confirmed_requotes = _confirm_pending_requotes(pending_requotes, decisions_payload, min_confidence=risk_profile.min_confidence, now_ms=now)
-    executable, quote_blocks = _preflight_candidate_quotes(client, executable, pending_requotes, confirmed_requotes, now_ms=now)
+    executable, quote_blocks = _preflight_candidate_quotes(client, executable, pending_requotes, confirmed_requotes, now_ms=now, entry_intent_enabled=settings.entry_intent_enabled)
+    if breakout_kept_contracts:
+        executable = [row for row in executable if str(row.get("instId") or "") not in breakout_kept_contracts]
     if quote_blocks:
         result["trade_candidates_blocked"] = quote_blocks
         if not executable:
@@ -1130,7 +1373,7 @@ def run_cycle() -> dict:
     # recorded but does not consume an entry slot or hide the next valid signal.
     candidate_outcomes: list[dict] = []
     submitted_trades: list[dict] = []
-    if execution_enabled and safety_status["safe_for_new_risk"] and llm_source == "gate-multifactor-llm":
+    if execution_enabled and safety_status["safe_for_new_risk"] and not breakout_stop_cycle and llm_source == "gate-multifactor-llm":
         ordered_candidates = sorted(
             executable,
             key=lambda row: (row["instId"] in confirmed_requotes, float(row["decision"].get("confidence") or 0)),
@@ -1143,8 +1386,8 @@ def run_cycle() -> dict:
         risk_state = {
             "baseline_margin": _account_committed_margin(fresh_account),
             "baseline_notional": _portfolio_position_notional(client, fresh_positions),
-            "reserved_margin": 0.0,
-            "reserved_notional": 0.0,
+            "reserved_margin": sum(float(row.get("estimated_margin_usdt") or 0) for row in pending_executions if str(row.get("status") or "") == "awaiting_trigger" and str(row.get("contract") or "") in breakout_kept_contracts),
+            "reserved_notional": sum(float(row.get("order_notional_usdt") or 0) for row in pending_executions if str(row.get("status") or "") == "awaiting_trigger" and str(row.get("contract") or "") in breakout_kept_contracts),
         }
         def execute_candidate(candidate, sequence):
             return _execute_entry_candidate(
@@ -1160,12 +1403,12 @@ def run_cycle() -> dict:
         for trade_outcome in candidate_outcomes:
             trade_outcome.setdefault("policy_version", policy_snapshot["policy_version"])
             trade_outcome.setdefault("policy_hash", policy_snapshot["policy_hash"])
-    elif execution_enabled and not safety_status["safe_for_new_risk"]:
+    elif execution_enabled and (not safety_status["safe_for_new_risk"] or breakout_stop_cycle):
         candidate_outcomes.append({"status": "blocked_safety_fail_closed",
-                                   "reason": "Gate reconciliation or daily-loss gate blocked new risk",
+                                   "reason": "Gate reconciliation, breakout lifecycle, or daily-loss gate blocked new risk",
                                    "safety_status": safety_status})
 
-    all_outcomes = [*(result.get("trade_candidates_blocked") or []), *candidate_outcomes]
+    all_outcomes = [*(result.get("trade_candidates_blocked") or []), *breakout_lifecycle, *candidate_outcomes]
     if submitted_trades:
         result["trade"] = submitted_trades[0]
     elif candidate_outcomes:

@@ -22,6 +22,16 @@ pytest -q
 
 默认 `GATE_ENVIRONMENT=testnet`。Testnet 使用 `GATE_TESTNET_API_KEY/SECRET`，Live 使用完全独立的 `GATE_LIVE_API_KEY/SECRET`。`GATE_TESTNET_EXECUTE_TRADES` 只控制模拟盘自动执行，绝不能解锁 Live；Live 必须同时满足 `GATE_ENVIRONMENT=live`、`GATE_LIVE_TRADING_ENABLED=true`、完整 Live 凭证以及 `GATE_PUBLIC_MARKET_ENV=live`。Live 环境允许在交易开关关闭时做只读连接检查。`GATE_LEVERAGE` 是执行层唯一杠杆来源，同时进入 AI 约束、保证金/张数计算，并在下单前通过 Gate 原生持仓杠杆接口设置。未配置任一限额时下单会拒绝（fail-closed）。代理仅读取 `GATE_PROXY_URL`。
 
+显式入场意图默认关闭，必须先完成 Gate Testnet 验证后再启用：
+
+```dotenv
+GATE_ENTRY_INTENT_ENABLED=false
+GATE_MAX_ENTRY_SLIPPAGE_PCT=0.003
+GATE_BREAKOUT_EXPIRATION_SECONDS=840
+```
+
+启用后 AI 策略主体不变，只在每个非观望决策中增加 `entry_intent=immediate|retracement|breakout`。滑点和有效期是执行层硬参数，AI 无权覆盖。
+
 `GATE_TESTNET_BASE_URL` 和 `GATE_LIVE_BASE_URL` 可按 Gate 账户集群覆盖，必须是完整的 `/api/v4` 地址。当前默认 Testnet 地址已用本账户验证；Gate 官方 SDK 当前列出的 `fx-api-testnet.gateio.ws` 属于另一集群，切换前必须用同一凭证做只读检测。
 
 ## Linux VPS 部署
@@ -71,13 +81,15 @@ ssh -N -L 28081:127.0.0.1:8081 your-server-alias
 
 系统同一时间只允许一个交易环境生效。切换环境前会只读检查当前环境的持仓和入场挂单；仍有风险时拒绝切换。Web 开启 Live 必须输入 `ENABLE GATE LIVE`，并在保存前使用候选 Live 凭证完成私有账户只读检测。关闭 Live 只阻止新增风险，不自动平仓。Testnet 提供独立的“停止自动交易并平仓”按钮，必须输入 `STOP TESTNET AND FLATTEN`：系统先关闭 Testnet 新增交易，再撤入场挂单、逐合约平仓、重复确认持仓归零，最后只清理由本系统创建的保护单；任何步骤无法确认时保持 Testnet 关闭并返回失败。
 
-AI 的 `entry_price` 使用 Gate 原生 GTC 限价单；只有明确的市价操作才使用 `price=0` 与 `tif=ioc`。下单张数按 `floor(margin_usdt × GATE_LEVERAGE ÷ (entry_price × quanto_multiplier))` 计算，并按 Gate 合约元数据的 `enable_decimal` 与 `order_size_min` 向下对齐。Testnet 的整数合约仍至少 1 张；Live 支持的合约可使用 0.1 等小数张。舍入后会重新计算实际名义价值和保证金，再接受单仓名义价值、总保证金和单笔保证金三重上限校验。
+显式入场意图启用后，`immediate` 使用带滑点上限的 IOC 可成交限价，`retracement` 使用 GTC 回调/反弹限价，`breakout` 使用 Gate 原生 `/price_orders` 上破/下破计划单。意图与买一/卖一关系矛盾时转为观望，不根据价格位置猜测。当前 Gate Testnet 要求原生 `trigger.expiration` 为 86400 秒的整数倍，因此交易所字段固定使用 86400 秒，10 秒对账器按本地 `GATE_BREAKOUT_EXPIRATION_SECONDS=840` 主动撤销并确认，确保计划不跨下一轮 AI。下一轮变为观望或反向信号时同样先确认撤单。
+
+下单张数按 `floor(margin_usdt × GATE_LEVERAGE ÷ (entry_price × quanto_multiplier))` 计算，并按 Gate 合约元数据的 `enable_decimal` 与 `order_size_min` 向下对齐。Gate 官方 `price_orders` 初始张数模型为整数，因此突破计划会再次向下取整，绝不向上放大仓位；取整后不足一张则拒绝。舍入后重新计算实际名义价值和保证金，再接受组合名义价值、总保证金和单笔保证金三重上限校验。
 
 每轮最近 200 条摘要保存在 `data/ai_decision_history.json`，完整追加审计写入 `data/ai_decision_audit.jsonl`。每条记录包含环境、原始/最终动作、拦截原因、交易结果和当轮风险快照，Testnet 与 Live 可明确区分。
 
-入场执行另有 `data/gate_execution.db` 持久化状态机。系统在调用 Gate 下单前先保存客户端订单号、环境、原持仓、计划张数和止盈止损；10 秒对账任务只按已有客户端订单号恢复，绝不根据旧 AI 信号重新提交入场单。保护单按 Gate 返回的实际成交量和真实持仓逐步补齐，顺序固定为先止损、后止盈；部分成交增加时只补覆盖差额。止损无法确认时先撤剩余入场单，再以 `reduce_only` 市价单只减掉本次新增仓位，不会使用整仓平仓误伤加仓前持仓。所有保护覆盖只承认 Gate 明确返回的 `reduce_only/is_reduce_only` 或 `close` 订单。
+入场执行另有 `data/gate_execution.db` 持久化状态机。系统在调用 Gate 下单前先保存客户端订单号、环境、原持仓、计划张数、入场意图、滑点上限和 TP/SL 百分比距离；10 秒对账任务只按已有客户端订单号恢复，绝不根据旧 AI 信号重新提交入场单。突破触发后使用 Gate 返回的 `trade_id` 找到真实订单，以真实平均成交价平移 TP/SL 距离并校验价格几何。保护单按真实成交量和持仓逐步补齐，顺序固定为先止损、后止盈；保护失败只减本次新增仓位，不误伤旧仓。
 
-只要执行台账存在待确认、部分成交或人工复核状态，新增风险安全门就保持关闭。关闭 Live 新增风险开关后，对账器仍可继续确认此前已经提交的订单并执行撤单、补保护或减仓等风险降低操作，但不会补发入场单。
+只要执行台账存在待确认、部分成交、已触发待对账或人工复核状态，新增风险安全门就保持关闭。唯一例外是已确认仍在 Gate 等待触发的 `awaiting_trigger`：它保留风险预算但只占对应合约，不阻止其他合约使用剩余额度。一旦触发状态不明确，立即恢复组合级 fail-closed。
 
 P0/P1 安全层还会记录 Gate 对账、日亏损熔断、挂单生命周期、最长持仓、按合约隔离的止损冷却和进程心跳；某一合约止损后只暂停该合约，组合达到日亏损上限时才暂停全部合约。运行时文件默认被 `.gitignore` 排除，不应提交到公开仓库。
 
@@ -86,10 +98,6 @@ P0/P1 安全层还会记录 Gate 对账、日亏损熔断、挂单生命周期�
 ## P2/P3 策略版本与运行监控
 
 每轮 AI 决策、交易结果和历史记录都绑定 `policy_version` 与 `policy_hash`。版本指纹覆盖提示词、自进化心法、物理拦截器、模型委员会、Gate 风险档位/杠杆/资金上限/生命周期参数和标的池；归档与回滚明确排除 API Key、Secret、代理、`GATE_ENVIRONMENT` 和 Live 开关。
-
-## 未完成 AI 决策巡查
-
-后台决策页会读取 Gateway 的交易任务运行台账，把异常退出、超时或长时间未完成的 `trader` 任务列入“未完成 AI 决策巡查”。页面只显示失败阶段、返回码和错误摘要；处理时先对账和定位原因，不会自动重跑 AI、不自动补单，也不会改变 Live 持仓。
 
 自动复盘默认只写入 `data/evolution_candidates/` 候选，不会直接覆盖当前稳定心法或标的倍率。超级管理员可在“自进化配置”审核应用或拒绝候选。收益快照基于真实平仓台账统计净盈亏、手续费、最大回撤和分标的表现；台账没有资金费或滑点字段时显示“不可用”，不会估算或伪造。
 
@@ -107,8 +115,8 @@ GATE_AUTO_ROLLBACK_MAX_DRAWDOWN_USD=100
 
 ## Gate Testnet 验证
 
-已通过 Gate Testnet 验证：行情、合约元数据、账户余额、持仓、普通挂单、原生保护单、实际成交、过期挂单撤销、最长持仓平仓和 Gate 原生平仓台账均有运行记录；AI worker 已使用原 R20 提示词链生成六合约决策。全新部署仍默认关闭交易（`GATE_TESTNET_EXECUTE_TRADES=false` 和 `GATE_LIVE_TRADING_ENABLED=false`）；Live 必须选择 Live 环境、使用独立 Live 凭证、显式启用开关并通过限额检查。
+已通过 Gate Testnet 验证：行情、合约元数据、账户余额、持仓、普通挂单、原生保护单、实际成交、过期挂单撤销、最长持仓平仓和 Gate 原生平仓台账均有运行记录；AI worker 已使用原 R20 提示词链生成六合约决策。2026-09-17 又完成突破计划单创建、客户端订单号查询、显式撤销、本地 840 秒到期撤销、`trade_id` 对账，以及 BTC 多空最小张数触发成交和真实均价 TP/SL 重算验证。验证结束后账户持仓、普通挂单、计划单和保护单均确认归零。全新部署仍默认关闭所有自动交易和显式入场意图。
 
 ## 当前风险
 
-正常 Testnet 写链路已经在持续运行中完成。下单超时找回、部分成交递增覆盖、保护失败只减新增仓位和重启恢复已加入离线故障注入测试；这些异常分支仍需在不影响现有持仓的受控 Testnet 场景中做最终验证。Gate API 版本、账户持仓模式或合约规则变化后必须重新执行 Testnet 回归。Live 交易从未执行。
+Testnet 正常链已经覆盖突破计划单，但不等于 Live 已验证。当前账户集群实测要求 `trigger.expiration` 为 86400 秒的整数倍，系统通过本地 840 秒主动撤单满足策略生命周期；Gate API 版本、账户持仓模式或合约规则变化后必须重新执行 Testnet 回归。该功能尚未获准用于 Live。

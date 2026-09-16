@@ -7,7 +7,8 @@ from gate_quant.client import GateFuturesClient, AmbiguousOrderError
 from gate_quant.config import GateSettings
 from gate_quant.risk import RiskLimits
 from gate_quant.service import GateTradingService, protection_coverage_status
-from gate_quant.ai_worker import _extract_decision_object, _extract_response_object, _as_instruction_list, _order_size_for_margin, _protection_matches, _execution_enabled, _account_committed_margin, _portfolio_position_notional, _requote_decision, _confirm_pending_requotes, _preflight_candidate_quotes, _run_serial_candidates
+from gate_quant.ai_worker import _extract_decision_object, _extract_response_object, _as_instruction_list, _order_size_for_margin, _protection_matches, _execution_enabled, _account_committed_margin, _portfolio_position_notional, _requote_decision, _confirm_pending_requotes, _preflight_candidate_quotes, _run_serial_candidates, _entry_execution_plan, _breakout_compatible_size, _manage_breakout_plans, _untracked_trigger_entries
+from gate_quant.execution_journal import ExecutionJournal
 from gate_quant.strategy_adapter import validate_decision
 from gate_quant.risk_profiles import get_risk_profile
 from r20_gateway.scheduler import JOBS, GatewayScheduler
@@ -57,6 +58,68 @@ def test_requote_extreme_move_fails_closed():
     updated, meta = _requote_decision({"action": "BUY_LONG", "entry_price": 2500}, 2200)
     assert meta["requote_status"] == "blocked_extreme_deviation"
     assert updated["entry_price"] == 2500
+
+
+@pytest.mark.parametrize(("action", "intent", "entry", "expected_type", "expected_tif"), [
+    ("BUY_LONG", "immediate", 100.05, "immediate", "ioc"),
+    ("BUY_LONG", "retracement", 99, "retracement", "gtc"),
+    ("BUY_LONG", "breakout", 102, "breakout", "ioc"),
+    ("SELL_SHORT", "immediate", 99.95, "immediate", "ioc"),
+    ("SELL_SHORT", "retracement", 101, "retracement", "gtc"),
+    ("SELL_SHORT", "breakout", 98, "breakout", "ioc"),
+])
+def test_explicit_entry_intent_maps_to_gate_order_semantics(action, intent, entry, expected_type, expected_tif):
+    plan = _entry_execution_plan(
+        action=action, entry_intent=intent, entry_price=entry,
+        quote={"highest_bid": "99.9", "lowest_ask": "100.1"},
+        max_slippage_pct=0.003, price_tick="0.1", expiration_seconds=840,
+    )
+    assert plan["valid"] is True
+    assert plan["order_type"] == expected_type
+    assert plan["tif"] == expected_tif
+    if intent == "breakout":
+        assert plan["trigger_rule"] == (1 if action == "BUY_LONG" else 2)
+        assert plan["expiration_seconds"] == 840
+
+
+@pytest.mark.parametrize(("action", "intent", "entry"), [
+    ("BUY_LONG", "retracement", 101),
+    ("BUY_LONG", "breakout", 99),
+    ("SELL_SHORT", "retracement", 99),
+    ("SELL_SHORT", "breakout", 101),
+    ("BUY_LONG", "immediate", 105),
+])
+def test_entry_intent_price_relationship_mismatch_fails_closed(action, intent, entry):
+    plan = _entry_execution_plan(
+        action=action, entry_intent=intent, entry_price=entry,
+        quote={"highest_bid": "99.9", "lowest_ask": "100.1"},
+        max_slippage_pct=0.003, price_tick="0.1", expiration_seconds=840,
+    )
+    assert plan["valid"] is False
+
+
+def test_ioc_tick_rounding_never_crosses_slippage_boundary():
+    long_plan = _entry_execution_plan(
+        action="BUY_LONG", entry_intent="breakout", entry_price=100.01,
+        quote={"highest_bid": "99.9", "lowest_ask": "100"},
+        max_slippage_pct=0.003, price_tick="0.1", expiration_seconds=840,
+    )
+    short_plan = _entry_execution_plan(
+        action="SELL_SHORT", entry_intent="breakout", entry_price=99.99,
+        quote={"highest_bid": "100", "lowest_ask": "100.1"},
+        max_slippage_pct=0.003, price_tick="0.1", expiration_seconds=840,
+    )
+    assert Decimal(long_plan["price"]) <= Decimal("100.01") * Decimal("1.003")
+    assert Decimal(short_plan["price"]) >= Decimal("99.99") * Decimal("0.997")
+    assert Decimal(long_plan["trigger_price"]) > Decimal("100")
+    assert Decimal(short_plan["trigger_price"]) < Decimal("100")
+
+
+def test_breakout_size_never_rounds_fractional_contracts_up():
+    assert _breakout_compatible_size(Decimal("6.9")) == Decimal("6")
+    assert _breakout_compatible_size(Decimal("-6.9")) == Decimal("-6")
+    with pytest.raises(ValueError):
+        _breakout_compatible_size(Decimal("0.9"))
 
 
 def test_deferred_signal_requires_same_direction_next_cycle(monkeypatch, tmp_path):
@@ -539,3 +602,152 @@ def test_market_and_limit_semantics_remain_distinct():
     client.create_order(contract="SOL_USDT", size=0, price="0", tif="ioc", client_id="t-close", reduce_only=True, close=True)
     assert client.calls[0]["price"] != "0" and client.calls[0]["tif"] == "gtc"
     assert client.calls[1]["price"] == "0" and client.calls[1]["tif"] == "ioc"
+
+
+def test_gate_native_breakout_payload_uses_price_order_and_bounded_ioc():
+    class Response:
+        content = b'{"id":123}'
+        def raise_for_status(self): pass
+        def json(self): return {"id": 123}
+    class Session:
+        def __init__(self): self.calls = []; self.proxies = {}
+        def request(self, method, url, **kwargs):
+            self.calls.append((method, url, kwargs))
+            return Response()
+    session = Session()
+    client = GateFuturesClient(settings(), session=session)
+    result = client.create_trigger_entry_order(
+        contract="BTC_USDT", size=2, trigger_price="77250", execution_price="77481.8",
+        rule=1, client_id="t-gate-ai-breakout", expiration=86400,
+    )
+    assert result == {"id": 123}
+    method, url, kwargs = session.calls[0]
+    payload = json.loads(kwargs["data"])
+    assert method == "POST" and url.endswith("/futures/usdt/price_orders")
+    assert payload["initial"] == {"contract": "BTC_USDT", "size": 2, "price": "77481.8", "tif": "ioc", "reduce_only": False, "close": False, "text": "t-gate-ai-breakout"}
+    assert payload["trigger"] == {"price": "77250", "rule": 1, "expiration": 86400, "strategy_type": 0, "price_type": 0}
+
+
+def test_gate_native_breakout_rejects_subday_exchange_expiration():
+    client = GateFuturesClient(settings())
+    with pytest.raises(ValueError, match="86400"):
+        client.create_trigger_entry_order(
+            contract="BTC_USDT", size=1, trigger_price="77250", execution_price="77481.8",
+            rule=1, client_id="t-gate-ai-breakout", expiration=840,
+        )
+
+
+def test_trigger_entries_and_protections_are_classified_separately(monkeypatch):
+    client = GateFuturesClient(settings())
+    rows = [
+        {"id": 1, "initial": {"contract": "BTC_USDT", "size": 2, "text": "t-gate-ai-x", "reduce_only": False}, "trigger": {"rule": 1}},
+        {"id": 2, "initial": {"contract": "BTC_USDT", "size": -2, "text": "t-gate-rsl-x", "reduce_only": True}, "trigger": {"rule": 2}},
+    ]
+    monkeypatch.setattr(client, "price_orders", lambda **kwargs: rows)
+    assert [row["id"] for row in client.trigger_entry_orders("BTC_USDT")] == [1]
+    assert [row["id"] for row in client.protection_orders("BTC_USDT")] == [2]
+
+
+def test_untracked_trigger_entry_is_fail_closed_input_not_a_protection():
+    plans = [
+        {"id": "501", "initial": {"contract": "BTC_USDT", "text": "t-gate-ai-known"}},
+        {"id": "502", "initial": {"contract": "SOL_USDT", "text": "manual-plan"}},
+    ]
+    intents = [{"client_id": "t-gate-ai-known", "order_id": "501", "status": "awaiting_trigger"}]
+    assert _untracked_trigger_entries(plans, intents) == [
+        {"order_id": "502", "client_id": "manual-plan", "contract": "SOL_USDT"}
+    ]
+
+
+def test_breakout_timeout_reconciles_by_client_id_without_resubmit():
+    class Client:
+        create_calls = 0
+        find_calls = 0
+        def create_trigger_entry_order(self, **kwargs):
+            self.create_calls += 1
+            raise AmbiguousOrderError("timeout")
+        def find_trigger_entry_by_client_id(self, client_id, contract):
+            self.find_calls += 1
+            return {"id": "501", "status": "open", "initial": {"text": client_id, "contract": contract}}
+    client = Client()
+    service = GateTradingService(client, RiskLimits(1000, 1000, 1000))
+    result = service.place_trigger_entry(
+        contract="BTC_USDT", size=2, trigger_price="101", execution_price="101.3",
+        rule=1, client_id="t-gate-ai-timeout", expiration=840,
+        risk={"order_margin_usd": 10, "current_margin_usd": 0, "current_position_notional_usd": 0,
+              "order_notional_usd": 20, "environment": "testnet", "live_enabled": False},
+    )
+    assert result["reconciled"] is True
+    assert client.create_calls == 1
+    assert client.find_calls == 1
+
+
+def test_next_ai_wait_cancels_untriggered_breakout_plan(tmp_path):
+    journal = ExecutionJournal(tmp_path / "execution.db")
+    intent = journal.prepare({
+        "client_id": "t-gate-ai-plan", "environment": "testnet", "contract": "BTC_USDT",
+        "requested_size": "2", "baseline_position_size": "0", "entry_price": "101",
+        "take_profit_price": "110", "stop_loss_price": "95", "order_type": "breakout",
+        "entry_action": "BUY_LONG", "order_notional_usdt": "20", "estimated_margin_usdt": "10",
+        "created_at_ms": 1000,
+    })
+    intent = journal.update(intent["client_id"], "awaiting_trigger", order_id="501", order_status="waiting_trigger")
+    class Client:
+        cancelled = False
+        def price_order(self, order_id):
+            return {"id": order_id, "status": "open", "initial": {"contract": "BTC_USDT", "text": "t-gate-ai-plan"}}
+        def cancel_trigger_entry_order(self, order_id):
+            self.cancelled = True
+            return {"id": order_id, "status": "finished"}
+        def trigger_entry_orders(self, contract, status="open"):
+            return [] if self.cancelled else [{"id": "501", "status": "open"}]
+    client = Client()
+    kept, outcomes, stop = _manage_breakout_plans(
+        client, journal, [intent], {"BTC_USDT": {"decision": {"action": "WAIT", "entry_intent": ""}}}, settings()
+    )
+    assert kept == set() and stop is False
+    assert outcomes[0]["status"] == "breakout_cancelled_by_new_signal"
+    assert journal.get(intent["client_id"])["status"] == "trigger_cancelled"
+
+
+def test_same_breakout_plan_is_kept_without_blocking_other_contracts(tmp_path):
+    journal = ExecutionJournal(tmp_path / "execution.db")
+    intent = journal.prepare({
+        "client_id": "t-gate-ai-plan", "environment": "testnet", "contract": "BTC_USDT",
+        "requested_size": "2", "baseline_position_size": "0", "entry_price": "101",
+        "take_profit_price": "110", "stop_loss_price": "95", "order_type": "breakout",
+        "entry_action": "BUY_LONG", "order_notional_usdt": "20", "estimated_margin_usdt": "10",
+        "created_at_ms": 1000,
+    })
+    intent = journal.update(intent["client_id"], "awaiting_trigger", order_id="501", order_status="waiting_trigger")
+    kept, outcomes, stop = _manage_breakout_plans(
+        object(), journal, [intent],
+        {"BTC_USDT": {"decision": {"action": "BUY_LONG", "entry_intent": "breakout"}},
+         "SOL_USDT": {"decision": {"action": "BUY_LONG", "entry_intent": "retracement"}}},
+        settings(),
+    )
+    assert kept == {"BTC_USDT"} and stop is False
+    assert outcomes[0]["status"] == "existing_breakout_plan_kept"
+    assert "SOL_USDT" not in kept
+
+
+def test_trigger_cancel_timeout_is_reconciled_by_fresh_open_query():
+    class Client:
+        def cancel_trigger_entry_order(self, order_id):
+            raise RuntimeError("request timed out")
+        def trigger_entry_orders(self, contract, status="open"):
+            return []
+    service = GateTradingService(Client(), RiskLimits(1000, 1000, 1000))
+    result = service.cancel_trigger_entry_confirmed(contract="BTC_USDT", order_id="501")
+    assert result == {"cancelled": True, "order_id": "501", "reconciled_after_error": True}
+
+
+def test_protection_cancel_timeout_is_reconciled_before_rollback_continues():
+    class Client:
+        def cancel_protection_order(self, order_id):
+            raise RuntimeError("request timed out")
+        def protection_orders(self, contract=None):
+            return []
+    service = GateTradingService(Client(), RiskLimits(1000, 1000, 1000))
+    result = service.cancel_protection_confirmed(order_id="701")
+    assert result == {"cancelled": True, "order_id": "701", "reconciled_after_error": True}

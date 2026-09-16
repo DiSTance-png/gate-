@@ -6,10 +6,11 @@ const store = useDashboardStore()
 
 function lifecycleState(order: any) {
   const left = Number(order.expires_in_seconds)
-  if (!Number.isFinite(left)) return { label: '挂单中', color: 'var(--color-brand)' }
+  const waiting = order.order_kind === 'breakout' ? '等待突破' : '挂单中'
+  if (!Number.isFinite(left)) return { label: waiting, color: 'var(--color-brand)' }
   if (left <= 0) return { label: '等待撤单', color: 'var(--color-down)' }
   if (left <= 300) return { label: '即将过期', color: '#f59e0b' }
-  return { label: '正常等待', color: 'var(--color-up)' }
+  return { label: order.order_kind === 'breakout' ? '等待突破' : '正常等待', color: 'var(--color-up)' }
 }
 
 function elapsed(seconds: any) {
@@ -38,7 +39,7 @@ function elapsed(seconds: any) {
           <Clock class="w-3.5 h-3.5" />
         </div>
         <h2 class="text-xs sm:text-sm font-black font-mono uppercase tracking-wider" style="color: var(--text-main);">
-          在途限价挂单监控 (Maker Orders)
+          在途入场委托监控
         </h2>
         <span
           class="px-2 py-0.5 rounded text-xs font-mono font-bold border"
@@ -48,7 +49,7 @@ function elapsed(seconds: any) {
         </span>
       </div>
       <span class="text-xs font-mono hidden sm:inline" style="color: var(--text-faint);">
-        被动撮合成交 · 享受交易所负手续费 Rebate
+        普通限价单与突破计划单分开标识
       </span>
     </div>
 
@@ -58,7 +59,7 @@ function elapsed(seconds: any) {
       class="py-3 px-4 text-center rounded-lg border border-dashed text-xs font-mono"
       style="background-color: var(--bg-card-subtle); border-color: var(--border-subtle); color: var(--text-muted);"
     >
-      当前无在途限价挂单 · 挂单池就绪 (AI 决策周期动态报单与智能重挂)
+      当前无在途限价单或突破计划单
     </div>
 
     <!-- Table -->
@@ -72,7 +73,8 @@ function elapsed(seconds: any) {
             <th class="py-2.5 px-3.5 font-bold">订单号</th>
             <th class="py-2.5 px-3.5 font-bold">标的</th>
             <th class="py-2.5 px-3.5 font-bold">操作类型</th>
-            <th class="py-2.5 px-3.5 font-bold">挂单限价</th>
+            <th class="py-2.5 px-3.5 font-bold">委托类型</th>
+            <th class="py-2.5 px-3.5 font-bold">触发/限价</th>
             <th class="py-2.5 px-3.5 font-bold">委托数量</th>
             <th class="py-2.5 px-3.5 font-bold">挂单时间</th>
             <th class="py-2.5 px-3.5 font-bold">生命周期</th>
@@ -104,8 +106,14 @@ function elapsed(seconds: any) {
                 <span>{{ (ord.side_raw === 'buy' || ord.side === 'buy' || String(ord.side).includes('多')) ? '买入开多' : '卖出开空' }}</span>
               </span>
             </td>
+            <td class="py-2.5 px-3.5">
+              <span class="px-2 py-0.5 rounded text-[11px] font-bold border" style="border-color: var(--border-subtle); color: var(--color-brand);">
+                {{ ord.order_kind === 'breakout' ? '突破计划' : '回调限价' }}
+              </span>
+            </td>
             <td class="py-2.5 px-3.5 font-mono font-black num-tabular text-sm" style="color: var(--text-main);">
-              ${{ ord.px }}
+              <template v-if="ord.order_kind === 'breakout'">触发 ${{ ord.triggerPx }} · 成交上限/下限 ${{ ord.px }}</template>
+              <template v-else>${{ ord.px }}</template>
             </td>
             <td class="py-2.5 px-3.5 font-bold num-tabular" style="color: var(--text-main);">
               {{ ord.sz }} 张

@@ -42,6 +42,10 @@ export interface PendingOrderItem {
   sz: string
   state: string
   cTime: string
+  order_kind?: 'limit' | 'breakout'
+  triggerPx?: string
+  age_seconds?: number
+  expires_in_seconds?: number
   tpTriggerPx?: string
   slTriggerPx?: string
 }
@@ -124,6 +128,7 @@ export interface DashboardResponse {
     items: PositionItem[]
   }
   pending_orders: PendingOrderItem[]
+  trigger_entry_orders?: any[]
   protection_orders_normalized?: ProtectionOrderItem[]
   factors: InstrumentFactor[]
   macro_assessment?: string

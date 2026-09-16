@@ -30,4 +30,5 @@ data/gate_safety_status.json
 data/gate_trader_heartbeat.json
 data/gate_execution_reconciler.json
 data/protection_intents.json
+data/pending_requotes.json
 backups/

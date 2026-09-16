@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
@@ -84,6 +84,26 @@ def _lookup_entry(client: GateFuturesClient, intent: dict[str, Any]) -> dict[str
     return _order_payload(found) if found else None
 
 
+def _lookup_trigger_entry(client: GateFuturesClient, intent: dict[str, Any]) -> dict[str, Any] | None:
+    order_id = str(intent.get("order_id") or "")
+    if order_id:
+        try:
+            value = client.price_order(order_id)
+            if isinstance(value, dict):
+                return value
+        except RuntimeError:
+            pass
+    found = client.find_trigger_entry_by_client_id(str(intent["client_id"]), str(intent["contract"]))
+    return found if isinstance(found, dict) else None
+
+
+def _rounded_decimal(value: Decimal, tick: Any) -> Decimal:
+    quantum = _decimal(tick)
+    if quantum <= 0:
+        return value
+    return (value / quantum).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * quantum
+
+
 def _cancel_remainder(service: GateTradingService, intent: dict[str, Any], order: dict[str, Any]) -> dict[str, Any] | None:
     if not _order_open(order):
         return None
@@ -132,7 +152,49 @@ def _reconcile_intent_unlocked(
     if str(intent.get("environment") or "").lower() != settings.environment:
         return journal.update(client_id, "manual_review", last_error="execution environment changed")
 
-    order = _lookup_entry(client, intent)
+    if str(intent.get("order_type") or "") == "breakout":
+        trigger_order = _lookup_trigger_entry(client, intent)
+        if not trigger_order:
+            age_ms = now_ms - int(intent.get("created_at_ms") or now_ms)
+            if age_ms >= 60_000:
+                return journal.update(client_id, "manual_review", last_error="Gate breakout order is not visible; it was not retried")
+            return journal.update(client_id, "awaiting_trigger", last_error="Gate breakout order is not visible yet")
+        trigger_id = str(trigger_order.get("id_string") or trigger_order.get("id") or intent.get("order_id") or "")
+        trigger_status = str(trigger_order.get("status") or "unknown").lower()
+        finish_as = str(trigger_order.get("finish_as") or "").lower()
+        if trigger_status == "open":
+            age_ms = now_ms - int(intent.get("created_at_ms") or now_ms)
+            local_expiration_ms = int(_decimal(intent.get("expiration_seconds")) or settings.breakout_expiration_seconds) * 1000
+            if age_ms >= local_expiration_ms:
+                service = GateTradingService(
+                    client,
+                    RiskLimits(settings.max_position_notional_usd, settings.max_total_margin_usd, settings.max_order_margin_usd),
+                )
+                cancelled = service.cancel_trigger_entry_confirmed(contract=contract, order_id=trigger_id)
+                return journal.update(client_id, "trigger_expired", order_id=trigger_id,
+                                      order_status="locally_expired_cancelled", last_error="") | {"cancel": cancelled}
+            return journal.update(client_id, "awaiting_trigger", order_id=trigger_id,
+                                  order_status="waiting_trigger", last_error="")
+        trade_id = str(trigger_order.get("trade_id") or "")
+        if finish_as != "succeeded" or not trade_id:
+            terminal = {
+                "expired": "trigger_expired",
+                "cancelled": "trigger_cancelled",
+                "failed": "trigger_failed",
+            }.get(finish_as)
+            if terminal:
+                return journal.update(client_id, terminal, order_id=trigger_id,
+                                      order_status=finish_as, last_error=str(trigger_order.get("reason") or ""))
+            return journal.update(client_id, "triggered_order_pending", order_id=trigger_id,
+                                  order_status=finish_as or trigger_status,
+                                  last_error="Gate breakout trigger finished without a visible child trade id")
+        try:
+            order = _order_payload(client.order(trade_id, contract))
+        except RuntimeError as exc:
+            return journal.update(client_id, "triggered_order_pending", order_id=trigger_id,
+                                  order_status="triggered", last_error=f"triggered Gate entry is not visible yet: {exc}")
+    else:
+        order = _lookup_entry(client, intent)
     if not order:
         age_ms = now_ms - int(intent.get("created_at_ms") or now_ms)
         if str(intent.get("status")) == "prepared" and age_ms >= 60_000:
@@ -179,16 +241,42 @@ def _reconcile_intent_unlocked(
     mark_price = _decimal(position.get("mark_price"))
     stop_price = _decimal(intent["stop_loss_price"])
     take_profit_price = _decimal(intent["take_profit_price"])
-    valid_geometry = (
-        mark_price > 0
-        and stop_price > 0
-        and take_profit_price > 0
-        and ((position_size > 0 and stop_price < mark_price < take_profit_price)
-             or (position_size < 0 and take_profit_price < mark_price < stop_price))
-    )
+    fill_price = _decimal(order.get("fill_price") or order.get("avg_deal_price"))
+    if fill_price <= 0:
+        fill_price = _decimal(position.get("entry_price"))
+    tp_distance = _decimal(intent.get("take_profit_distance_pct"))
+    sl_distance = _decimal(intent.get("stop_loss_distance_pct"))
+    if fill_price > 0 and tp_distance and sl_distance:
+        take_profit_price = _rounded_decimal(fill_price * (Decimal("1") + tp_distance), intent.get("price_tick"))
+        stop_price = _rounded_decimal(fill_price * (Decimal("1") + sl_distance), intent.get("price_tick"))
+        intent = journal.update(
+            client_id,
+            entry_price=str(fill_price),
+            fill_price=str(fill_price),
+            take_profit_price=str(take_profit_price),
+            stop_loss_price=str(stop_price),
+            **base_update,
+        )
+        base_update["fill_price"] = str(fill_price)
+    if tp_distance and sl_distance:
+        valid_geometry = (
+            mark_price > 0 and fill_price > 0 and stop_price > 0 and take_profit_price > 0
+            and ((position_size > 0 and stop_price < min(mark_price, fill_price) and take_profit_price > max(mark_price, fill_price))
+                 or (position_size < 0 and take_profit_price < min(mark_price, fill_price) and stop_price > max(mark_price, fill_price)))
+        )
+    else:
+        # Backward-compatible recovery for intents created before fill-relative
+        # distances were introduced. New intents always take the strict branch.
+        valid_geometry = (
+            mark_price > 0 and stop_price > 0 and take_profit_price > 0
+            and ((position_size > 0 and stop_price < mark_price < take_profit_price)
+                 or (position_size < 0 and take_profit_price < mark_price < stop_price))
+        )
     if not valid_geometry:
         _cancel_remainder(service, intent, order)
-        reduce_size = close_sign * min(filled, abs(position_size))
+        reduce_size = close_sign * min(filled, abs(signed_delta))
+        if reduce_size == 0:
+            return journal.update(client_id, "flattened_invalid_protection", last_error="saved protection geometry is no longer valid; new fill was already absent", **base_update)
         flattened = service.reduce_position_safely(
             contract=contract,
             size=reduce_size,
@@ -222,12 +310,13 @@ def _reconcile_intent_unlocked(
             except Exception as cleanup_exc:
                 cleanup["cancel_entry_error"] = str(cleanup_exc)
             try:
-                reduce_size = close_sign * min(filled, abs(position_size))
-                cleanup["reduce_fill"] = service.reduce_position_safely(
-                    contract=contract,
-                    size=reduce_size,
-                    client_id=f"t-gate-rclose-{hashlib.sha256(client_id.encode()).hexdigest()[:8]}",
-                )
+                reduce_size = close_sign * min(filled, abs(signed_delta))
+                if reduce_size:
+                    cleanup["reduce_fill"] = service.reduce_position_safely(
+                        contract=contract,
+                        size=reduce_size,
+                        client_id=f"t-gate-rclose-{hashlib.sha256(client_id.encode()).hexdigest()[:8]}",
+                    )
             except Exception as cleanup_exc:
                 cleanup["reduce_fill_error"] = str(cleanup_exc)
             updated = journal.update(client_id, "stop_failed_flatten_attempted", last_error=str(exc), **base_update)
@@ -255,7 +344,41 @@ def _reconcile_intent_unlocked(
                 raise RuntimeError("Gate take-profit creation was not confirmed")
             intent = journal.update(client_id, take_profit_revision=revision + 1)
         except Exception as exc:
-            return journal.update(client_id, "stop_protected_tp_pending", last_error=str(exc), **base_update)
+            cleanup: dict[str, Any] = {}
+            try:
+                cleanup["cancel_entry"] = _cancel_remainder(service, intent, order)
+            except Exception as cleanup_exc:
+                cleanup["cancel_entry_error"] = str(cleanup_exc)
+            stop_revision = int(intent.get("stop_revision") or 0)
+            stop_client_id = _protection_id(intent, "stop_loss", max(0, stop_revision - 1))
+            try:
+                created_stop = client.find_protection_by_client_id(stop_client_id, contract)
+                if created_stop:
+                    stop_order_id = str(created_stop.get("id_string") or created_stop.get("id") or "")
+                    if not stop_order_id:
+                        raise RuntimeError("new stop-loss has no Gate order id")
+                    cleanup["cancel_new_stop"] = service.cancel_protection_confirmed(order_id=stop_order_id)
+            except Exception as cleanup_exc:
+                cleanup["cancel_new_stop_error"] = str(cleanup_exc)
+                updated = journal.update(
+                    client_id,
+                    "stop_protected_tp_pending",
+                    last_error=f"take-profit failed and new stop cancellation is unconfirmed: {exc}; {cleanup_exc}",
+                    **base_update,
+                )
+                return {**updated, "cleanup": cleanup}
+            try:
+                reduce_size = close_sign * min(filled, abs(signed_delta))
+                if reduce_size:
+                    cleanup["reduce_fill"] = service.reduce_position_safely(
+                        contract=contract,
+                        size=reduce_size,
+                        client_id=f"t-gate-rclose-{hashlib.sha256(client_id.encode()).hexdigest()[:8]}",
+                    )
+            except Exception as cleanup_exc:
+                cleanup["reduce_fill_error"] = str(cleanup_exc)
+            updated = journal.update(client_id, "take_profit_failed_flatten_attempted", last_error=str(exc), **base_update)
+            return {**updated, "cleanup": cleanup}
 
     protections = client.protection_orders(contract) or []
     coverage = protection_coverage_status(protections, position_size)

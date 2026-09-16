@@ -8,6 +8,8 @@ import requests
 
 from .config import GateSettings
 from .exchange_write_lock import gate_write_lock
+
+PRICE_ORDER_EXPIRATION_QUANTUM_SECONDS = 86400
 from .signing import gate_signature
 
 
@@ -113,6 +115,40 @@ class GateFuturesClient:
                 return row
         return None
     @staticmethod
+    def _is_protection_price_order(row: dict) -> bool:
+        initial = row.get("initial") or {}
+        order_type = str(row.get("order_type") or "").lower()
+        return bool(
+            initial.get("reduce_only") or initial.get("is_reduce_only")
+            or initial.get("close") or initial.get("is_close")
+            or initial.get("auto_size")
+            or order_type.startswith(("close-", "plan-close-"))
+        )
+
+    def price_orders(self, *, status: str = "open", contract: str | None = None):
+        if status not in {"open", "finished"}:
+            raise ValueError("Gate price-order status must be open or finished")
+        return self._request(
+            "GET",
+            f"/futures/{self.settings.settle}/price_orders",
+            params={"status": status, **({"contract": contract} if contract else {})},
+            private=True,
+        )
+
+    def price_order(self, order_id: str):
+        return self._request("GET", f"/futures/{self.settings.settle}/price_orders/{order_id}", private=True)
+
+    def trigger_entry_orders(self, contract: str | None = None, *, status: str = "open"):
+        rows = self.price_orders(status=status, contract=contract) or []
+        return [row for row in rows if isinstance(row, dict) and not self._is_protection_price_order(row)]
+
+    def find_trigger_entry_by_client_id(self, client_id: str, contract: str):
+        for status in ("open", "finished"):
+            for row in self.trigger_entry_orders(contract, status=status):
+                if str((row.get("initial") or {}).get("text") or "") == client_id:
+                    return row
+        return None
+    @staticmethod
     def _api_size(size: int | float | Decimal) -> int | float:
         value = Decimal(str(size))
         return int(value) if value == value.to_integral_value() else float(value)
@@ -156,5 +192,44 @@ class GateFuturesClient:
             if found:
                 return {"reconciled": True, "order": found}
             raise
-    def protection_orders(self, contract: str | None = None): return self._request("GET", f"/futures/{self.settings.settle}/price_orders", params={"status": "open", **({"contract": contract} if contract else {})}, private=True)
+    def create_trigger_entry_order(self, *, contract: str, size: int | float | Decimal,
+                                   trigger_price: str, execution_price: str, rule: int,
+                                   client_id: str, expiration: int):
+        requested_size = Decimal(str(size))
+        if requested_size == 0 or requested_size != requested_size.to_integral_value():
+            raise ValueError("Gate Futures price-triggered entry size must be a non-zero integer contract count")
+        if rule not in {1, 2}:
+            raise ValueError("Gate trigger rule must be 1 (>=) or 2 (<=)")
+        if int(expiration) < PRICE_ORDER_EXPIRATION_QUANTUM_SECONDS or int(expiration) % PRICE_ORDER_EXPIRATION_QUANTUM_SECONDS:
+            raise ValueError("Gate Futures trigger expiration must be a whole number of days (86400 seconds)")
+        payload = {
+            "initial": {
+                "contract": contract,
+                "size": self._api_size(requested_size),
+                "price": execution_price,
+                "tif": "ioc",
+                "reduce_only": False,
+                "close": False,
+                "text": client_id,
+            },
+            "trigger": {
+                "price": trigger_price,
+                "rule": rule,
+                "expiration": int(expiration),
+                "strategy_type": 0,
+                "price_type": 0,
+            },
+        }
+        try:
+            return self._request("POST", f"/futures/{self.settings.settle}/price_orders", payload=payload, private=True)
+        except AmbiguousOrderError:
+            found = self.find_trigger_entry_by_client_id(client_id, contract)
+            if found:
+                return {"reconciled": True, "order": found}
+            raise
+
+    def protection_orders(self, contract: str | None = None):
+        rows = self.price_orders(status="open", contract=contract) or []
+        return [row for row in rows if isinstance(row, dict) and self._is_protection_price_order(row)]
     def cancel_protection_order(self, order_id: str): return self._request("DELETE", f"/futures/{self.settings.settle}/price_orders/{order_id}", private=True)
+    def cancel_trigger_entry_order(self, order_id: str): return self._request("DELETE", f"/futures/{self.settings.settle}/price_orders/{order_id}", private=True)

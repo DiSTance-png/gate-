@@ -47,6 +47,13 @@ TRADE_STATUS_LABELS = {
     "blocked_risk_limit": "超过风险限额，未下单",
     "blocked_opposite_position": "与现有持仓方向冲突",
     "blocked_cycle_entry_limit": "达到单轮开仓上限，本轮未提交",
+    "blocked_entry_intent_mismatch": "入场意图与盘口矛盾，未下单",
+    "blocked_invalid_trigger_size": "突破计划张数无效，未下单",
+    "blocked_invalid_protection_geometry": "止盈止损方向无效，未下单",
+    "existing_breakout_plan_kept": "保留现有突破计划单",
+    "breakout_cancelled_by_new_signal": "新信号已撤销突破计划单",
+    "breakout_triggered_reconciliation_pending": "突破已触发，等待成交保护对账",
+    "breakout_cancel_ambiguous": "突破计划撤单状态不明，安全暂停",
 }
 from .protection_lifecycle import is_system_protection
 from .store import EventStore
@@ -76,7 +83,8 @@ def _safety_status() -> dict[str, Any]:
     payload = _read_json_file("gate_safety_status.json", {"safe_for_new_risk": False, "reason": "no safety check recorded"})
     try:
         environment = load_settings().environment
-        active = ExecutionJournal(EXECUTION_JOURNAL).active(environment)
+        active = [row for row in ExecutionJournal(EXECUTION_JOURNAL).active(environment)
+                  if str(row.get("status") or "") != "awaiting_trigger"]
     except Exception as exc:
         return {**payload, "safe_for_new_risk": False, "execution_journal_error": str(exc)}
     if not active:
@@ -285,6 +293,9 @@ class GateAdminConfig(BaseModel):
     max_position_notional_usd: float = Field(gt=0)
     max_total_margin_usd: float = Field(gt=0)
     max_order_margin_usd: float = Field(gt=0)
+    entry_intent_enabled: bool = False
+    max_entry_slippage_pct: float = Field(default=0.003, ge=0, le=0.02)
+    breakout_expiration_seconds: int = Field(default=840, ge=60, le=900)
 
 
 class GateOrderRequest(BaseModel):
@@ -381,9 +392,12 @@ def _environment_risk_present(environment: str) -> bool:
         c = GateFuturesClient(target)
         positions = c.positions() or []
         orders = c.open_orders() or []
+        trigger_entries = c.trigger_entry_orders() or []
         rows = positions if isinstance(positions, list) else [positions]
-        return any(float(row.get("size") or 0) != 0 for row in rows if isinstance(row, dict)) or any(
-            not bool(row.get("reduce_only")) and not bool(row.get("close")) for row in (orders if isinstance(orders, list) else []) if isinstance(row, dict)
+        return (
+            any(float(row.get("size") or 0) != 0 for row in rows if isinstance(row, dict))
+            or any(not bool(row.get("reduce_only") or row.get("is_reduce_only")) and not bool(row.get("close") or row.get("is_close")) for row in (orders if isinstance(orders, list) else []) if isinstance(row, dict))
+            or bool(trigger_entries)
         )
     except Exception as exc:
         raise RuntimeError(f"无法确认 Gate {environment.upper()} 是否还有仓位或入场挂单：{exc}") from exc
@@ -491,9 +505,10 @@ def dashboard():
     account, account_error = safe_private(c.account, {})
     positions, position_error = safe_private(c.positions, [])
     orders, order_error = safe_private(c.open_orders, [])
+    trigger_entries, trigger_error = safe_private(c.trigger_entry_orders, [])
     protections, protection_error = safe_private(c.protection_orders, [])
-    errors = [e for e in (account_error, position_error, order_error, protection_error) if e]
-    return {"account": account, "positions": positions, "orders": orders, "protections": protections, "private_available": not errors, "errors": sorted(set(errors)), "events": store.recent()}
+    errors = [e for e in (account_error, position_error, order_error, trigger_error, protection_error) if e]
+    return {"account": account, "positions": positions, "orders": orders, "trigger_entries": trigger_entries, "protections": protections, "private_available": not errors, "errors": sorted(set(errors)), "events": store.recent()}
 
 
 @app.get("/api/all")
@@ -504,16 +519,17 @@ def all_dashboard():
     # Keep slow or unavailable Gate endpoints from serially blocking the whole
     # dashboard. Each worker owns its client/session because requests.Session
     # is not guaranteed to be thread-safe.
-    private_clients = [GateFuturesClient(s) for _ in range(5)]
-    with ThreadPoolExecutor(max_workers=6, thread_name_prefix="gate-dashboard") as executor:
+    private_clients = [GateFuturesClient(s) for _ in range(6)]
+    with ThreadPoolExecutor(max_workers=7, thread_name_prefix="gate-dashboard") as executor:
         ticker_future = executor.submit(market_client().tickers)
         account_future = executor.submit(safe_private, private_clients[0].account, {})
         positions_future = executor.submit(safe_private, private_clients[1].positions, [])
         orders_future = executor.submit(safe_private, private_clients[2].open_orders, [])
-        protections_future = executor.submit(safe_private, private_clients[3].protection_orders, [])
+        trigger_entries_future = executor.submit(safe_private, private_clients[3].trigger_entry_orders, [])
+        protections_future = executor.submit(safe_private, private_clients[4].protection_orders, [])
         account_book_future = executor.submit(
             safe_private,
-            lambda: private_clients[4].account_book(from_time=now - 172800, to_time=now, limit=1000),
+            lambda: private_clients[5].account_book(from_time=now - 172800, to_time=now, limit=1000),
             [],
         )
         try:
@@ -524,6 +540,7 @@ def all_dashboard():
         account, account_error = account_future.result()
         positions_raw, position_error = positions_future.result()
         orders_raw, order_error = orders_future.result()
+        trigger_entries_raw, trigger_error = trigger_entries_future.result()
         protections_raw, protection_error = protections_future.result()
         account_book, account_book_error = account_book_future.result()
     positions = []
@@ -552,7 +569,15 @@ def all_dashboard():
     pending = []
     for o in orders_raw or []:
         age = order_age_seconds(o)
-        pending.append({"ordId": str(o.get("id")), "instId": o.get("contract"), "name": o.get("contract"), "side": "buy" if float(o.get("size") or 0) > 0 else "sell", "posSide": "long" if float(o.get("size") or 0) > 0 else "short", "px": str(o.get("price") or "0"), "sz": str(abs(float(o.get("size") or 0))), "state": o.get("status", "open"), "cTime": str(o.get("create_time_ms") or o.get("create_time") or ""), "text": o.get("text", ""), "age_seconds": int(age) if age is not None else None, "expires_in_seconds": max(0, s.max_pending_order_age_seconds - int(age)) if age is not None else None})
+        created_ms = int(float(o.get("create_time_ms") or 0)) or int(float(o.get("create_time") or 0) * 1000)
+        pending.append({"ordId": str(o.get("id")), "instId": o.get("contract"), "name": o.get("contract"), "side": "buy" if float(o.get("size") or 0) > 0 else "sell", "posSide": "long" if float(o.get("size") or 0) > 0 else "short", "px": str(o.get("price") or "0"), "sz": str(abs(float(o.get("size") or 0))), "state": o.get("status", "open"), "cTime": str(created_ms), "text": o.get("text", ""), "order_kind": "limit", "age_seconds": int(age) if age is not None else None, "expires_in_seconds": max(0, s.max_pending_order_age_seconds - int(age)) if age is not None else None})
+    for o in trigger_entries_raw or []:
+        initial = o.get("initial") or {}
+        trigger = o.get("trigger") or {}
+        created = float(o.get("create_time") or 0)
+        age = max(0, int(time.time() - created)) if created else None
+        expiration = int(trigger.get("expiration") or s.breakout_expiration_seconds)
+        pending.append({"ordId": str(o.get("id_string") or o.get("id") or ""), "instId": initial.get("contract"), "name": initial.get("contract"), "side": "buy" if float(initial.get("size") or 0) > 0 else "sell", "posSide": "long" if float(initial.get("size") or 0) > 0 else "short", "px": str(initial.get("price") or "0"), "triggerPx": str(trigger.get("price") or "0"), "sz": str(abs(float(initial.get("size") or 0))), "state": "waiting_trigger", "cTime": str(int(created * 1000)) if created else "", "text": initial.get("text", ""), "order_kind": "breakout", "age_seconds": age, "expires_in_seconds": max(0, expiration - age) if age is not None else None})
     dashboard_contracts = {"BTC_USDT", "ETH_USDT", "SOL_USDT", "DOGE_USDT", "SUI_USDT", "XRP_USDT"}
     account["initial_capital"] = s.initial_capital_usd or None
     factor_snapshot = _read_json_file("factor_library_snapshot.json", {})
@@ -574,7 +599,7 @@ def all_dashboard():
         decision = envelope.get("decision", {}) if isinstance(envelope, dict) else {}
         calculus = snapshot.get("calculus", {}) if isinstance(snapshot, dict) else {}
         factors.append({"instId": contract_name, "name": contract_name, "type": "Gate Futures", "price": float(t.get("last") or 0), "chg24h": float(t.get("change_percentage") or 0), "high24h": float(t.get("high_24h") or 0), "low24h": float(t.get("low_24h") or 0), "vol24h": float(t.get("volume_24h_quote") or 0), "atr1h": snapshot.get("atr1h") or snapshot.get("atr_1h") or snapshot.get("atr"), "c_1h_ret": snapshot.get("c_1h_ret"), "trend_direction": snapshot.get("structure_1h", "NEUTRAL"), "adx_1h": snapshot.get("adx_1h"), "smart_money": snapshot.get("smart_money", {}), "calculus": {"velocity_1h": calculus.get("velocity"), "accel_1h": calculus.get("acceleration"), "jerk_1h": calculus.get("max_abs_jerk"), "impulse_1h": calculus.get("impulse"), "energy_1h": (calculus.get("definite_integrals") or {}).get("energy_integral"), "action_area_1h": (calculus.get("definite_integrals") or {}).get("deviation_area_integral"), "state_1h": calculus.get("regime")}, "decision": decision})
-    errors = [e for e in (account_error, position_error, order_error, protection_error, account_book_error) if e]
+    errors = [e for e in (account_error, position_error, order_error, trigger_error, protection_error, account_book_error) if e]
     book_stats = _account_book_stats(account_book)
     history_view = []
     for row in reversed(decision_history[-200:]):
@@ -592,7 +617,7 @@ def all_dashboard():
         reverse=True,
     )
     normalized_protections = _dashboard_protection_orders(protections_raw or [], positions_raw or [])
-    return {"timestamp": str(int(time.time() * 1000)), "is_stale": bool(errors), "account": {"total_eq": float(account.get("total") or 0), "avail_eq": float(account.get("available") or 0), "upl": float(account.get("unrealised_pnl") or 0), "currency": s.settle.upper(), "margin_usage_pct": 0, "initial_capital": s.initial_capital_usd or None}, "positions_summary": {"total_count": len(positions), "long_count": sum(p["side"] == "long" for p in positions), "short_count": sum(p["side"] == "short" for p in positions), "items": positions}, "pending_orders": pending, "factors": factors, "factor_library": factor_snapshot, "macro_assessment": "Gate Futures 原生行情、因子与账户数据巡检中", "llm_runtime": {"model": os.getenv("LLM_MODEL", "Gate AI Worker"), "provider_name": "Gate-native", "reasoning_effort": os.getenv("LLM_REASONING_EFFORT", "high"), "api_format": "openai_chat"}, "logs": [f"Gate {s.environment.upper()} · {profile.label} · {s.leverage:g}x · 私有数据{'可用' if not errors else '未配置或不可用'}"], "trades": ledger_rows, "today_stats": book_stats, "news_intelligence": [], "protection_orders": protections_raw or [], "protection_orders_normalized": normalized_protections, "ai_brain_history": history_view, "risk_snapshot": risk_snapshot, "safety_status": _safety_status(), "gate_environment": s.environment, "gate_public_market_environment": s.public_market_environment, "errors": sorted(set(errors))}
+    return {"timestamp": str(int(time.time() * 1000)), "is_stale": bool(errors), "account": {"total_eq": float(account.get("total") or 0), "avail_eq": float(account.get("available") or 0), "upl": float(account.get("unrealised_pnl") or 0), "currency": s.settle.upper(), "margin_usage_pct": 0, "initial_capital": s.initial_capital_usd or None}, "positions_summary": {"total_count": len(positions), "long_count": sum(p["side"] == "long" for p in positions), "short_count": sum(p["side"] == "short" for p in positions), "items": positions}, "pending_orders": pending, "trigger_entry_orders": trigger_entries_raw or [], "factors": factors, "factor_library": factor_snapshot, "macro_assessment": "Gate Futures 原生行情、因子与账户数据巡检中", "llm_runtime": {"model": os.getenv("LLM_MODEL", "Gate AI Worker"), "provider_name": "Gate-native", "reasoning_effort": os.getenv("LLM_REASONING_EFFORT", "high"), "api_format": "openai_chat"}, "logs": [f"Gate {s.environment.upper()} · {profile.label} · {s.leverage:g}x · 私有数据{'可用' if not errors else '未配置或不可用'}"], "trades": ledger_rows, "today_stats": book_stats, "news_intelligence": [], "protection_orders": protections_raw or [], "protection_orders_normalized": normalized_protections, "ai_brain_history": history_view, "risk_snapshot": risk_snapshot, "safety_status": _safety_status(), "gate_environment": s.environment, "gate_public_market_environment": s.public_market_environment, "errors": sorted(set(errors))}
 
 
 @app.get("/api/v1/contracts/{contract}")
@@ -750,7 +775,7 @@ def gate_admin_runtime(x_gate_session: str | None = Header(default=None, alias="
     tunnel_payload = {**tunnel.__dict__, "running": bool(tunnel.running or shared_tunnel_ready), "pid": tunnel.pid or None}
     profile = get_risk_profile(s.risk_profile)
     snapshot = profile.snapshot(leverage=s.leverage, environment=s.environment)
-    return {"exchange": "gate", "environment": s.environment, "ready": bool(s.api_key and s.api_secret), "base_url": s.base_url, "public_market_environment": s.public_market_environment, "proxy_configured": bool(s.proxy_url), "proxy_url": s.proxy_url or "", "proxy_required": s.require_proxy, "tunnel": tunnel_payload, "testnet_execute_trades": bool(s.testnet_execute_trades), "live_trading_enabled": bool(s.environment == "live" and s.live_trading_enabled), "credentials": {"testnet_configured": bool(_stored_gate_credential("GATE_TESTNET_API_KEY") and _stored_gate_credential("GATE_TESTNET_API_SECRET")), "live_configured": bool(_stored_gate_credential("GATE_LIVE_API_KEY") and _stored_gate_credential("GATE_LIVE_API_SECRET"))}, "risk_profiles": profile_catalog(), "risk_snapshot": snapshot, "risk": {"risk_profile": s.risk_profile, "max_entries_per_cycle": s.max_entries_per_cycle, "leverage": s.leverage, "max_position_notional_usd": s.max_position_notional_usd, "max_total_margin_usd": s.max_total_margin_usd, "max_order_margin_usd": s.max_order_margin_usd}}
+    return {"exchange": "gate", "environment": s.environment, "ready": bool(s.api_key and s.api_secret), "base_url": s.base_url, "public_market_environment": s.public_market_environment, "proxy_configured": bool(s.proxy_url), "proxy_url": s.proxy_url or "", "proxy_required": s.require_proxy, "tunnel": tunnel_payload, "testnet_execute_trades": bool(s.testnet_execute_trades), "live_trading_enabled": bool(s.environment == "live" and s.live_trading_enabled), "credentials": {"testnet_configured": bool(_stored_gate_credential("GATE_TESTNET_API_KEY") and _stored_gate_credential("GATE_TESTNET_API_SECRET")), "live_configured": bool(_stored_gate_credential("GATE_LIVE_API_KEY") and _stored_gate_credential("GATE_LIVE_API_SECRET"))}, "risk_profiles": profile_catalog(), "risk_snapshot": snapshot, "risk": {"risk_profile": s.risk_profile, "max_entries_per_cycle": s.max_entries_per_cycle, "leverage": s.leverage, "max_position_notional_usd": s.max_position_notional_usd, "max_total_margin_usd": s.max_total_margin_usd, "max_order_margin_usd": s.max_order_margin_usd, "entry_intent_enabled": s.entry_intent_enabled, "max_entry_slippage_pct": s.max_entry_slippage_pct, "breakout_expiration_seconds": s.breakout_expiration_seconds}}
 
 
 @app.get("/api/v1/admin/runtime")
@@ -775,7 +800,7 @@ def gate_admin_runtime_overview(x_gate_session: str | None = Header(default=None
         llm_runtime = {key: raw_llm.get(key) for key in ("model", "name", "provider_name", "provider_id", "api_format", "reasoning_effort", "reasoning_type", "thinking_timeout")}
     except Exception:
         llm_runtime = {"model": os.getenv("LLM_MODEL", ""), "provider_name": "Gate AI Worker", "reasoning_effort": os.getenv("LLM_REASONING_EFFORT", "high")}
-    configuration = {"Gate 当前环境": settings.environment.upper(), "Gate API 凭证": "已配置" if settings.api_key and settings.api_secret else "未配置", "AI 风险档位": get_risk_profile(settings.risk_profile).label, "单轮最大开仓数": str(settings.max_entries_per_cycle), "Gate Testnet 自动交易": "已启用" if settings.testnet_execute_trades else "关闭", "Gate Live 交易开关": "显式启用" if settings.environment == "live" and settings.live_trading_enabled else "关闭 (FAIL-CLOSED)", "Gate VPS 独立代理": "已配置" if settings.proxy_url else "未配置", "执行杠杆": f"{settings.leverage:g}x", "原生保护单覆盖": "Gate price_orders 双保护校验", "总持仓名义敞口上限": f"{settings.max_position_notional_usd:.2f} USDT", "总保证金上限": f"{settings.max_total_margin_usd:.2f} USDT", "单笔保证金上限": f"{settings.max_order_margin_usd:.2f} USDT"}
+    configuration = {"Gate 当前环境": settings.environment.upper(), "Gate API 凭证": "已配置" if settings.api_key and settings.api_secret else "未配置", "AI 风险档位": get_risk_profile(settings.risk_profile).label, "单轮最大开仓数": str(settings.max_entries_per_cycle), "Gate Testnet 自动交易": "已启用" if settings.testnet_execute_trades else "关闭", "Gate Live 交易开关": "显式启用" if settings.environment == "live" and settings.live_trading_enabled else "关闭 (FAIL-CLOSED)", "Gate VPS 独立代理": "已配置" if settings.proxy_url else "未配置", "执行杠杆": f"{settings.leverage:g}x", "显式入场意图": "已启用" if settings.entry_intent_enabled else "关闭", "突破最大滑点": f"{settings.max_entry_slippage_pct * 100:.2f}%", "突破单有效期": f"{settings.breakout_expiration_seconds} 秒", "原生保护单覆盖": "Gate price_orders 双保护校验", "总持仓名义敞口上限": f"{settings.max_position_notional_usd:.2f} USDT", "总保证金上限": f"{settings.max_total_margin_usd:.2f} USDT", "单笔保证金上限": f"{settings.max_order_margin_usd:.2f} USDT"}
     gateway_store = GatewayStore(GATEWAY_DB_PATH)
     gateway_pid = current_pid()
     return {"service": {"version": app.version, "pid": os.getpid(), "uptime_seconds": int(time.time() - STARTED_AT)}, "exchange": "gate", "environment": settings.environment, "credentials": {"gate": bool(settings.api_key and settings.api_secret), "llm": bool(os.getenv("LLM_API_KEY"))}, "configuration": configuration, "data_health": {"overall": "LIVE" if all(item["fresh"] for item in health_files) else "STALE", "files": health_files}, "safety_status": _safety_status(), "execution_reconciler": _execution_status(settings.environment), "trader_heartbeat": _heartbeat_status(), "gateway": {"running": bool(gateway_pid or _worker_lock_held()), "pid": gateway_pid or None, "scheduler": scheduler_snapshot(gateway_store)}, "full_decisions": full, "decisions": full, "decision_history": list(reversed(history)), "decision_history_total": len(history), "recent_logs": [], "logs": {"trader": _tail_log("gate_trader.log", 18), "backend": _tail_log("gate_backend.log", 18), "scheduler": _tail_log("r20_gateway.log", 18)}, "llm_runtime": llm_runtime}
@@ -916,7 +941,7 @@ def gate_admin_config(payload: GateAdminConfig, x_gate_session: str | None = Hea
         except Exception as exc:
             raise HTTPException(409, str(exc)) from exc
     managed_proxy = os.getenv("GATE_PROXY_URL", "") if gate_tunnel.enabled else (payload.proxy_url or "")
-    values = {"GATE_ENVIRONMENT": payload.environment, "GATE_PUBLIC_MARKET_ENV": payload.environment, "GATE_TESTNET_EXECUTE_TRADES": str(payload.testnet_execute_trades).lower(), "GATE_LIVE_TRADING_ENABLED": str(payload.live_trading_enabled).lower(), "GATE_RISK_PROFILE": payload.risk_profile, "GATE_MAX_ENTRIES_PER_CYCLE": str(payload.max_entries_per_cycle), "GATE_LEVERAGE": str(payload.leverage), "GATE_PROXY_URL": managed_proxy, "GATE_MAX_POSITION_NOTIONAL_USD": str(payload.max_position_notional_usd), "GATE_MAX_TOTAL_MARGIN_USD": str(payload.max_total_margin_usd), "GATE_MAX_ORDER_MARGIN_USD": str(payload.max_order_margin_usd)}
+    values = {"GATE_ENVIRONMENT": payload.environment, "GATE_PUBLIC_MARKET_ENV": payload.environment, "GATE_TESTNET_EXECUTE_TRADES": str(payload.testnet_execute_trades).lower(), "GATE_LIVE_TRADING_ENABLED": str(payload.live_trading_enabled).lower(), "GATE_RISK_PROFILE": payload.risk_profile, "GATE_MAX_ENTRIES_PER_CYCLE": str(payload.max_entries_per_cycle), "GATE_LEVERAGE": str(payload.leverage), "GATE_PROXY_URL": managed_proxy, "GATE_MAX_POSITION_NOTIONAL_USD": str(payload.max_position_notional_usd), "GATE_MAX_TOTAL_MARGIN_USD": str(payload.max_total_margin_usd), "GATE_MAX_ORDER_MARGIN_USD": str(payload.max_order_margin_usd), "GATE_ENTRY_INTENT_ENABLED": str(payload.entry_intent_enabled).lower(), "GATE_MAX_ENTRY_SLIPPAGE_PCT": str(payload.max_entry_slippage_pct), "GATE_BREAKOUT_EXPIRATION_SECONDS": str(payload.breakout_expiration_seconds)}
     # Keep market data, credentials and order writes on the selected cluster.
     # In particular, a Live order must never be priced from Testnet data.
     values["GATE_PUBLIC_MARKET_ENV"] = payload.environment
@@ -940,6 +965,9 @@ def gate_admin_config(payload: GateAdminConfig, x_gate_session: str | None = Hea
         max_position_notional_usd=payload.max_position_notional_usd,
         max_total_margin_usd=payload.max_total_margin_usd,
         max_order_margin_usd=payload.max_order_margin_usd,
+        entry_intent_enabled=payload.entry_intent_enabled,
+        max_entry_slippage_pct=payload.max_entry_slippage_pct,
+        breakout_expiration_seconds=payload.breakout_expiration_seconds,
     )
     try:
         candidate.validate()
@@ -974,7 +1002,7 @@ def stop_and_flatten_testnet(payload: GateTestnetShutdownRequest, x_gate_session
         # Disable new Testnet risk before querying or mutating any exchange state.
         _update_env({"GATE_TESTNET_EXECUTE_TRADES": "false"})
         client_instance = GateFuturesClient(load_settings())
-        result: dict[str, Any] = {"ok": False, "environment": "testnet", "trading_disabled": True, "cancelled_orders": [], "closed_positions": [], "cancelled_protections": [], "retained_protections": []}
+        result: dict[str, Any] = {"ok": False, "environment": "testnet", "trading_disabled": True, "cancelled_orders": [], "cancelled_trigger_entries": [], "closed_positions": [], "cancelled_protections": [], "retained_protections": []}
         try:
             orders = client_instance.open_orders() or []
             for order in orders if isinstance(orders, list) else []:
@@ -985,6 +1013,15 @@ def stop_and_flatten_testnet(payload: GateTestnetShutdownRequest, x_gate_session
                 if not contract or not order_id:
                     raise RuntimeError("发现无法识别的 Testnet 入场挂单，已停止后续操作")
                 result["cancelled_orders"].append(GateTradingService(client_instance, RiskLimits(settings.max_position_notional_usd, settings.max_total_margin_usd, settings.max_order_margin_usd)).cancel_order_confirmed(contract=contract, order_id=order_id))
+            service = GateTradingService(client_instance, RiskLimits(settings.max_position_notional_usd, settings.max_total_margin_usd, settings.max_order_margin_usd))
+            trigger_entries = client_instance.trigger_entry_orders() or []
+            for plan in trigger_entries if isinstance(trigger_entries, list) else []:
+                initial = plan.get("initial") or {}
+                contract = str(initial.get("contract") or "").upper()
+                order_id = str(plan.get("id_string") or plan.get("id") or "")
+                if not contract or not order_id:
+                    raise RuntimeError("发现无法识别的 Testnet 突破计划单，已停止后续操作")
+                result["cancelled_trigger_entries"].append(service.cancel_trigger_entry_confirmed(contract=contract, order_id=order_id))
             positions = client_instance.positions() or []
             rows = positions if isinstance(positions, list) else [positions]
             for position in rows:
@@ -1004,7 +1041,6 @@ def stop_and_flatten_testnet(payload: GateTestnetShutdownRequest, x_gate_session
             if remaining:
                 raise RuntimeError("Testnet 平仓请求已发送，但持仓仍未确认归零")
             protections = client_instance.protection_orders() or []
-            service = GateTradingService(client_instance, RiskLimits(settings.max_position_notional_usd, settings.max_total_margin_usd, settings.max_order_margin_usd))
             for protection in protections if isinstance(protections, list) else []:
                 if not is_system_protection(protection):
                     result["retained_protections"].append(str(protection.get("id_string") or protection.get("id") or "unknown"))
@@ -1013,7 +1049,7 @@ def stop_and_flatten_testnet(payload: GateTestnetShutdownRequest, x_gate_session
                 if order_id:
                     result["cancelled_protections"].append(service.cancel_protection_confirmed(order_id=order_id))
             result["ok"] = True
-            store.add("gate.testnet.stop_and_flatten", {"actor": actor.get("username"), "cancelled_orders": len(result["cancelled_orders"]), "closed_positions": len(result["closed_positions"]), "cancelled_protections": len(result["cancelled_protections"]), "retained_protections": len(result["retained_protections"])})
+            store.add("gate.testnet.stop_and_flatten", {"actor": actor.get("username"), "cancelled_orders": len(result["cancelled_orders"]), "cancelled_trigger_entries": len(result["cancelled_trigger_entries"]), "closed_positions": len(result["closed_positions"]), "cancelled_protections": len(result["cancelled_protections"]), "retained_protections": len(result["retained_protections"])})
             return result
         except Exception as exc:
             result["error"] = str(exc)
@@ -1046,6 +1082,7 @@ def gate_account_snapshot(x_gate_session: str | None = Header(default=None, alia
         account = c.account()
         positions = c.positions()
         orders = c.open_orders()
+        trigger_entries = c.trigger_entry_orders()
         protections = c.protection_orders()
     except PermissionError as exc:
         raise HTTPException(503, str(exc)) from exc
@@ -1068,7 +1105,7 @@ def gate_account_snapshot(x_gate_session: str | None = Header(default=None, alia
             minimums.append({"contract": contract_name, "enable_decimal": bool(meta.get("enable_decimal")), "order_size_min": meta.get("order_size_min"), "quanto_multiplier": meta.get("quanto_multiplier"), "minimum_margin_usdt": round(min_margin, 6) if min_margin is not None else None, "effective_margin_cap_usdt": round(effective_cap, 6), "executable_under_current_cap": bool(min_margin is not None and min_margin <= effective_cap)})
     except Exception as exc:
         minimums = [{"error": str(exc)}]
-    return {"account": account, "positions": positions, "orders": orders, "protections": protections, "contract_minimums": minimums, "captured_at_ms": int(time.time() * 1000)}
+    return {"account": account, "positions": positions, "orders": orders, "trigger_entries": trigger_entries, "protections": protections, "contract_minimums": minimums, "captured_at_ms": int(time.time() * 1000)}
 
 
 # The migrated control plane handles /admin and all exchange-independent R20 modules.

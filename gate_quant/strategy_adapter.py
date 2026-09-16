@@ -28,7 +28,7 @@ def _use_gate_strategy_inputs() -> None:
     _r20_strategy.PROMPT_OVERRIDE_FILE = str(_GATE_DATA / "system_prompt_override.txt")
 
 
-def build_prompt(packages: list[dict[str, Any]], *, positions: list[dict[str, Any]], pending_orders: list[dict[str, Any]], available_usdt: float, execution_leverage: float = 3.0, max_order_margin_usdt: float = 0.0, max_total_margin_usdt: float = 0.0, current_margin_usdt: float = 0.0, risk_snapshot: dict[str, Any] | None = None) -> tuple[str, str]:
+def build_prompt(packages: list[dict[str, Any]], *, positions: list[dict[str, Any]], pending_orders: list[dict[str, Any]], available_usdt: float, execution_leverage: float = 3.0, max_order_margin_usdt: float = 0.0, max_total_margin_usdt: float = 0.0, current_margin_usdt: float = 0.0, risk_snapshot: dict[str, Any] | None = None, entry_intent_enabled: bool = False) -> tuple[str, str]:
     _use_gate_strategy_inputs()
     prompt = construct_full_market_prompt(
         packages,
@@ -39,6 +39,15 @@ def build_prompt(packages: list[dict[str, Any]], *, positions: list[dict[str, An
     )
     risk = risk_snapshot or {}
     effective_margin = max_order_margin_usdt * float(risk.get("margin_ratio", 1.0))
+    entry_contract = (
+        "每个非 WAIT 决策必须增加 entry_intent，且只能为 immediate、retracement、breakout。"
+        "immediate 表示按当前盘口立即入场，entry_price 必须接近当前盘口；"
+        "retracement 表示做多等待低于卖一的回调、做空等待高于买一的反弹；"
+        "breakout 表示做多等待上破高于卖一的触发价、做空等待下破低于买一的触发价。"
+        "只表达入场意图，不得自行决定滑点、有效期或绕过风控。"
+        if entry_intent_enabled else
+        "entry_price 按既有 Gate GTC 限价契约解释。"
+    )
     gate_constraints = (
         f"\n\n【Gate 当前风险档位（本轮唯一有效配置）】{risk.get('label', risk.get('risk_profile', 'standard'))}；"
         f"配置版本={risk.get('risk_profile_version', 'unknown')}，哈希={risk.get('risk_profile_hash', 'unknown')}。"
@@ -50,7 +59,7 @@ def build_prompt(packages: list[dict[str, Any]], *, positions: list[dict[str, An
         f"最低 1H ADX={float(risk.get('min_adx', 18)):g}；执行 R:R 底线={float(risk.get('min_rr', 2.0)):g}，目标 R:R≥{float(risk.get('target_rr', 2.2)):g}；"
         f"结构止损参考 {float(risk.get('stop_atr_min', 1.8)):g}~{float(risk.get('stop_atr_max', 2.2)):g}x 1H ATR。"
         "这里的动态数值覆盖原模板中同类建议数值，但不能覆盖数据有效、4H 方向、价格几何、绝对 2R、保证金/仓位上限、双保护覆盖和超时查单等 P0 条件。"
-        "entry_price 是 GTC 限价，不是市价。"
+        + entry_contract
     )
     return (get_effective_system_prompt() or SYSTEM_PROMPT) + gate_constraints, prompt + gate_constraints
 

@@ -59,7 +59,7 @@ def position_age_seconds(position: dict, now: float | None = None) -> float | No
 
 
 def _is_entry_order(order: dict) -> bool:
-    return not bool(order.get("reduce_only")) and not bool(order.get("close"))
+    return not bool(order.get("reduce_only") or order.get("is_reduce_only")) and not bool(order.get("close") or order.get("is_close"))
 
 
 def reconcile_exchange_state(

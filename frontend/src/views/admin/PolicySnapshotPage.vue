@@ -481,7 +481,7 @@ onMounted(() => {
               <span class="font-bold font-mono text-xs" style="color: var(--text-main);">Gate 执行与风险策略</span>
             </div>
             <div class="space-y-1 text-xs font-mono">
-              <div v-for="key in ['GATE_RISK_PROFILE','GATE_LEVERAGE','GATE_MAX_POSITION_NOTIONAL_USD','GATE_MAX_TOTAL_MARGIN_USD','GATE_MAX_ORDER_MARGIN_USD','GATE_MAX_PENDING_ORDER_AGE_SECONDS','GATE_MAX_POSITION_AGE_SECONDS','GATE_STOP_COOLDOWN_SECONDS']" :key="key" class="flex justify-between gap-3 py-1 border-b border-dashed" style="border-color: var(--border-subtle);">
+              <div v-for="key in ['GATE_RISK_PROFILE','GATE_LEVERAGE','GATE_MAX_POSITION_NOTIONAL_USD','GATE_MAX_TOTAL_MARGIN_USD','GATE_MAX_ORDER_MARGIN_USD','GATE_MAX_PENDING_ORDER_AGE_SECONDS','GATE_MAX_POSITION_AGE_SECONDS','GATE_STOP_COOLDOWN_SECONDS','GATE_ENTRY_INTENT_ENABLED','GATE_MAX_ENTRY_SLIPPAGE_PCT','GATE_BREAKOUT_EXPIRATION_SECONDS']" :key="key" class="flex justify-between gap-3 py-1 border-b border-dashed" style="border-color: var(--border-subtle);">
                 <span class="text-[#8A99AD] truncate">{{ key }}:</span>
                 <span class="font-bold text-right" style="color: var(--text-main);">{{ snapshotData.snapshot.units?.gate_execution?.values?.[key] || '默认值' }}</span>
               </div>

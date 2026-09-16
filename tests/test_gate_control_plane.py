@@ -304,6 +304,7 @@ def test_testnet_stop_and_flatten_orders_actions_and_confirms_zero(monkeypatch):
     class FakeGate:
         def __init__(self):
             self.entry_open = True
+            self.trigger_entry_open = True
             self.position_open = True
             self.protections = [{"id": "p1", "initial": {"text": "t-gate-sl-1"}}]
             self.actions = []
@@ -311,6 +312,10 @@ def test_testnet_stop_and_flatten_orders_actions_and_confirms_zero(monkeypatch):
             return ([{"id": "o1", "contract": "BTC_USDT", "reduce_only": False, "close": False}] if self.entry_open else [])
         def cancel_order(self, order_id, contract=None):
             self.actions.append(("cancel", contract, order_id)); self.entry_open = False; return {"id": order_id}
+        def trigger_entry_orders(self, contract=None, status="open"):
+            return ([{"id": "plan-1", "initial": {"contract": "BTC_USDT", "text": "t-gate-entry-1"}}] if self.trigger_entry_open else [])
+        def cancel_trigger_entry_order(self, order_id):
+            self.actions.append(("cancel_trigger_entry", order_id)); self.trigger_entry_open = False; return {"id": order_id}
         def positions(self, contract=None):
             return ([{"contract": "BTC_USDT", "size": "2"}] if self.position_open else [])
         def close_position(self, contract, client_id):
@@ -327,7 +332,7 @@ def test_testnet_stop_and_flatten_orders_actions_and_confirms_zero(monkeypatch):
     result = web.stop_and_flatten_testnet(web.GateTestnetShutdownRequest(confirmation="STOP TESTNET AND FLATTEN"), None)
     assert result["ok"] is True
     assert config_updates == {"GATE_TESTNET_EXECUTE_TRADES": "false"}
-    assert [action[0] for action in fake.actions] == ["cancel", "close", "cancel_protection"]
+    assert [action[0] for action in fake.actions] == ["cancel", "cancel_trigger_entry", "close", "cancel_protection"]
     close_client_id = next(action[2] for action in fake.actions if action[0] == "close")
     assert len(close_client_id) <= 28
 
@@ -357,6 +362,7 @@ def test_testnet_stop_failure_keeps_trading_disabled_and_protections(monkeypatch
 
     class StuckGate:
         def open_orders(self, contract=None): return []
+        def trigger_entry_orders(self, contract=None, status="open"): return []
         def positions(self, contract=None): return [{"contract": "ETH_USDT", "size": "1"}]
         def close_position(self, contract, client_id): return {"id": "close-unknown"}
         def find_by_client_id(self, client_id, contract): return None

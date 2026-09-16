@@ -32,6 +32,9 @@ class GateSettings:
     max_pending_order_age_seconds: int = 1800
     max_position_age_seconds: int = 57600
     stop_cooldown_seconds: int = 1800
+    max_entry_slippage_pct: float = 0.003
+    entry_intent_enabled: bool = False
+    breakout_expiration_seconds: int = 840
     max_daily_loss_usd: float = 100.0
     max_daily_loss_ratio: float = 0.05
     testnet_base_url: str = "https://api-testnet.gateapi.io/api/v4"
@@ -74,6 +77,10 @@ class GateSettings:
             raise ValueError("Gate network access is fail-closed: GATE_PROXY_URL is required")
         if self.initial_capital_usd < 0:
             raise ValueError("GATE_INITIAL_CAPITAL_USD cannot be negative")
+        if not 0 <= self.max_entry_slippage_pct <= 0.02:
+            raise ValueError("GATE_MAX_ENTRY_SLIPPAGE_PCT must be between 0 and 0.02")
+        if not 60 <= self.breakout_expiration_seconds <= 900:
+            raise ValueError("GATE_BREAKOUT_EXPIRATION_SECONDS must be between 60 and 900")
         if min(self.max_pending_order_age_seconds, self.max_position_age_seconds, self.stop_cooldown_seconds) < 0:
             raise ValueError("Gate lifecycle time limits cannot be negative")
         if self.max_daily_loss_usd <= 0 or not 0 < self.max_daily_loss_ratio <= 1:
@@ -116,6 +123,9 @@ def load_settings() -> GateSettings:
         max_pending_order_age_seconds=int(os.getenv("GATE_MAX_PENDING_ORDER_AGE_SECONDS", "1800")),
         max_position_age_seconds=int(os.getenv("GATE_MAX_POSITION_AGE_SECONDS", "57600")),
         stop_cooldown_seconds=int(os.getenv("GATE_STOP_COOLDOWN_SECONDS", "1800")),
+        max_entry_slippage_pct=float(os.getenv("GATE_MAX_ENTRY_SLIPPAGE_PCT", "0.003")),
+        entry_intent_enabled=_bool("GATE_ENTRY_INTENT_ENABLED"),
+        breakout_expiration_seconds=int(os.getenv("GATE_BREAKOUT_EXPIRATION_SECONDS", "840")),
         max_daily_loss_usd=float(os.getenv("GATE_MAX_DAILY_LOSS_USD", "100")),
         max_daily_loss_ratio=float(os.getenv("GATE_MAX_DAILY_LOSS_RATIO", "0.05")),
         testnet_base_url=os.getenv("GATE_TESTNET_BASE_URL", "https://api-testnet.gateapi.io/api/v4").rstrip("/"),

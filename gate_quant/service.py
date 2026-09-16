@@ -24,7 +24,7 @@ def protection_coverage_status(protections: list[dict], position_size: int | flo
             continue
         if rule not in coverage:
             continue
-        reduce_only = bool(initial.get("reduce_only", initial.get("is_reduce_only", False)))
+        reduce_only = bool(initial.get("reduce_only") or initial.get("is_reduce_only"))
         close_all_side = str(initial.get("auto_size") or "").lower()
         order_type = str(protection.get("order_type") or "").lower()
         expected_side = "long" if signed_position > 0 else "short"
@@ -104,8 +104,37 @@ class GateTradingService:
         return {"cancelled": True, "order_id": str(order_id), "result": result}
 
     def cancel_protection_confirmed(self, *, order_id: str) -> dict:
-        result = self.client.cancel_protection_order(order_id)
+        try:
+            result = self.client.cancel_protection_order(order_id)
+        except Exception:
+            remaining = self.client.protection_orders() or []
+            if not any(str(row.get("id_string") or row.get("id") or "") == str(order_id) for row in remaining if isinstance(row, dict)):
+                return {"cancelled": True, "order_id": str(order_id), "reconciled_after_error": True}
+            raise
         remaining = self.client.protection_orders() or []
         if any(str(row.get("id_string") or row.get("id") or "") == str(order_id) for row in remaining if isinstance(row, dict)):
             raise RuntimeError(f"Gate protection cancellation not confirmed for order {order_id}")
+        return {"cancelled": True, "order_id": str(order_id), "result": result}
+
+    def place_trigger_entry(self, **kwargs):
+        self.limits.check_order(**kwargs.pop("risk"))
+        try:
+            return self.client.create_trigger_entry_order(**kwargs)
+        except AmbiguousOrderError:
+            found = self.client.find_trigger_entry_by_client_id(kwargs["client_id"], kwargs["contract"])
+            if found:
+                return {"reconciled": True, "order": found}
+            raise
+
+    def cancel_trigger_entry_confirmed(self, *, contract: str, order_id: str) -> dict:
+        try:
+            result = self.client.cancel_trigger_entry_order(order_id)
+        except Exception:
+            remaining = self.client.trigger_entry_orders(contract, status="open") or []
+            if not any(str(row.get("id_string") or row.get("id") or "") == str(order_id) for row in remaining if isinstance(row, dict)):
+                return {"cancelled": True, "order_id": str(order_id), "reconciled_after_error": True}
+            raise
+        remaining = self.client.trigger_entry_orders(contract, status="open") or []
+        if any(str(row.get("id_string") or row.get("id") or "") == str(order_id) for row in remaining if isinstance(row, dict)):
+            raise RuntimeError(f"Gate trigger-entry cancellation not confirmed for order {order_id}")
         return {"cancelled": True, "order_id": str(order_id), "result": result}

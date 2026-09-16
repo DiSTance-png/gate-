@@ -10,6 +10,8 @@ from typing import Any
 ACTIVE_STATUSES = (
     "prepared",
     "submitted",
+    "awaiting_trigger",
+    "triggered_order_pending",
     "pending_fill",
     "position_pending",
     "partially_filled",
@@ -47,10 +49,20 @@ class ExecutionJournal:
                   entry_price TEXT NOT NULL,
                   take_profit_price TEXT NOT NULL,
                   stop_loss_price TEXT NOT NULL,
+                  take_profit_distance_pct TEXT NOT NULL DEFAULT '',
+                  stop_loss_distance_pct TEXT NOT NULL DEFAULT '',
+                  order_type TEXT NOT NULL DEFAULT 'limit',
+                  entry_action TEXT NOT NULL DEFAULT '',
+                  max_slippage_pct TEXT NOT NULL DEFAULT '',
+                  expiration_seconds TEXT NOT NULL DEFAULT '',
+                  order_notional_usdt TEXT NOT NULL DEFAULT '',
+                  estimated_margin_usdt TEXT NOT NULL DEFAULT '',
+                  price_tick TEXT NOT NULL DEFAULT '',
                   status TEXT NOT NULL,
                   order_id TEXT NOT NULL DEFAULT '',
                   order_status TEXT NOT NULL DEFAULT '',
                   filled_size TEXT NOT NULL DEFAULT '0',
+                  fill_price TEXT NOT NULL DEFAULT '',
                   protected_size TEXT NOT NULL DEFAULT '0',
                   stop_revision INTEGER NOT NULL DEFAULT 0,
                   take_profit_revision INTEGER NOT NULL DEFAULT 0,
@@ -73,6 +85,21 @@ class ExecutionJournal:
                   ON execution_events(client_id, id);
                 """
             )
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(entry_intents)")}
+            for name, definition in (
+                ("take_profit_distance_pct", "TEXT NOT NULL DEFAULT ''"),
+                ("stop_loss_distance_pct", "TEXT NOT NULL DEFAULT ''"),
+                ("order_type", "TEXT NOT NULL DEFAULT 'limit'"),
+                ("entry_action", "TEXT NOT NULL DEFAULT ''"),
+                ("max_slippage_pct", "TEXT NOT NULL DEFAULT ''"),
+                ("expiration_seconds", "TEXT NOT NULL DEFAULT ''"),
+                ("order_notional_usdt", "TEXT NOT NULL DEFAULT ''"),
+                ("estimated_margin_usdt", "TEXT NOT NULL DEFAULT ''"),
+                ("price_tick", "TEXT NOT NULL DEFAULT ''"),
+                ("fill_price", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if name not in columns:
+                    connection.execute(f"ALTER TABLE entry_intents ADD COLUMN {name} {definition}")
 
     def prepare(self, payload: dict[str, Any]) -> dict[str, Any]:
         now = int(payload.get("created_at_ms") or time.time() * 1000)
@@ -85,6 +112,15 @@ class ExecutionJournal:
             "entry_price": str(payload["entry_price"]),
             "take_profit_price": str(payload["take_profit_price"]),
             "stop_loss_price": str(payload["stop_loss_price"]),
+            "take_profit_distance_pct": str(payload.get("take_profit_distance_pct") or ""),
+            "stop_loss_distance_pct": str(payload.get("stop_loss_distance_pct") or ""),
+            "order_type": str(payload.get("order_type") or "limit"),
+            "entry_action": str(payload.get("entry_action") or ""),
+            "max_slippage_pct": str(payload.get("max_slippage_pct") or ""),
+            "expiration_seconds": str(payload.get("expiration_seconds") or ""),
+            "order_notional_usdt": str(payload.get("order_notional_usdt") or ""),
+            "estimated_margin_usdt": str(payload.get("estimated_margin_usdt") or ""),
+            "price_tick": str(payload.get("price_tick") or ""),
             "status": "prepared",
             "policy_version": str(payload.get("policy_version") or ""),
             "policy_hash": str(payload.get("policy_hash") or ""),
@@ -95,11 +131,13 @@ class ExecutionJournal:
             connection.execute(
                 """INSERT INTO entry_intents(
                      client_id,environment,contract,requested_size,baseline_position_size,
-                     entry_price,take_profit_price,stop_loss_price,status,policy_version,
+                     entry_price,take_profit_price,stop_loss_price,take_profit_distance_pct,stop_loss_distance_pct,
+                     order_type,entry_action,max_slippage_pct,expiration_seconds,order_notional_usdt,estimated_margin_usdt,price_tick,status,policy_version,
                      policy_hash,created_at_ms,updated_at_ms
                    ) VALUES (
                      :client_id,:environment,:contract,:requested_size,:baseline_position_size,
-                     :entry_price,:take_profit_price,:stop_loss_price,:status,:policy_version,
+                     :entry_price,:take_profit_price,:stop_loss_price,:take_profit_distance_pct,:stop_loss_distance_pct,
+                     :order_type,:entry_action,:max_slippage_pct,:expiration_seconds,:order_notional_usdt,:estimated_margin_usdt,:price_tick,:status,:policy_version,
                      :policy_hash,:created_at_ms,:updated_at_ms
                    )""",
                 values,
@@ -109,8 +147,9 @@ class ExecutionJournal:
 
     def update(self, client_id: str, status: str | None = None, **fields: Any) -> dict[str, Any]:
         allowed = {
-            "order_id", "order_status", "filled_size", "protected_size",
+            "order_id", "order_status", "filled_size", "fill_price", "protected_size",
             "stop_revision", "take_profit_revision", "last_error",
+            "entry_price", "take_profit_price", "stop_loss_price",
         }
         updates = {key: value for key, value in fields.items() if key in allowed}
         if status is not None:
