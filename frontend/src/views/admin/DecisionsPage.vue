@@ -71,7 +71,7 @@ function cycleTime(value: unknown) {
 }
 
 function cycleTradeText(trade: any) {
-  return trade?.status_label || tradeStatusText[trade?.status] || (trade?.status ? `未知执行状态（${trade.status}）` : '未下单')
+  return tradeStatusText[trade?.status] || (trade?.status_label && trade.status_label !== trade.status ? trade.status_label : '') || (trade?.status ? `未知执行状态（${trade.status}）` : '未下单')
 }
 
 function historyStatusText(status: unknown) {
