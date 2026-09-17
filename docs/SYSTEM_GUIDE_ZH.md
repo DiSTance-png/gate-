@@ -372,7 +372,7 @@ SSH 隧道由 Web lifespan 管理。已经存在并且端口可用的隧道会�
 | `data/gate_safety_status.json` | 最新安全门快照 |
 | `data/gate_trader_heartbeat.json` | AI Worker 心跳 |
 | `data/gate_execution_reconciler.json` | 10 秒对账心跳 |
-| `data/gate_anomaly_history.json` | 异常与未闭环的首次发现、持续和恢复历史 |
+| `data/gate_anomaly_history.json` | 每 60 秒只读巡查得到的异常首次发现、持续和恢复历史 |
 | `data/r20_gateway.db` | 调度和通知队列 |
 | `runtime/gate_quant.db` | Web 事件记录 |
 | `logs/gate_trader.log` | AI 巡检摘要和异常 |

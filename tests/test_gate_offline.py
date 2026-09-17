@@ -228,6 +228,8 @@ def test_gate_position_close_maps_native_lifecycle_fields():
 
 def test_gateway_scheduler_includes_gate_ledger_and_self_improvement():
     jobs = {job.name: job for job in JOBS}
+    assert jobs["anomaly_audit"].interval_seconds == 60
+    assert jobs["anomaly_audit"].script == "-m gate_quant.anomaly_audit"
     assert jobs["gate_ledger"].interval_seconds == 15 * 60
     assert jobs["self_improvement"].schedule_key == "self_improvement_times"
 

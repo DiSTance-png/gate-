@@ -33,6 +33,7 @@ class JobSpec:
 JOBS = (
     JobSpec("trader", "-m gate_quant.ai_worker", 15 * 60, 840),
     JobSpec("execution_reconcile", "-m gate_quant.execution_reconciler", 10, 120),
+    JobSpec("anomaly_audit", "-m gate_quant.anomaly_audit", 60, 45),
     JobSpec("factor_library", "-m gate_quant.factor_worker", 60, 300),
     JobSpec("news", "-m gate_quant.news_worker", 10 * 60, 120, offset_seconds=180),
     JobSpec("gate_ledger", "sync_gate_ledger.py", 15 * 60, 180, offset_seconds=60),

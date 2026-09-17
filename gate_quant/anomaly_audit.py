@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,9 @@ from .service import protection_coverage_status
 
 SEVERITY_ORDER = {"critical": 0, "error": 1, "warning": 2, "info": 3}
 TERMINAL_EXECUTION_STATUSES = {"completed", "cancelled", "rolled_back", "failed"}
+ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = ROOT / "data"
+ANOMALY_HISTORY_PATH = DATA_DIR / "gate_anomaly_history.json"
 
 
 def _decimal(value: Any) -> Decimal:
@@ -397,3 +401,72 @@ def persist_anomaly_history(path: Path, report: dict[str, Any], *, max_records: 
         "active_total": sum(row.get("status") == "active" and str(row.get("environment") or "").lower() == environment for row in records),
         "resolved_total": sum(row.get("status") == "resolved" and str(row.get("environment") or "").lower() == environment for row in records),
     }
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _safe_call(method) -> tuple[Any, str | None]:
+    try:
+        return method(), None
+    except Exception as exc:
+        return [], f"{type(exc).__name__}: {exc}"
+
+
+def run_anomaly_audit(*, history_path: Path = ANOMALY_HISTORY_PATH) -> dict[str, Any]:
+    """Run one read-only audit against durable state and Gate query endpoints."""
+    from .client import GateFuturesClient
+    from .config import load_settings
+    from .execution_journal import ExecutionJournal
+    from .execution_reconciler import JOURNAL_PATH
+    from r20_gateway.publisher import DB_PATH
+    from r20_gateway.store import GatewayStore
+
+    settings = load_settings()
+    clients = [GateFuturesClient(settings) for _ in range(3)]
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="gate-anomaly-audit") as executor:
+        position_future = executor.submit(_safe_call, clients[0].positions)
+        order_future = executor.submit(_safe_call, clients[1].open_orders)
+        protection_future = executor.submit(_safe_call, clients[2].protection_orders)
+        positions, position_error = position_future.result()
+        orders, order_error = order_future.result()
+        protections, protection_error = protection_future.result()
+    try:
+        executions = ExecutionJournal(JOURNAL_PATH).active(settings.environment, limit=200)
+    except Exception as exc:
+        executions = [{"client_id": "journal-read", "contract": "", "status": "manual_review", "last_error": str(exc)}]
+    report = collect_anomalies(
+        environment=settings.environment,
+        job_runs=GatewayStore(DB_PATH).job_runs(200),
+        decision=_read_json(DATA_DIR / "ai_brain_decisions.json"),
+        safety_snapshot=_read_json(DATA_DIR / "gate_safety_status.json"),
+        trader_heartbeat=_read_json(DATA_DIR / "gate_trader_heartbeat.json"),
+        reconciler_heartbeat=_read_json(DATA_DIR / "gate_execution_reconciler.json"),
+        executions=executions,
+        positions=positions if isinstance(positions, list) else [],
+        orders=orders if isinstance(orders, list) else [],
+        protections=protections if isinstance(protections, list) else [],
+        private_errors=sorted(set(error for error in (position_error, order_error, protection_error) if error)),
+        max_pending_age_seconds=settings.max_pending_order_age_seconds,
+    )
+    return persist_anomaly_history(history_path, report)
+
+
+def main() -> None:
+    result = run_anomaly_audit()
+    print(json.dumps({
+        "environment": result["environment"],
+        "checked_at_ms": result["checked_at_ms"],
+        "active_total": result["active_total"],
+        "resolved_total": result["resolved_total"],
+        "summary": result["summary"],
+    }, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
