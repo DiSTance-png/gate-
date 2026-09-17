@@ -319,6 +319,53 @@ def test_timeout_reconciles_before_retry():
     assert [c[0] for c in fake.calls] == ["POST", "GET", "GET", "GET"]
 
 
+def test_public_get_retries_transient_gate_500_without_retrying_writes(monkeypatch):
+    class Response:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self.payload = payload
+            self.reason = "Internal Server Error" if status_code == 500 else "OK"
+            self.content = json.dumps(payload).encode()
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise requests.HTTPError(response=self)
+
+        def json(self):
+            return self.payload
+
+    class Session:
+        def __init__(self):
+            self.calls = 0
+            self.proxies = {}
+
+        def request(self, *args, **kwargs):
+            self.calls += 1
+            return Response(500, {"label": "INTERNAL", "message": "Internal error"}) if self.calls == 1 else Response(200, [{"contract": "BTC_USDT"}])
+
+    session = Session()
+    monkeypatch.setattr("gate_quant.client.time.sleep", lambda _: None)
+    assert GateFuturesClient(settings(), session).tickers() == [{"contract": "BTC_USDT"}]
+    assert session.calls == 2
+
+
+def test_public_get_stops_after_bounded_timeout_retries(monkeypatch):
+    class Session:
+        def __init__(self):
+            self.calls = 0
+            self.proxies = {}
+
+        def request(self, *args, **kwargs):
+            self.calls += 1
+            raise requests.Timeout("offline")
+
+    session = Session()
+    monkeypatch.setattr("gate_quant.client.time.sleep", lambda _: None)
+    with pytest.raises(RuntimeError, match="request timed out"):
+        GateFuturesClient(settings(), session).candlesticks("BTC_USDT")
+    assert session.calls == 3
+
+
 @pytest.mark.parametrize(("mode", "expected_auto_size"), [
     ("dual_long", "close_long"),
     ("dual_short", "close_short"),

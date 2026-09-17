@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from decimal import Decimal
 from dataclasses import dataclass
 from urllib.parse import urlencode
@@ -32,6 +33,20 @@ class GateFuturesClient:
         if private and method.upper() in {"POST", "PUT", "PATCH", "DELETE"}:
             with gate_write_lock():
                 return self._request_unlocked(method, endpoint, params=params, payload=payload, private=private)
+        if not private and method.upper() == "GET":
+            for attempt in range(3):
+                try:
+                    return self._request_unlocked(method, endpoint, params=params, payload=payload, private=False)
+                except RuntimeError as exc:
+                    message = str(exc)
+                    transient = (
+                        "request timed out" in message
+                        or "network error" in message
+                        or any(f"HTTP {status}" in message for status in (500, 502, 503, 504))
+                    )
+                    if not transient or attempt == 2:
+                        raise
+                    time.sleep((0.25, 0.75)[attempt])
         return self._request_unlocked(method, endpoint, params=params, payload=payload, private=private)
 
     def _request_unlocked(self, method: str, endpoint: str, *, params: dict | None = None, payload: dict | None = None, private: bool = False):
@@ -50,6 +65,10 @@ class GateFuturesClient:
             if method.upper() == "POST" and (endpoint.endswith("/orders") or endpoint.endswith("/price_orders")):
                 raise AmbiguousOrderError("Gate order request timed out; reconcile by client order id before retrying") from exc
             raise RuntimeError(f"Gate {method.upper()} {endpoint} request timed out") from exc
+        except requests.RequestException as exc:
+            if method.upper() == "POST" and (endpoint.endswith("/orders") or endpoint.endswith("/price_orders")):
+                raise AmbiguousOrderError("Gate order request failed ambiguously; reconcile by client order id before retrying") from exc
+            raise RuntimeError(f"Gate {method.upper()} {endpoint} network error: {type(exc).__name__}") from exc
         try:
             response.raise_for_status()
         except requests.HTTPError as exc:
