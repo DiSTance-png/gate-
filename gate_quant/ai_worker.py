@@ -1404,7 +1404,17 @@ def run_cycle() -> dict:
                     meta = client.contracts(contract_name)
                     step = meta.get("order_price_round") or meta.get("mark_price_round") or "0"
                     position_size = Decimal(str(current.get("size") or 0))
-                    management_result["positions"].append({"contract": contract_name, "action": mgmt_action, "result": client.create_protection_order(contract=contract_name, size=-position_size, trigger_price=_round_price(float(instruction["suggested_sl_price"]), step), rule=2 if position_size > 0 else 1, client_id=f"t-gate-sl-update-{now}")})
+                    service = GateTradingService(client, RiskLimits(settings.max_position_notional_usd, settings.max_total_margin_usd, settings.max_order_margin_usd))
+                    management_result["positions"].append({
+                        "contract": contract_name, "action": mgmt_action,
+                        "result": service.replace_stop_loss_safely(
+                            contract=contract_name,
+                            position_size=position_size,
+                            mark_price=Decimal(str(current.get("mark_price") or 0)),
+                            trigger_price=_round_price(float(instruction["suggested_sl_price"]), step),
+                            client_id=f"t-gate-slu-{now}-{contract_name.split('_', 1)[0].lower()}",
+                        ),
+                    })
             except Exception as exc:
                 management_result["positions"].append({"contract": contract_name, "action": mgmt_action, "error": str(exc)})
         for instruction in pending_management:

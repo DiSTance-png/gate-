@@ -116,6 +116,59 @@ class GateTradingService:
             raise RuntimeError(f"Gate protection cancellation not confirmed for order {order_id}")
         return {"cancelled": True, "order_id": str(order_id), "result": result}
 
+    def replace_stop_loss_safely(
+        self, *, contract: str, position_size: int | float | Decimal,
+        mark_price: int | float | Decimal, trigger_price: str, client_id: str,
+    ) -> dict:
+        """Replace Gate's single allowed close-position stop and restore it on failure."""
+        size = Decimal(str(position_size))
+        mark = Decimal(str(mark_price))
+        proposed = Decimal(str(trigger_price))
+        if size == 0 or mark <= 0 or proposed <= 0:
+            raise ValueError("stop-loss replacement requires a live position, mark price, and trigger price")
+        rule = 2 if size > 0 else 1
+        close_size = -size
+        rows = self.client.protection_orders(contract) or []
+        matching = [
+            row for row in rows
+            if int((row.get("trigger") or {}).get("rule") or 0) == rule
+        ]
+        if len(matching) != 1:
+            raise RuntimeError(f"Gate stop-loss replacement requires exactly one existing rule:{rule} order; found {len(matching)}")
+        old = matching[0]
+        old_id = str(old.get("id_string") or old.get("id") or "")
+        old_price = Decimal(str((old.get("trigger") or {}).get("price") or 0))
+        if not old_id or old_price <= 0:
+            raise RuntimeError("existing Gate stop-loss is missing its order id or trigger price")
+        valid_geometry = proposed < mark if size > 0 else proposed > mark
+        tightens_risk = proposed > old_price if size > 0 else proposed < old_price
+        if not valid_geometry:
+            raise ValueError("suggested stop-loss is on the wrong side of the current mark price")
+        if not tightens_risk:
+            raise ValueError("suggested stop-loss does not tighten the existing protection")
+
+        cancelled = self.cancel_protection_confirmed(order_id=old_id)
+        try:
+            created = self.client.create_protection_order(
+                contract=contract, size=close_size, trigger_price=str(proposed),
+                rule=rule, client_id=client_id,
+            )
+            confirmed = self.client.find_protection_by_client_id(client_id, contract)
+            if not confirmed:
+                raise RuntimeError("replacement Gate stop-loss was not confirmed")
+            return {"replaced": True, "old_order_id": old_id, "old_price": str(old_price),
+                    "new_price": str(proposed), "cancel": cancelled, "order": created}
+        except Exception as exc:
+            rollback_id = f"{client_id[:24]}-rb"
+            rollback = self.client.create_protection_order(
+                contract=contract, size=close_size, trigger_price=str(old_price),
+                rule=rule, client_id=rollback_id,
+            )
+            restored = self.client.find_protection_by_client_id(rollback_id, contract)
+            if not restored:
+                raise RuntimeError(f"new stop-loss failed and old stop-loss restoration is unconfirmed: {exc}") from exc
+            raise RuntimeError(f"new stop-loss failed; old stop-loss restored: {exc}") from exc
+
     def place_trigger_entry(self, **kwargs):
         self.limits.check_order(**kwargs.pop("risk"))
         try:

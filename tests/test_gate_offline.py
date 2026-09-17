@@ -929,3 +929,65 @@ def test_protection_cancel_timeout_is_reconciled_before_rollback_continues():
     service = GateTradingService(Client(), RiskLimits(1000, 1000, 1000))
     result = service.cancel_protection_confirmed(order_id="701")
     assert result == {"cancelled": True, "order_id": "701", "reconciled_after_error": True}
+
+
+class StopReplacementClient:
+    def __init__(self, *, fail_new=False):
+        self.fail_new = fail_new
+        self.rows = [{
+            "id": "old-sl", "id_string": "old-sl", "status": "open",
+            "trigger": {"rule": 2, "price": "96.82"},
+            "initial": {"contract": "SOL_USDT", "size": -17.9, "text": "t-gate-sl-old", "is_reduce_only": True},
+        }]
+        self.created = []
+
+    def protection_orders(self, contract=None):
+        return list(self.rows)
+
+    def cancel_protection_order(self, order_id):
+        self.rows = [row for row in self.rows if str(row.get("id")) != str(order_id)]
+        return {"id": order_id, "status": "finished"}
+
+    def create_protection_order(self, **kwargs):
+        if self.fail_new and not str(kwargs["client_id"]).endswith("-rb"):
+            raise RuntimeError("Gate rejected replacement")
+        self.created.append(kwargs)
+        row = {"id": kwargs["client_id"], "status": "open", "trigger": {"rule": kwargs["rule"], "price": kwargs["trigger_price"]},
+               "initial": {"contract": kwargs["contract"], "size": kwargs["size"], "text": kwargs["client_id"], "is_reduce_only": True}}
+        self.rows.append(row)
+        return row
+
+    def find_protection_by_client_id(self, client_id, contract):
+        return next((row for row in self.rows if row["initial"]["text"] == client_id), None)
+
+
+def test_stop_loss_update_replaces_existing_gate_rule_in_safe_order():
+    client = StopReplacementClient()
+    result = GateTradingService(client, RiskLimits(1, 1, 1)).replace_stop_loss_safely(
+        contract="SOL_USDT", position_size="17.9", mark_price="101.49",
+        trigger_price="99.2", client_id="t-gate-slu-test",
+    )
+    assert result["replaced"] is True
+    assert len(client.rows) == 1
+    assert client.rows[0]["trigger"]["price"] == "99.2"
+
+
+def test_stop_loss_update_restores_old_stop_when_new_order_fails():
+    client = StopReplacementClient(fail_new=True)
+    with pytest.raises(RuntimeError, match="old stop-loss restored"):
+        GateTradingService(client, RiskLimits(1, 1, 1)).replace_stop_loss_safely(
+            contract="SOL_USDT", position_size="17.9", mark_price="101.49",
+            trigger_price="99.2", client_id="t-gate-slu-test",
+        )
+    assert len(client.rows) == 1
+    assert client.rows[0]["trigger"]["price"] == "96.82"
+
+
+def test_stop_loss_update_rejects_looser_or_crossed_price_without_cancelling():
+    client = StopReplacementClient()
+    service = GateTradingService(client, RiskLimits(1, 1, 1))
+    with pytest.raises(ValueError, match="does not tighten"):
+        service.replace_stop_loss_safely(contract="SOL_USDT", position_size="17.9", mark_price="101.49", trigger_price="95", client_id="t-gate-slu-loose")
+    with pytest.raises(ValueError, match="wrong side"):
+        service.replace_stop_loss_safely(contract="SOL_USDT", position_size="17.9", mark_price="101.49", trigger_price="102", client_id="t-gate-slu-crossed")
+    assert [row["id"] for row in client.rows] == ["old-sl"]
