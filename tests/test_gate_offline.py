@@ -335,7 +335,7 @@ def test_dual_mode_close_uses_gate_native_auto_size(mode, expected_auto_size):
     client.close_position(contract="BTC_USDT", client_id="t-close-dual", position_mode=mode)
     assert client.payload == {
         "contract": "BTC_USDT", "size": 0, "price": "0", "tif": "ioc",
-        "text": "t-close-dual", "reduce_only": False, "close": False,
+        "text": "t-close-dual", "reduce_only": True, "close": False,
         "auto_size": expected_auto_size,
     }
 
@@ -363,7 +363,9 @@ def test_invalid_dual_mode_auto_size_fails_closed_before_request():
     with pytest.raises(ValueError, match="auto_size"):
         client.create_order(contract="BTC_USDT", size=0, client_id="t-invalid", auto_size="close_both")
     with pytest.raises(ValueError, match="size=0"):
-        client.create_order(contract="BTC_USDT", size=1, client_id="t-invalid", auto_size="close_long")
+        client.create_order(contract="BTC_USDT", size=1, client_id="t-invalid", reduce_only=True, auto_size="close_long")
+    with pytest.raises(ValueError, match="reduce_only=true"):
+        client.create_order(contract="BTC_USDT", size=0, client_id="t-invalid", reduce_only=False, auto_size="close_long")
 
 
 def test_close_timeout_reconciles_by_client_id_without_resubmission():

@@ -158,8 +158,8 @@ class GateFuturesClient:
         if auto_size is not None:
             if auto_size not in {"close_long", "close_short"}:
                 raise ValueError("Gate dual-mode auto_size must be close_long or close_short")
-            if Decimal(str(size)) != 0 or close:
-                raise ValueError("Gate dual-mode auto_size requires size=0 and close=false")
+            if Decimal(str(size)) != 0 or not reduce_only or close:
+                raise ValueError("Gate dual-mode auto_size requires size=0, reduce_only=true, and close=false")
             payload["auto_size"] = auto_size
         try:
             return self._request("POST", f"/futures/{self.settings.settle}/orders", payload=payload, private=True)
@@ -179,7 +179,7 @@ class GateFuturesClient:
             side = "long" if mode == "dual_long" else "short"
             return self.create_order(
                 contract=contract, size=0, price="0", tif="ioc", client_id=client_id,
-                reduce_only=False, close=False, auto_size=f"close_{side}",
+                reduce_only=True, close=False, auto_size=f"close_{side}",
             )
         # Single-position mode uses Gate's size=0, close=true semantic.
         return self.create_order(contract=contract, size=0, price="0", tif="ioc", client_id=client_id, reduce_only=True, close=True)
