@@ -113,7 +113,7 @@ def _cancel_remainder(service: GateTradingService, intent: dict[str, Any], order
     return service.cancel_order_confirmed(contract=str(intent["contract"]), order_id=order_id)
 
 
-def _position_for_contract(client: GateFuturesClient, contract: str) -> dict[str, Any]:
+def _position_for_contract(client: GateFuturesClient, contract: str, requested_size: Decimal) -> dict[str, Any]:
     try:
         value = client.positions(contract) or {}
     except RuntimeError as exc:
@@ -121,7 +121,24 @@ def _position_for_contract(client: GateFuturesClient, contract: str) -> dict[str
             return {}
         raise
     if isinstance(value, list):
-        return next((row for row in value if str(row.get("contract") or "").upper() == contract), {})
+        rows = [
+            row for row in value
+            if isinstance(row, dict) and str(row.get("contract") or "").upper() == contract
+        ]
+        expected_mode = "dual_long" if requested_size > 0 else "dual_short"
+        directional = next(
+            (row for row in rows if str(row.get("mode") or "").lower() == expected_mode),
+            None,
+        )
+        if directional is not None:
+            return directional
+        same_sign = next(
+            (row for row in rows if _decimal(row.get("size")) * requested_size > 0),
+            None,
+        )
+        if same_sign is not None:
+            return same_sign
+        return next((row for row in rows if _decimal(row.get("size")) != 0), rows[0] if rows else {})
     return value if isinstance(value, dict) else {}
 
 
@@ -204,7 +221,7 @@ def _reconcile_intent_unlocked(
     order_id = str(order.get("id") or intent.get("order_id") or "")
     order_status = str(order.get("status") or "unknown")
     filled = _filled_size(order, requested)
-    position = _position_for_contract(client, contract)
+    position = _position_for_contract(client, contract, requested)
     position_size = _decimal(position.get("size"))
     baseline = _decimal(intent.get("baseline_position_size"))
     signed_delta = position_size - baseline

@@ -129,6 +129,28 @@ def test_restart_recovers_prepared_intent_by_client_order_id_without_resubmit(tm
     assert not gate.reductions
 
 
+def test_dual_mode_short_selects_short_position_row_and_creates_protection(tmp_path):
+    journal = ExecutionJournal(tmp_path / "execution.db")
+    intent = prepared(journal, requested="-58")
+    intent = journal.update(
+        intent["client_id"],
+        take_profit_price="90",
+        stop_loss_price="110",
+    )
+    gate = FakeGate(size="-58", left="0", position_size="0")
+    gate.position = [
+        {"contract": "BTC_USDT", "mode": "dual_long", "size": "0", "entry_price": "0", "mark_price": "100"},
+        {"contract": "BTC_USDT", "mode": "dual_short", "size": "-58", "entry_price": "100", "mark_price": "100"},
+    ]
+
+    result = reconcile_intent(gate, journal, intent, settings(), now_ms=2_000)
+
+    assert result["status"] == "filled_protected"
+    assert result["filled_size"] == "58"
+    assert gate.created_rules == [1, 2]
+    assert [Decimal(str(row["initial"]["size"])) for row in gate.protections] == [Decimal("58"), Decimal("58")]
+
+
 def test_decimal_fill_is_covered_by_gate_full_close_price_orders(tmp_path):
     journal = ExecutionJournal(tmp_path / "execution.db")
     intent = prepared(journal, requested="7.7")

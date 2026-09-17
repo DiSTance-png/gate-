@@ -13,7 +13,6 @@ import time
 import datetime
 import urllib.request
 import tempfile
-from scripts.portable_lock import acquire as acquire_lock, release as release_lock
 import hashlib
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -23,6 +22,8 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ROOT = Path(PROJECT_ROOT)
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
+
+from scripts.portable_lock import acquire as acquire_lock, release as release_lock
 
 try:
     from r20_backend.config import settings as standalone_settings
@@ -45,8 +46,8 @@ LOG_FILE = os.path.join(LOGS_DIR, "self_improvement.log")
 EVOLUTION_LOCK_FILE = os.path.join(DATA_DIR, ".self_improvement.lock")
 
 from r20_backend.version import __version__
-from instrument_pool import load_instruments
-from prompt_library import active_profile, apply_module_layout
+from scripts.instrument_pool import load_instruments
+from scripts.prompt_library import active_profile, apply_module_layout
 from r20_gateway.telemetry import ModelCallTelemetry
 TARGET_INSTRUMENTS = [item["name"] for item in load_instruments()]
 
