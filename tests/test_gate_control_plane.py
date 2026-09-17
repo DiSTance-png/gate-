@@ -318,7 +318,7 @@ def test_testnet_stop_and_flatten_orders_actions_and_confirms_zero(monkeypatch):
             self.actions.append(("cancel_trigger_entry", order_id)); self.trigger_entry_open = False; return {"id": order_id}
         def positions(self, contract=None):
             return ([{"contract": "BTC_USDT", "size": "2"}] if self.position_open else [])
-        def close_position(self, contract, client_id):
+        def close_position(self, contract, client_id, position_mode=None):
             self.actions.append(("close", contract, client_id)); self.position_open = False; return {"id": "close-1"}
         def find_by_client_id(self, client_id, contract):
             return None
@@ -364,7 +364,7 @@ def test_testnet_stop_failure_keeps_trading_disabled_and_protections(monkeypatch
         def open_orders(self, contract=None): return []
         def trigger_entry_orders(self, contract=None, status="open"): return []
         def positions(self, contract=None): return [{"contract": "ETH_USDT", "size": "1"}]
-        def close_position(self, contract, client_id): return {"id": "close-unknown"}
+        def close_position(self, contract, client_id, position_mode=None): return {"id": "close-unknown"}
         def find_by_client_id(self, client_id, contract): return None
         def protection_orders(self, contract=None): raise AssertionError("protection cleanup must wait for confirmed zero positions")
 

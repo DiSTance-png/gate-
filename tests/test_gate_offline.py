@@ -12,7 +12,7 @@ from gate_quant.execution_journal import ExecutionJournal
 from gate_quant.strategy_adapter import validate_decision
 from gate_quant.risk_profiles import get_risk_profile
 from r20_gateway.scheduler import JOBS, GatewayScheduler
-from gate_quant.safety import classify_error, cooldown_state, daily_loss_state, reconcile_exchange_state
+from gate_quant.safety import classify_error, cooldown_state, daily_loss_state, position_age_stage, reconcile_exchange_state
 from gate_quant.protection_lifecycle import intent_from_history, is_system_protection, recovery_plans
 from scripts.sync_gate_ledger import _ledger_row
 
@@ -315,6 +315,87 @@ def test_timeout_reconciles_before_retry():
     with pytest.raises(AmbiguousOrderError):
         service.place_order(contract="BTC_USDT", size=1, client_id="t-gate-1", risk={"order_margin_usd": 1, "current_margin_usd": 0, "current_position_notional_usd": 0, "order_notional_usd": 10, "environment": "testnet", "live_enabled": False})
     assert [c[0] for c in fake.calls] == ["POST", "GET", "GET", "GET"]
+
+
+@pytest.mark.parametrize(("mode", "expected_auto_size"), [
+    ("dual_long", "close_long"),
+    ("dual_short", "close_short"),
+])
+def test_dual_mode_close_uses_gate_native_auto_size(mode, expected_auto_size):
+    class Capture:
+        def __init__(self): self.payload = None; self.settings = settings()
+        def _request(self, method, endpoint, *, payload=None, private=False):
+            self.payload = payload
+            return {"id": "close-1"}
+        _api_size = staticmethod(GateFuturesClient._api_size)
+        create_order = GateFuturesClient.create_order
+        close_position = GateFuturesClient.close_position
+
+    client = Capture()
+    client.close_position(contract="BTC_USDT", client_id="t-close-dual", position_mode=mode)
+    assert client.payload == {
+        "contract": "BTC_USDT", "size": 0, "price": "0", "tif": "ioc",
+        "text": "t-close-dual", "reduce_only": False, "close": False,
+        "auto_size": expected_auto_size,
+    }
+
+
+def test_single_mode_close_keeps_gate_close_flag():
+    class Capture:
+        def __init__(self): self.payload = None; self.settings = settings()
+        def _request(self, method, endpoint, *, payload=None, private=False):
+            self.payload = payload
+            return {"id": "close-1"}
+        _api_size = staticmethod(GateFuturesClient._api_size)
+        create_order = GateFuturesClient.create_order
+        close_position = GateFuturesClient.close_position
+
+    client = Capture()
+    client.close_position(contract="BTC_USDT", client_id="t-close-single", position_mode="single")
+    assert client.payload["size"] == 0
+    assert client.payload["close"] is True
+    assert client.payload["reduce_only"] is True
+    assert "auto_size" not in client.payload
+
+
+def test_invalid_dual_mode_auto_size_fails_closed_before_request():
+    client = GateFuturesClient(settings())
+    with pytest.raises(ValueError, match="auto_size"):
+        client.create_order(contract="BTC_USDT", size=0, client_id="t-invalid", auto_size="close_both")
+    with pytest.raises(ValueError, match="size=0"):
+        client.create_order(contract="BTC_USDT", size=1, client_id="t-invalid", auto_size="close_long")
+
+
+def test_close_timeout_reconciles_by_client_id_without_resubmission():
+    class C:
+        def __init__(self): self.close_calls = 0; self.lookup_calls = 0
+        def close_position(self, **kwargs):
+            self.close_calls += 1
+            raise AmbiguousOrderError("timeout")
+        def find_by_client_id(self, client_id, contract):
+            self.lookup_calls += 1
+            return {"id": "reconciled-close", "text": client_id}
+
+    client = C()
+    result = GateTradingService(client, RiskLimits(100, 20, 10)).close_position_safely(
+        contract="BTC_USDT", client_id="t-close-timeout", position_mode="dual_long",
+    )
+    assert result["reconciled"] is True
+    assert client.close_calls == 1
+    assert client.lookup_calls == 1
+
+
+def test_position_age_enters_review_before_absolute_close():
+    position = {"create_time": 1_000}
+    review = position_age_stage(position, review_after_seconds=16 * 3600, force_close_after_seconds=36 * 3600, now=1_000 + 16 * 3600)
+    forced = position_age_stage(position, review_after_seconds=16 * 3600, force_close_after_seconds=36 * 3600, now=1_000 + 36 * 3600)
+    assert review == {"stage": "review", "age_seconds": 16 * 3600}
+    assert forced == {"stage": "force_close", "age_seconds": 36 * 3600}
+
+
+def test_absolute_position_limit_must_follow_review_threshold():
+    with pytest.raises(ValueError, match="must be greater"):
+        GateSettings(max_position_age_seconds=16 * 3600, absolute_max_position_age_seconds=16 * 3600).validate()
 
 
 def test_client_id_reconciliation_scans_open_and_finished_orders():

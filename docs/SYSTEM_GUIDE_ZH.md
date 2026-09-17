@@ -284,7 +284,9 @@ Gate 官方 `FuturesInitialOrder.size` 对 `price_orders` 定义为整数张。�
 - 同一合约只保留一个同方向突破计划；维持信号时不重复叠加。
 - 突破计划属于普通入场计划，不得计入 TP/SL 保护覆盖；主页在“在途入场委托”中独立标记。
 - AI 可在 `pending_orders_management` 中明确要求撤单，但系统仍校验订单身份和合约。
-- 持仓超过 `GATE_MAX_POSITION_AGE_SECONDS` 后会执行最长持仓平仓。
+- 持仓超过 `GATE_MAX_POSITION_AGE_SECONDS`（默认 16 小时）后进入最长持仓复核，不再仅因时间到点机械平仓。AI 结合浮盈、1H/4H 趋势、结构失效和反向信号选择 `HOLD`、`UPDATE_SL` 或 `CLOSE_MARKET`。
+- 持仓达到 `GATE_ABSOLUTE_MAX_POSITION_AGE_SECONDS`（默认 36 小时）后由执行层强制平仓；该值必须大于复核阈值。
+- Gate 双向持仓使用原生 `auto_size=close_long/close_short` 平仓；单向持仓继续使用 `size=0, close=true`。平仓请求超时后必须先按客户端订单号查单，禁止盲目重发。
 - AI 可输出 `HOLD`、`CLOSE_MARKET` 或 `UPDATE_SL` 管理已有持仓。
 - 止损后的冷却按合约隔离；ETH 的止损不会直接阻止 BTC、SOL，除非组合日亏损安全门已经触发。
 - 平仓后，系统重新读取持仓和保护单，只清理由本系统创建的孤立保护单。

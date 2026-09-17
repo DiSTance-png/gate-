@@ -31,6 +31,7 @@ class GateSettings:
     initial_capital_usd: float = 0.0
     max_pending_order_age_seconds: int = 1800
     max_position_age_seconds: int = 57600
+    absolute_max_position_age_seconds: int = 129600
     stop_cooldown_seconds: int = 1800
     max_entry_slippage_pct: float = 0.003
     entry_intent_enabled: bool = False
@@ -81,8 +82,10 @@ class GateSettings:
             raise ValueError("GATE_MAX_ENTRY_SLIPPAGE_PCT must be between 0 and 0.02")
         if not 60 <= self.breakout_expiration_seconds <= 900:
             raise ValueError("GATE_BREAKOUT_EXPIRATION_SECONDS must be between 60 and 900")
-        if min(self.max_pending_order_age_seconds, self.max_position_age_seconds, self.stop_cooldown_seconds) < 0:
+        if min(self.max_pending_order_age_seconds, self.max_position_age_seconds, self.absolute_max_position_age_seconds, self.stop_cooldown_seconds) < 0:
             raise ValueError("Gate lifecycle time limits cannot be negative")
+        if self.max_position_age_seconds > 0 and self.absolute_max_position_age_seconds > 0 and self.absolute_max_position_age_seconds <= self.max_position_age_seconds:
+            raise ValueError("GATE_ABSOLUTE_MAX_POSITION_AGE_SECONDS must be greater than GATE_MAX_POSITION_AGE_SECONDS")
         if self.max_daily_loss_usd <= 0 or not 0 < self.max_daily_loss_ratio <= 1:
             raise ValueError("Gate daily loss limits must be configured fail-closed")
         for name, value in (("GATE_TESTNET_BASE_URL", self.testnet_base_url), ("GATE_LIVE_BASE_URL", self.live_base_url)):
@@ -122,6 +125,7 @@ def load_settings() -> GateSettings:
         initial_capital_usd=float(os.getenv("GATE_INITIAL_CAPITAL_USD", "0")),
         max_pending_order_age_seconds=int(os.getenv("GATE_MAX_PENDING_ORDER_AGE_SECONDS", "1800")),
         max_position_age_seconds=int(os.getenv("GATE_MAX_POSITION_AGE_SECONDS", "57600")),
+        absolute_max_position_age_seconds=int(os.getenv("GATE_ABSOLUTE_MAX_POSITION_AGE_SECONDS", "129600")),
         stop_cooldown_seconds=int(os.getenv("GATE_STOP_COOLDOWN_SECONDS", "1800")),
         max_entry_slippage_pct=float(os.getenv("GATE_MAX_ENTRY_SLIPPAGE_PCT", "0.003")),
         entry_intent_enabled=_bool("GATE_ENTRY_INTENT_ENABLED"),

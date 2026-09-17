@@ -58,6 +58,17 @@ def position_age_seconds(position: dict, now: float | None = None) -> float | No
     return None if created is None else max(0.0, (now or time.time()) - created)
 
 
+def position_age_stage(position: dict, *, review_after_seconds: int, force_close_after_seconds: int, now: float | None = None) -> dict[str, Any]:
+    age = position_age_seconds(position, now=now)
+    if age is None:
+        return {"stage": "unknown", "age_seconds": None}
+    if force_close_after_seconds > 0 and age >= force_close_after_seconds:
+        return {"stage": "force_close", "age_seconds": int(age)}
+    if review_after_seconds > 0 and age >= review_after_seconds:
+        return {"stage": "review", "age_seconds": int(age)}
+    return {"stage": "normal", "age_seconds": int(age)}
+
+
 def _is_entry_order(order: dict) -> bool:
     return not bool(order.get("reduce_only") or order.get("is_reduce_only")) and not bool(order.get("close") or order.get("is_close"))
 

@@ -153,16 +153,35 @@ class GateFuturesClient:
         value = Decimal(str(size))
         return int(value) if value == value.to_integral_value() else float(value)
 
-    def create_order(self, *, contract: str, size: int | float | Decimal, price: str = "0", tif: str = "ioc", client_id: str, reduce_only: bool = False, close: bool = False):
+    def create_order(self, *, contract: str, size: int | float | Decimal, price: str = "0", tif: str = "ioc", client_id: str, reduce_only: bool = False, close: bool = False, auto_size: str | None = None):
         payload = {"contract": contract, "size": self._api_size(size), "price": price, "tif": tif, "text": client_id, "reduce_only": reduce_only, "close": close}
+        if auto_size is not None:
+            if auto_size not in {"close_long", "close_short"}:
+                raise ValueError("Gate dual-mode auto_size must be close_long or close_short")
+            if Decimal(str(size)) != 0 or close:
+                raise ValueError("Gate dual-mode auto_size requires size=0 and close=false")
+            payload["auto_size"] = auto_size
         try:
             return self._request("POST", f"/futures/{self.settings.settle}/orders", payload=payload, private=True)
         except AmbiguousOrderError:
             raise
 
-    def close_position(self, *, contract: str, client_id: str):
-        # Gate close-orders use size=0 and close=true; an opposite size is a
-        # separate order and is rejected when close=true.
+    def close_position(self, *, contract: str, client_id: str, position_mode: str | None = None):
+        mode = str(position_mode or "").lower()
+        if not mode:
+            rows = self.positions(contract) or []
+            rows = rows if isinstance(rows, list) else [rows]
+            active = [row for row in rows if Decimal(str(row.get("size") or 0)) != 0]
+            if len(active) != 1:
+                raise RuntimeError(f"Gate close requires exactly one active {contract} position side; found {len(active)}")
+            mode = str(active[0].get("mode") or "").lower()
+        if mode in {"dual_long", "dual_short"}:
+            side = "long" if mode == "dual_long" else "short"
+            return self.create_order(
+                contract=contract, size=0, price="0", tif="ioc", client_id=client_id,
+                reduce_only=False, close=False, auto_size=f"close_{side}",
+            )
+        # Single-position mode uses Gate's size=0, close=true semantic.
         return self.create_order(contract=contract, size=0, price="0", tif="ioc", client_id=client_id, reduce_only=True, close=True)
     def update_position_leverage(self, *, contract: str, leverage: float, cross_margin: bool = True):
         if leverage < 1:

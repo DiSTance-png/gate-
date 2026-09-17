@@ -18,7 +18,7 @@ from .execution_reconciler import JOURNAL_PATH as EXECUTION_JOURNAL, reconcile_i
 from .risk import RiskLimits
 from .service import GateTradingService, protection_coverage_status
 from .risk_profiles import get_risk_profile
-from .safety import atomic_json, classify_error, cooldown_state, daily_loss_state, position_age_seconds, reconcile_exchange_state
+from .safety import atomic_json, classify_error, cooldown_state, daily_loss_state, position_age_stage, reconcile_exchange_state
 from .protection_lifecycle import is_system_protection, load_protection_intents, record_protection_intent, recovery_plans
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1069,6 +1069,7 @@ def run_cycle() -> dict:
     }
     safety_status["safe_for_new_risk"] = bool(not private_context["private_errors"] and reconciliation["safe_for_new_risk"] and not daily_loss["tripped"])
     lifecycle_actions: list[dict] = []
+    position_age_reviews: dict[str, dict] = {}
     if execution_enabled and not private_context["private_errors"]:
         service = GateTradingService(client, RiskLimits(settings.max_position_notional_usd, settings.max_total_margin_usd, settings.max_order_margin_usd))
         lifecycle_close_attempts: set[str] = set()
@@ -1096,15 +1097,28 @@ def run_cycle() -> dict:
             size = Decimal(str(position.get("size") or 0))
             if size == 0:
                 continue
-            age = position_age_seconds(position)
-            if age is not None and settings.max_position_age_seconds > 0 and age >= settings.max_position_age_seconds:
-                contract_name = str(position.get("contract") or "").upper()
+            contract_name = str(position.get("contract") or "").upper()
+            age_state = position_age_stage(
+                position,
+                review_after_seconds=settings.max_position_age_seconds,
+                force_close_after_seconds=settings.absolute_max_position_age_seconds,
+            )
+            if age_state["stage"] == "force_close":
+                age = int(age_state["age_seconds"])
                 lifecycle_close_attempts.add(contract_name)
                 try:
-                    closed = service.close_position_safely(contract=contract_name, client_id=f"t-gate-time-{int(time.time() * 1000)}")
-                    lifecycle_actions.append({"action": "CLOSE_MAX_AGE", "contract": contract_name, "age_seconds": int(age), "result": closed})
+                    closed = service.close_position_safely(
+                        contract=contract_name,
+                        client_id=f"t-gate-time-{int(time.time() * 1000)}",
+                        position_mode=str(position.get("mode") or ""),
+                    )
+                    lifecycle_actions.append({"action": "CLOSE_ABSOLUTE_MAX_AGE", "contract": contract_name, "age_seconds": age, "result": closed})
                 except Exception as exc:
-                    lifecycle_actions.append({"action": "CLOSE_MAX_AGE", "contract": contract_name, "age_seconds": int(age), "error": str(exc), "category": classify_error(exc)})
+                    position_age_reviews[contract_name] = {"stage": "absolute_close_failed", "age_seconds": age}
+                    lifecycle_actions.append({"action": "CLOSE_ABSOLUTE_MAX_AGE", "contract": contract_name, "age_seconds": age, "error": str(exc), "category": classify_error(exc)})
+            elif age_state["stage"] == "review":
+                position_age_reviews[contract_name] = age_state
+                lifecycle_actions.append({"action": "REVIEW_MAX_AGE", "contract": contract_name, "age_seconds": int(age_state["age_seconds"]), "absolute_limit_seconds": settings.absolute_max_position_age_seconds})
         recovery_source_available = True
         try:
             # Cleanup and time-based closes may have changed exchange state. A
@@ -1144,7 +1158,8 @@ def run_cycle() -> dict:
             if plan["close_required"]:
                 client_id = f"t-gate-pclose-{int(time.time() * 1000)}"
                 try:
-                    closed = service.close_position_safely(contract=contract_name, client_id=client_id)
+                    current_position = next((row for row in private_context["positions"] if str(row.get("contract") or "").upper() == contract_name and Decimal(str(row.get("size") or 0)) != 0), {})
+                    closed = service.close_position_safely(contract=contract_name, client_id=client_id, position_mode=str(current_position.get("mode") or ""))
                     lifecycle_actions.append({"action": "CLOSE_CROSSED_MISSING_PROTECTION", **plan, "client_id": client_id, "result": closed})
                     protection_closed_contracts.add(contract_name)
                 except Exception as exc:
@@ -1195,7 +1210,10 @@ def run_cycle() -> dict:
                 size = float(position.get("size") or 0)
                 if not size:
                     continue
-                active_positions_detail.append({"instId": str(position.get("contract") or "").replace("_USDT", "-USDT-SWAP"), "name": position.get("contract"), "side": "long" if size > 0 else "short", "pos": str(abs(size)), "lever": position.get("leverage") or position.get("lever") or "--", "avgPx": position.get("entry_price"), "lastPx": position.get("mark_price"), "upl": position.get("unrealised_pnl"), "uplRatio": 0.0})
+                contract_name = str(position.get("contract") or "").upper()
+                age_state = position_age_stage(position, review_after_seconds=settings.max_position_age_seconds, force_close_after_seconds=settings.absolute_max_position_age_seconds)
+                stage_desc = "已到持仓复核期，须结合趋势、浮盈和反向信号决定继续持有、移损或退出" if age_state["stage"] == "review" else ("已到绝对持仓上限" if age_state["stage"] == "force_close" else "持有监控中")
+                active_positions_detail.append({"instId": contract_name.replace("_USDT", "-USDT-SWAP"), "name": contract_name, "side": "long" if size > 0 else "short", "pos": str(abs(size)), "lever": position.get("leverage") or position.get("lever") or "--", "avgPx": position.get("entry_price"), "lastPx": position.get("mark_price"), "upl": position.get("unrealised_pnl"), "uplRatio": 0.0, "holding_age_seconds": age_state["age_seconds"], "stage_desc": stage_desc})
             pending_orders_detail = [{"ordId": str(order.get("id")), "instId": str(order.get("contract") or "").replace("_USDT", "-USDT-SWAP"), "side": "buy" if float(order.get("size") or 0) > 0 else "sell", "posSide": "net", "px": order.get("price"), "sz": abs(float(order.get("size") or 0)), "state": order.get("status", "open"), "cTime": str(order.get("create_time_ms") or ""), "text": order.get("text", "")} for order in private_context["pending_orders"] if isinstance(order, dict)]
             pending_orders_detail.extend([
                 {"ordId": str(order.get("id")), "instId": str((order.get("initial") or {}).get("contract") or "").replace("_USDT", "-USDT-SWAP"),
@@ -1218,6 +1236,12 @@ def run_cycle() -> dict:
                       'position_management actions are HOLD|CLOSE_MARKET|UPDATE_SL; pending_orders_management actions are KEEP|CANCEL. '
                       'Gate Futures data: ' + json.dumps({"instruments": features, "account": private_context["account"], "positions": private_context["positions"], "pending_orders": private_context["pending_orders"]}, ensure_ascii=False))
             system_prompt = "You are a Gate Futures risk-controlled trading decision model. Return the final JSON object only."
+        if position_age_reviews:
+            prompt += ("\n【最长持仓复核】以下合约已超过复核阈值，但尚未达到绝对上限："
+                       + json.dumps(position_age_reviews, ensure_ascii=False)
+                       + "。不得仅因持仓时间到点就机械平仓；必须结合当前浮盈、1H/4H趋势是否延续、结构是否失效及明确反向信号，"
+                         "在 position_management 中选择 HOLD、UPDATE_SL 或 CLOSE_MARKET。趋势仍有效且保护完整可继续持有；"
+                         "盈利但动能减弱时优先合理上移止损；结构失效或出现明确反向信号时退出。绝对持仓上限由执行层强制执行。")
         runtime = get_active_llm_runtime()
         request_url = runtime["base_url"].rstrip("/") + "/chat/completions"
         request_headers = {"Authorization": f"Bearer {runtime['api_key']}", "Content-Type": "application/json"}
@@ -1340,7 +1364,7 @@ def run_cycle() -> dict:
             mgmt_action = str(instruction.get("action") or "HOLD").upper()
             try:
                 if mgmt_action == "CLOSE_MARKET":
-                    management_result["positions"].append({"contract": contract_name, "action": mgmt_action, "result": client.close_position(contract=contract_name, client_id=f"t-gate-close-{now}")})
+                    management_result["positions"].append({"contract": contract_name, "action": mgmt_action, "result": GateTradingService(client, RiskLimits(settings.max_position_notional_usd, settings.max_total_margin_usd, settings.max_order_margin_usd)).close_position_safely(contract=contract_name, client_id=f"t-gate-close-{now}", position_mode=str(current.get("mode") or ""))})
                 elif mgmt_action == "UPDATE_SL" and float(instruction.get("suggested_sl_price") or 0) > 0:
                     meta = client.contracts(contract_name)
                     step = meta.get("order_price_round") or meta.get("mark_price_round") or "0"

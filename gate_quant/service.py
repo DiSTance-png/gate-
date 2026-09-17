@@ -69,9 +69,9 @@ class GateTradingService:
         protections = self.client.protection_orders(contract)
         return bool(protection_coverage_status(protections, position_size)["fully_protected"])
 
-    def close_position_safely(self, *, contract: str, client_id: str):
+    def close_position_safely(self, *, contract: str, client_id: str, position_mode: str | None = None):
         try:
-            return self.client.close_position(contract=contract, client_id=client_id)
+            return self.client.close_position(contract=contract, client_id=client_id, position_mode=position_mode)
         except AmbiguousOrderError:
             found = self.client.find_by_client_id(client_id, contract)
             if found:
