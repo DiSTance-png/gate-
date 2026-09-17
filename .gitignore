@@ -24,6 +24,7 @@ data/news_sentiment.json
 data/trading_ledger.json
 data/position_trackers.json
 data/self_improvement_report.json
+data/self_improvement_last_prompt.txt
 data/self_improvement_history/
 data/evolution_candidates/
 data/policy_archives/
