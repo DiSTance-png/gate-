@@ -207,14 +207,14 @@ onMounted(() => {
 
     <section v-if="incompleteDecisions.length" class="border rounded-lg overflow-hidden" style="background-color: var(--bg-card); border-color: #f59e0b;">
       <div class="px-4 py-3 border-b" style="border-color: var(--border-subtle);">
-        <h2 class="text-xs font-black text-amber-300">未完成 AI 决策巡查</h2>
-        <p class="text-[11px] mt-1" style="color: var(--text-muted);">发现任务异常或超时；这里只记录和对账，不会自动重跑或下单。</p>
+        <h2 class="text-xs font-black text-amber-300">异常与未闭环巡查</h2>
+        <p class="text-[11px] mt-1" style="color: var(--text-muted);">发现决策、执行、保护或状态一致性异常；这里只记录和对账，不会自动交易。</p>
       </div>
       <div class="divide-y" style="border-color: var(--border-subtle);">
-        <div v-for="item in incompleteDecisions" :key="item.run_id" class="px-4 py-3 text-xs">
-          <div class="flex flex-wrap justify-between gap-2"><b class="text-amber-300">{{ item.status_label }}</b><span class="font-mono" style="color: var(--text-muted);">{{ item.started_at || '--' }}</span></div>
-          <div class="mt-1" style="color: var(--text-muted);">失败阶段：{{ item.failure_stage }} · 返回码：{{ item.return_code ?? '--' }}</div>
-          <pre class="mt-2 whitespace-pre-wrap text-[11px] text-red-300">{{ item.error_summary }}</pre>
+        <div v-for="item in incompleteDecisions" :key="item.fingerprint || item.run_id" class="px-4 py-3 text-xs">
+          <div class="flex flex-wrap justify-between gap-2"><b class="text-amber-300">{{ item.title || item.status_label }}</b><span class="font-mono" style="color: var(--text-muted);">{{ item.contract || item.client_id || item.code }}</span></div>
+          <div class="mt-1" style="color: var(--text-muted);">类别：{{ item.category || 'decision' }} · 等级：{{ item.severity || 'warning' }}</div>
+          <pre class="mt-2 whitespace-pre-wrap text-[11px] text-red-300">{{ item.detail || item.error_summary }}</pre>
         </div>
       </div>
     </section>

@@ -66,6 +66,10 @@ def _save_decision_payload(payload: dict, decisions_payload: dict, trade: dict, 
         "policy_version": risk_snapshot.get("policy_version", "gate@unknown"),
         "policy_hash": risk_snapshot.get("policy_hash", "unknown"),
         "risk_snapshot": risk_snapshot,
+        "safety_status": payload.get("safety_status") or {},
+        "position_management": payload.get("position_management") or [],
+        "pending_orders_management": payload.get("pending_orders_management") or [],
+        "management_result": payload.get("management_result") or {},
         "decisions": {
             symbol: {
                 "action": envelope["decision"].get("action", "WAIT"),
@@ -1446,7 +1450,8 @@ def run_cycle() -> dict:
     payload = {**decisions_payload, "generated_at_ms": now, "exchange": "gate", "environment": settings.environment,
                "policy_snapshot": policy_snapshot, "risk_snapshot": risk_snapshot, "safety_status": safety_status,
                "position_management": position_management, "pending_orders_management": pending_management,
-               "private_context": private_context, "trade": result["trade"], "trades": all_outcomes}
+               "management_result": result.get("management") or {}, "private_context": private_context,
+               "trade": result["trade"], "trades": all_outcomes}
     _save_decision_payload(payload, decisions_payload, result["trade"], now, settings.environment, risk_snapshot)
     result["decisions"] = decisions_payload
     return result

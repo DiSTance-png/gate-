@@ -30,6 +30,7 @@ data/policy_archives/
 data/gate_safety_status.json
 data/gate_trader_heartbeat.json
 data/gate_execution_reconciler.json
+data/gate_anomaly_history.json
 data/protection_intents.json
 data/pending_requotes.json
 backups/

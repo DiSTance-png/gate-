@@ -35,6 +35,7 @@
 - `gate_quant/execution_journal.py`：下单前 SQLite 执行意图台账。
 - `gate_quant/execution_reconciler.py`：10 秒成交、持仓与保护单对账。
 - `gate_quant/protection_lifecycle.py`：保护意图恢复、保护缺口和孤立保护单生命周期。
+- `gate_quant/anomaly_audit.py`：只读异常与未闭环审计、环境隔离的异常指纹和恢复历史；不得在此模块加入交易写操作。
 - `gate_quant/safety.py`、`gate_quant/risk.py`、`gate_quant/risk_profiles.py`：硬风控与风险档位。
 - `gate_quant/web.py`：8081 Web、Gate 原生 API 路由和控制面挂载。
 - `r20_gateway/worker.py`、`r20_gateway/scheduler.py`：任务调度和通知投递。这里的 Gateway 不是交易所 API 网关。
@@ -126,8 +127,8 @@ git diff --check
 
 ## 当前验证基线
 
-- 修改前基线提交：`b062f45`。
-- 离线测试：126 项通过。
+- 当前部署前基线提交：`71d2e11`。
+- 离线测试：134 项通过。
 - 已在 Gate Testnet 正常链验证行情、账户、持仓、挂单、成交、撤单、保护单、过期撤单、原生平仓台账，以及突破计划多空触发、`trade_id` 对账、真实成交价保护重算和清理归零。双向持仓原生 `auto_size` 平仓已完成 Testnet 最小仓位回归；“复核阈值 + 绝对上限”已完成离线验证，尚未等待真实时长做 Testnet 回归。
 - 超时找回、部分成交递增保护、保护失败回滚和重启恢复已做离线故障注入，但尚未主动在 Testnet 制造这些异常。
 - Gate Live 从未执行过交易，不能声称已经完成实盘回归。

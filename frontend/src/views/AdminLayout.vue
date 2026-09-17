@@ -47,7 +47,7 @@ const navGroups = computed(() => [
     label: t('admin.sysOverview'),
     items: [
       { id: 'overview', label: t('admin.dashboard'), icon: LayoutDashboard },
-      { id: 'incomplete-decisions', label: '未完成决策', icon: AlertTriangle },
+      { id: 'incomplete-decisions', label: '异常与未闭环', icon: AlertTriangle },
       { id: 'decisions', label: t('admin.runtimeTelemetry', '决策日志'), icon: Radio },
     ],
   },

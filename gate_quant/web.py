@@ -28,6 +28,7 @@ def _backend_log(message: str) -> None:
         handle.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
 
 from .client import GateFuturesClient
+from .anomaly_audit import collect_anomalies, persist_anomaly_history
 from .config import load_settings
 from .execution_journal import ExecutionJournal
 from .execution_reconciler import JOURNAL_PATH as EXECUTION_JOURNAL
@@ -69,6 +70,7 @@ from r20_gateway.agents import agent_statuses
 from r20_gateway.secrets import status as secret_store_status
 
 DATA_DIR = ROOT / "data"
+ANOMALY_HISTORY = DATA_DIR / "gate_anomaly_history.json"
 LOG_SOURCES = {"trader": "gate_trader.log", "backend": "gate_backend.log", "scheduler": "r20_gateway.log"}
 
 def _read_json_file(name: str, default):
@@ -857,8 +859,39 @@ def gate_admin_history(page: int = 1, page_size: int = 20, query: str = "", x_ga
 @app.get("/api/v1/admin/incomplete-decisions")
 def gate_admin_incomplete_decisions(limit: int = 100, x_gate_session: str | None = Header(default=None, alias="X-R20-Session")):
     _require_control_admin(x_gate_session)
-    rows = _incomplete_decision_runs(limit)
-    return {"items": rows, "total": len(rows), "repair_policy": "只读查看与对账；不会自动重跑 AI 或提交订单"}
+    settings = load_settings()
+    clients = [GateFuturesClient(settings) for _ in range(3)]
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="gate-anomaly-audit") as executor:
+        position_future = executor.submit(safe_private, clients[0].positions, [])
+        order_future = executor.submit(safe_private, clients[1].open_orders, [])
+        protection_future = executor.submit(safe_private, clients[2].protection_orders, [])
+        positions, position_error = position_future.result()
+        orders, order_error = order_future.result()
+        protections, protection_error = protection_future.result()
+    try:
+        executions = ExecutionJournal(EXECUTION_JOURNAL).active(settings.environment, limit=200)
+    except Exception as exc:
+        executions = [{"client_id": "journal-read", "contract": "", "status": "manual_review", "last_error": str(exc)}]
+    report = collect_anomalies(
+        environment=settings.environment,
+        job_runs=GatewayStore(GATEWAY_DB_PATH).job_runs(200),
+        decision=_read_json_file("ai_brain_decisions.json", {}),
+        safety_snapshot=_safety_status(),
+        trader_heartbeat=_read_json_file("gate_trader_heartbeat.json", {}),
+        reconciler_heartbeat=_read_json_file("gate_execution_reconciler.json", {}),
+        executions=executions,
+        positions=positions if isinstance(positions, list) else [],
+        orders=orders if isinstance(orders, list) else [],
+        protections=protections if isinstance(protections, list) else [],
+        private_errors=sorted(set(error for error in (position_error, order_error, protection_error) if error)),
+        max_pending_age_seconds=settings.max_pending_order_age_seconds,
+    )
+    persisted = persist_anomaly_history(ANOMALY_HISTORY, report)
+    history_limit = max(20, min(limit, 500))
+    persisted["history"] = persisted["history"][:history_limit]
+    persisted["total"] = persisted["active_total"]
+    persisted["repair_policy"] = "只读检测、记录与对账；不会自动重跑 AI、提交订单、撤单或平仓"
+    return persisted
 
 
 @app.get("/api/v1/admin/config")
