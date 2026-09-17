@@ -7,13 +7,13 @@ from gate_quant.client import GateFuturesClient, AmbiguousOrderError
 from gate_quant.config import GateSettings
 from gate_quant.risk import RiskLimits
 from gate_quant.service import GateTradingService, protection_coverage_status
-from gate_quant.ai_worker import _extract_decision_object, _extract_response_object, _as_instruction_list, _order_size_for_margin, _protection_matches, _execution_enabled, _account_committed_margin, _portfolio_position_notional, _requote_decision, _confirm_pending_requotes, _preflight_candidate_quotes, _run_serial_candidates, _entry_execution_plan, _breakout_compatible_size, _manage_breakout_plans, _untracked_trigger_entries
+from gate_quant.ai_worker import _extract_decision_object, _extract_response_object, _as_instruction_list, _order_size_for_margin, _protection_matches, _reduce_crossed_protection_slice, _execution_enabled, _account_committed_margin, _portfolio_position_notional, _requote_decision, _confirm_pending_requotes, _preflight_candidate_quotes, _run_serial_candidates, _entry_execution_plan, _breakout_compatible_size, _manage_breakout_plans, _untracked_trigger_entries
 from gate_quant.execution_journal import ExecutionJournal
 from gate_quant.strategy_adapter import validate_decision
 from gate_quant.risk_profiles import get_risk_profile
 from r20_gateway.scheduler import JOBS, GatewayScheduler
 from gate_quant.safety import classify_error, cooldown_state, daily_loss_state, position_age_stage, reconcile_exchange_state
-from gate_quant.protection_lifecycle import intent_from_history, is_system_protection, recovery_plans
+from gate_quant.protection_lifecycle import actionable_recovery_plans, intent_from_history, is_system_protection, recovery_plans
 from scripts.sync_gate_ledger import _ledger_row
 
 
@@ -666,6 +666,52 @@ def test_recovery_plan_rejects_crossed_saved_trigger_and_manual_orphan():
     assert crossed["close_required"] is True
     assert is_system_protection({"initial": {"text": "manual-protection"}}) is False
     assert is_system_protection({"initial": {"text": "t-gate-rsl-123"}}) is True
+
+
+def test_crossed_stop_suppresses_same_contract_take_profit_repair():
+    protections = [
+        {"trigger": {"rule": 1}, "initial": {"contract": "BTC_USDT", "size": -98, "text": "t-gate-tp-old", "is_reduce_only": True}},
+        {"trigger": {"rule": 2}, "initial": {"contract": "BTC_USDT", "size": -98, "text": "t-gate-sl-old", "is_reduce_only": True}},
+    ]
+    plans = recovery_plans(
+        [{"contract": "BTC_USDT", "size": 197, "mark_price": "76327.6", "open_time": 1}], protections,
+        [{"contract": "BTC_USDT", "position_side": "long", "entry_client_id": "t-gate-ai-new",
+          "take_profit_price": "79500", "stop_loss_price": "76950", "created_at_ms": 1000}],
+    )
+    actionable = actionable_recovery_plans(plans)
+    assert len(actionable) == 1
+    assert actionable[0]["kind"] == "stop_loss"
+    assert actionable[0]["close_required"] is True
+    assert actionable[0]["missing_size"] == "99"
+    assert actionable[0]["close_size"] == "-99"
+
+
+def test_partial_crossed_stop_plan_keeps_reduction_size_not_full_position():
+    plans = actionable_recovery_plans([
+        {"contract": "BTC_USDT", "kind": "take_profit", "missing_size": "99", "close_size": "-99", "close_required": False},
+        {"contract": "BTC_USDT", "kind": "stop_loss", "missing_size": "99", "close_size": "-99", "close_required": True},
+    ])
+    assert plans == [{
+        "contract": "BTC_USDT", "kind": "stop_loss", "missing_size": "99",
+        "close_size": "-99", "close_required": True,
+    }]
+
+    class Service:
+        def __init__(self):
+            self.reductions = []
+
+        def reduce_position_safely(self, **kwargs):
+            self.reductions.append(kwargs)
+            return {"status": "finished", "size": str(kwargs["size"])}
+
+        def close_position_safely(self, **kwargs):
+            raise AssertionError("partial protection recovery must never flatten the contract")
+
+    service = Service()
+    reduced_size, result = _reduce_crossed_protection_slice(service, plans[0], "t-gate-pred-test")
+    assert reduced_size == Decimal("-99")
+    assert service.reductions == [{"contract": "BTC_USDT", "size": Decimal("-99"), "client_id": "t-gate-pred-test"}]
+    assert result["size"] == "-99"
 
 
 def test_recovery_plan_does_not_link_an_old_intent_to_a_new_position():

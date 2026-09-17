@@ -162,3 +162,18 @@ def recovery_plans(positions: list[dict], protections: list[dict], intents: list
                 "source_entry_client_id": str((source or {}).get("entry_client_id") or ""),
             })
     return plans
+
+
+def actionable_recovery_plans(plans: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Prioritize crossed stops and suppress repairs for the slice being reduced."""
+    crossed_contracts = {
+        str(plan.get("contract") or "").upper()
+        for plan in plans if plan.get("close_required")
+    }
+    crossed = [plan for plan in plans if plan.get("close_required")]
+    repairs = [
+        plan for plan in plans
+        if not plan.get("close_required")
+        and str(plan.get("contract") or "").upper() not in crossed_contracts
+    ]
+    return crossed + repairs

@@ -19,7 +19,7 @@ from .risk import RiskLimits
 from .service import GateTradingService, protection_coverage_status
 from .risk_profiles import get_risk_profile
 from .safety import atomic_json, classify_error, cooldown_state, daily_loss_state, position_age_stage, reconcile_exchange_state
-from .protection_lifecycle import is_system_protection, load_protection_intents, record_protection_intent, recovery_plans
+from .protection_lifecycle import actionable_recovery_plans, is_system_protection, load_protection_intents, record_protection_intent, recovery_plans
 
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env", override=True)
@@ -108,7 +108,21 @@ def _console_summary(result: dict) -> str:
     short_count = sum(float(position.get("size") or 0) < 0 for position in active)
     trade = payload.get("trade") or result.get("trade") or {}
     status = str(trade.get("status") or "not_submitted")
-    if status in {"submitted_testnet", "submitted_live"}:
+    lifecycle_actions = (payload.get("safety_status") or {}).get("lifecycle_actions") or []
+    completed_lifecycle_trades = [
+        row for row in lifecycle_actions
+        if isinstance(row, dict) and row.get("result") and not row.get("error")
+        and row.get("action") in {"REDUCE_CROSSED_MISSING_PROTECTION", "CLOSE_ABSOLUTE_MAX_AGE"}
+    ]
+    if completed_lifecycle_trades:
+        labels = []
+        for row in completed_lifecycle_trades:
+            if row.get("action") == "REDUCE_CROSSED_MISSING_PROTECTION":
+                labels.append(f"[{row.get('contract', '--')}] 保护缺口减仓 {row.get('reduced_size', row.get('missing_size', '--'))} 张")
+            else:
+                labels.append(f"[{row.get('contract', '--')}] 超过绝对持仓时限，已平仓")
+        action_text = "；".join(labels)
+    elif status in {"submitted_testnet", "submitted_live"}:
         venue = "测试网" if status == "submitted_testnet" else "实盘"
         action_text = f"[{trade.get('contract', '--')}] 已提交{venue}订单"
     elif status == "blocked_by_strategy_interceptor":
@@ -983,6 +997,19 @@ def _protection_matches(rows: list[dict], *, client_id: str, size: int | float |
     return False
 
 
+def _reduce_crossed_protection_slice(service: GateTradingService, plan: dict[str, Any], client_id: str) -> tuple[Decimal, Any]:
+    """Reduce exactly the unprotected slice; this path must never flatten the contract."""
+    reduce_size = Decimal(str(plan["close_size"]))
+    if reduce_size == 0:
+        raise ValueError("crossed protection recovery produced a zero reduction size")
+    result = service.reduce_position_safely(
+        contract=str(plan["contract"]),
+        size=reduce_size,
+        client_id=client_id,
+    )
+    return reduce_size, result
+
+
 def _as_instruction_list(value) -> list[dict]:
     if isinstance(value, list):
         return [item for item in value if isinstance(item, dict)]
@@ -1153,21 +1180,25 @@ def run_cycle() -> dict:
         except Exception as exc:
             recovery_source_available = False
             lifecycle_actions.append({"action": "REFRESH_BEFORE_PROTECTION_REPAIR", "error": str(exc), "category": classify_error(exc)})
-        plans = recovery_plans(private_context["positions"], private_context["protections"], protection_intents) if recovery_source_available else []
+        plans = actionable_recovery_plans(
+            recovery_plans(private_context["positions"], private_context["protections"], protection_intents)
+        ) if recovery_source_available else []
         protection_closed_contracts: set[str] = set()
         for plan in plans:
             contract_name = plan["contract"]
             if contract_name in lifecycle_close_attempts or contract_name in protection_closed_contracts:
                 continue
             if plan["close_required"]:
-                client_id = f"t-gate-pclose-{int(time.time() * 1000)}"
+                client_id = f"t-gate-pred-{int(time.time() * 1000)}"
                 try:
-                    current_position = next((row for row in private_context["positions"] if str(row.get("contract") or "").upper() == contract_name and Decimal(str(row.get("size") or 0)) != 0), {})
-                    closed = service.close_position_safely(contract=contract_name, client_id=client_id, position_mode=str(current_position.get("mode") or ""))
-                    lifecycle_actions.append({"action": "CLOSE_CROSSED_MISSING_PROTECTION", **plan, "client_id": client_id, "result": closed})
+                    reduce_size, reduced = _reduce_crossed_protection_slice(service, plan, client_id)
+                    lifecycle_actions.append({
+                        "action": "REDUCE_CROSSED_MISSING_PROTECTION", **plan,
+                        "client_id": client_id, "reduced_size": str(abs(reduce_size)), "result": reduced,
+                    })
                     protection_closed_contracts.add(contract_name)
                 except Exception as exc:
-                    lifecycle_actions.append({"action": "CLOSE_CROSSED_MISSING_PROTECTION", **plan, "client_id": client_id, "error": str(exc), "category": classify_error(exc)})
+                    lifecycle_actions.append({"action": "REDUCE_CROSSED_MISSING_PROTECTION", **plan, "client_id": client_id, "error": str(exc), "category": classify_error(exc)})
                 continue
             if not plan["recoverable"]:
                 lifecycle_actions.append({"action": "KEEP_PROTECTION_GAP", **plan})
