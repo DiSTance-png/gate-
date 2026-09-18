@@ -37,6 +37,12 @@ const macroText: Record<string, string> = {
   RANGE: '大周期震荡',
 }
 
+const positionActionText: Record<string, string> = {
+  HOLD: '继续持有',
+  UPDATE_SL: '调整止损',
+  CLOSE_MARKET: '市价平仓',
+}
+
 const tradeStatusText: Record<string, string> = {
   not_submitted: '未下单',
   submitted_testnet: '已提交模拟盘订单',
@@ -80,6 +86,22 @@ function historyStatusText(status: unknown) {
   return tradeStatusText[value] || (value ? `未知状态（${value}）` : '--')
 }
 
+function positionContract(item: any) {
+  return String(item?.contract || item?.instId || '--').replace('-USDT-SWAP', '/USDT').replace('_USDT', '/USDT')
+}
+
+function positionExecutionText(cycle: any, instruction: any) {
+  const action = String(instruction?.action || 'HOLD').toUpperCase()
+  if (action === 'HOLD') return '无需执行交易操作'
+  const contract = String(instruction?.contract || instruction?.instId || '').replace('-USDT-SWAP', '_USDT').replace(/-/g, '_')
+  const result = (cycle?.management_result?.positions || []).find((item: any) =>
+    String(item?.contract || '').toUpperCase() === contract.toUpperCase() && String(item?.action || '').toUpperCase() === action,
+  )
+  if (!result) return '未记录执行结果'
+  if (result.error) return `执行失败：${result.error}`
+  return action === 'UPDATE_SL' ? '止损调整已提交' : '平仓已提交'
+}
+
 function formatTraderLog(raw: string) {
   const lines = raw.split(/\r?\n/)
   const chineseSummary: string[] = []
@@ -87,6 +109,7 @@ function formatTraderLog(raw: string) {
     if (lines[index].includes('Gate Quantum Trader') && (lines[index].includes('巡检完成') || lines[index].includes('巡检异常'))) {
       chineseSummary.push(lines[index])
       if (lines[index + 1]?.startsWith('AI决策')) chineseSummary.push(lines[index + 1])
+      if (lines[index + 2]?.startsWith('持仓判断')) chineseSummary.push(lines[index + 2])
     }
   }
   if (chineseSummary.length) return chineseSummary.slice(-12).join('\n')
@@ -135,7 +158,12 @@ function formatTraderLog(raw: string) {
 
     const trade = payload.trade || {}
     const tradeLine = `执行结果：${cycleTradeText(trade)}${trade.reason ? `（${trade.reason}）` : ''}`
-    return [`【交易巡检】${timestamp}`, `巡检状态：${returnCode === '0' ? '正常完成' : `异常结束（返回码 ${returnCode}）`}`, tradeLine, '', rows.join('\n\n') || '本轮没有可展示的合约决策'].join('\n')
+    const positionRows = (payload.position_management || []).map((position: any) => {
+      const action = positionActionText[position.action] || position.action || '未知判断'
+      const stop = position.action === 'UPDATE_SL' && Number(position.suggested_sl_price) > 0 ? `，建议止损 $${Number(position.suggested_sl_price).toLocaleString()}` : ''
+      return `${positionContract(position)}: ${action}，置信度 ${pct(position.confidence, 0)}${stop}\n  理由：${position.reason || '未提供持仓判断理由'}`
+    })
+    return [`【交易巡检】${timestamp}`, `巡检状态：${returnCode === '0' ? '正常完成' : `异常结束（返回码 ${returnCode}）`}`, tradeLine, '', rows.join('\n\n') || '本轮没有可展示的合约决策', ...(positionRows.length ? ['', '【当前持仓判断】', positionRows.join('\n\n')] : [])].join('\n')
   }).join('\n\n────────────────────────\n\n')
 }
 
@@ -257,6 +285,21 @@ onMounted(() => {
                 </tr>
               </tbody>
             </table>
+          </div>
+          <div v-if="cycle.position_management?.length" class="mt-3 border rounded-lg overflow-hidden" style="border-color: var(--border-subtle); background-color: var(--bg-card-subtle);">
+            <div class="px-3 py-2 border-b text-[11px] font-black" style="border-color: var(--border-subtle); color: var(--text-main);">当前持仓判断</div>
+            <div class="divide-y" style="border-color: var(--border-subtle);">
+              <div v-for="(position, positionIndex) in cycle.position_management" :key="`${positionContract(position)}-${positionIndex}`" class="px-3 py-2.5 text-[11px]">
+                <div class="flex flex-wrap items-center gap-x-3 gap-y-1">
+                  <strong class="font-mono" style="color: var(--text-main);">{{ positionContract(position) }}</strong>
+                  <span class="font-bold" :style="{ color: position.action === 'HOLD' ? 'var(--color-brand)' : 'var(--color-warn)' }">{{ positionActionText[position.action] || position.action || '未知判断' }}</span>
+                  <span style="color: var(--text-muted);">置信度 {{ pct(position.confidence, 0) }}</span>
+                  <span v-if="position.action === 'UPDATE_SL' && Number(position.suggested_sl_price) > 0" class="font-mono text-amber-300">建议止损 ${{ Number(position.suggested_sl_price).toLocaleString() }}</span>
+                </div>
+                <p class="mt-1" style="color: var(--text-muted);">判断理由：{{ position.reason || '未提供持仓判断理由' }}</p>
+                <p class="mt-1" :class="positionExecutionText(cycle, position).startsWith('执行失败') ? 'text-red-300' : 'text-emerald-300'">执行结果：{{ positionExecutionText(cycle, position) }}</p>
+              </div>
+            </div>
           </div>
         </div>
       </div>

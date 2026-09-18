@@ -13,6 +13,7 @@ from gate_quant.strategy_adapter import validate_decision
 from gate_quant.risk_profiles import get_risk_profile
 from gate_quant.strategy_adapter import build_gate_risk_budget, strip_legacy_risk_values
 from gate_quant import strategy_adapter
+from gate_quant import ai_worker
 from r20_gateway.scheduler import JOBS, GatewayScheduler
 from gate_quant.safety import classify_error, cooldown_state, daily_loss_state, position_age_stage, reconcile_exchange_state
 from gate_quant.protection_lifecycle import actionable_recovery_plans, intent_from_history, is_system_protection, recovery_plans
@@ -32,6 +33,26 @@ class FakeSession:
 
 
 def settings(): return GateSettings(environment="testnet", api_key="offline-key", api_secret="offline-secret", max_order_margin_usd=10, max_total_margin_usd=20, max_position_notional_usd=100)
+
+
+def test_console_summary_includes_current_position_management(monkeypatch, tmp_path):
+    decisions = tmp_path / "ai_brain_decisions.json"
+    decisions.write_text(json.dumps({
+        "private_context": {"positions": [{"contract": "BTC_USDT", "size": "-98"}]},
+        "trade": {"status": "not_submitted"},
+        "position_management": [{
+            "instId": "BTC_USDT", "action": "HOLD", "confidence": 62,
+            "suggested_sl_price": 0, "reason": "空单趋势仍然有效",
+        }],
+    }, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(ai_worker, "DECISIONS", decisions)
+
+    summary = ai_worker._console_summary({
+        "trade": {"status": "not_submitted"},
+        "decisions": {"BTC_USDT": {"decision": {"action": "WAIT", "confidence": 55}}},
+    })
+
+    assert "持仓判断 | BTC:继续持有(62%) - 空单趋势仍然有效" in summary
 
 
 def test_requote_repairs_stale_long_without_market_conversion():

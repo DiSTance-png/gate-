@@ -149,7 +149,28 @@ def _console_summary(result: dict) -> str:
     if len(trades) > 1:
         status_parts = [f"{row.get('contract', '--')}:{TRADE_STATUS_LABELS.get(str(row.get('status') or ''), row.get('status') or '未下单')}" for row in trades]
         headline += "\n候选执行 | " + " | ".join(status_parts)
-    return headline + "\nAI决策 | " + " | ".join(decision_parts)
+    summary = headline + "\nAI决策 | " + " | ".join(decision_parts)
+    position_action_labels = {
+        "HOLD": "继续持有",
+        "UPDATE_SL": "调整止损",
+        "CLOSE_MARKET": "市价平仓",
+    }
+    management_parts = []
+    for instruction in payload.get("position_management") or []:
+        if not isinstance(instruction, dict):
+            continue
+        contract = str(instruction.get("contract") or instruction.get("instId") or "--")
+        symbol = contract.replace("-USDT-SWAP", "").replace("_USDT", "")
+        raw_action = str(instruction.get("action") or "HOLD").upper()
+        action = position_action_labels.get(raw_action, raw_action or "未知")
+        confidence = float(instruction.get("confidence") or 0)
+        reason = str(instruction.get("reason") or "未提供持仓判断理由").strip()
+        stop = float(instruction.get("suggested_sl_price") or 0)
+        stop_text = f"，建议止损 {stop:g}" if raw_action == "UPDATE_SL" and stop > 0 else ""
+        management_parts.append(f"{symbol}:{action}({confidence:.0f}%{stop_text}) - {reason}")
+    if management_parts:
+        summary += "\n持仓判断 | " + " | ".join(management_parts)
+    return summary
 SYMBOLS = ("BTC_USDT", "ETH_USDT", "SOL_USDT", "DOGE_USDT", "SUI_USDT", "XRP_USDT")
 
 GATE_LIMIT_PRICE_DEVIATION = 0.02
