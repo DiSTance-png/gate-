@@ -1,8 +1,8 @@
 # Gate 系统问题审计与上游 v7.9.5 整合待执行册
 
-> 状态：2026-09-18 已完成本地融合；未上传 GitHub，未部署 VPS
+> 状态：2026-09-18 已完成本地融合、GitHub 推送和 VPS 部署
 > 整理日期：2026-09-18
-> Gate 当前代码基线：`2e05dcf`
+> Gate 本轮融合前基线：`2e05dcf`
 > 上游检查基线：`b744f449`（`v7.9.5-1-gb744f44`）
 > 上游本地副本：`C:\Users\quesi\Documents\ChatGPT\New project\r20-upstream-latest`
 
