@@ -1,3 +1,3 @@
 """R20 Gateway runtime package."""
 
-__version__ = "0.4.0"
+from r20_backend.version import __version__

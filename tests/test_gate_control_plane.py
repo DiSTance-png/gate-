@@ -93,11 +93,35 @@ def test_account_book_stats_reports_gate_pnl_win_loss_counts(monkeypatch):
         {"time": now, "type": "fee", "change": "-0.1"},
         {"time": now, "type": "fund", "change": "-0.2"},
     ]
-    stats = _account_book_stats(rows)
+    closes = [
+        {"contract": "BTC_USDT", "close_time": "2027-01-15 08:01:00", "pnl": "10"},
+        {"contract": "ETH_USDT", "close_time": "2027-01-15 08:02:00", "pnl": "-2"},
+    ]
+    stats = _account_book_stats(rows, closes)
     assert stats["win_trades"] == 1
     assert stats["loss_trades"] == 1
     assert stats["closed_trades"] == 2
+    assert stats["settlement_events"] == 2
     assert stats["win_rate"] == 50.0
+
+
+def test_account_book_stats_does_not_count_partial_fill_events_as_closed_positions(monkeypatch):
+    import gate_quant.web as web
+    class FixedDateTime(web.dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 9, 18, 12, 0, tzinfo=tz)
+    monkeypatch.setattr(web.dt, "datetime", FixedDateTime)
+    timestamp = int(FixedDateTime(2026, 9, 18, 10, 0, tzinfo=web.dt.timezone(web.dt.timedelta(hours=8))).timestamp())
+    rows = [{"time": timestamp, "type": "pnl", "change": value} for value in ("1", "2", "3", "-1")]
+    closes = [{"contract": "XRP_USDT", "close_time": "2026-09-18 10:00:00", "pnl": "5"}]
+
+    stats = _account_book_stats(rows, closes)
+
+    assert stats["closed_trades"] == 1
+    assert stats["settlement_events"] == 4
+    assert stats["win_trades"] == 1
+    assert stats["loss_trades"] == 0
 
 
 def test_native_gate_order_and_price_order_paths():

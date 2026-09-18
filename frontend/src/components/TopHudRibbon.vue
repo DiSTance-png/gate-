@@ -30,6 +30,7 @@ const todayWinrate = computed(() => Number(today.value.win_rate || 100.0).toFixe
 const winTrades = computed(() => Number(today.value.win_trades ?? 0))
 const lossTrades = computed(() => Number(today.value.loss_trades ?? 0))
 const todayTrades = computed(() => winTrades.value + lossTrades.value)
+const settlementEvents = computed(() => Number(today.value.settlement_events ?? todayTrades.value))
 const winRatePct = computed(() => {
   if (todayTrades.value === 0) return 100
   return Math.round((winTrades.value / todayTrades.value) * 100)
@@ -243,7 +244,7 @@ const ocoProtectedRatio = computed(() => {
           ></div>
         </div>
         <div class="flex items-center justify-between text-[10px] sm:text-[11px] font-mono" style="color: var(--text-faint);">
-          <span>{{ t('hud.trades') }}: <strong style="color: var(--text-main);">{{ todayTrades }}</strong> {{ t('hud.tradesCount') }} ({{ winTrades }}{{ t('hud.win') }}/{{ lossTrades }}{{ t('hud.loss') }})</span>
+          <span>平仓: <strong style="color: var(--text-main);">{{ todayTrades }}</strong> 笔 ({{ winTrades }}{{ t('hud.win') }}/{{ lossTrades }}{{ t('hud.loss') }}) · Gate结算 {{ settlementEvents }} 条</span>
           <span>{{ t('hud.rrRatio') }}: <strong class="text-emerald-400">2.0+</strong></span>
         </div>
       </div>

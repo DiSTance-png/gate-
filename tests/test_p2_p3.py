@@ -1,9 +1,13 @@
 import json
+from datetime import datetime, timedelta, timezone
 
 from gate_quant import web
 from r20_backend.policy_snapshot import GATE_POLICY_ENV_KEYS, capture_full_strategy_package, generate_policy_snapshot
 from scripts import evolution_shield
 from scripts import self_improvement_engine as evolution
+from r20_backend.version import __version__
+from r20_gateway import __version__ as gateway_version
+from r20_gateway.store import GatewayStore
 
 
 def _snapshot(tmp_path):
@@ -15,6 +19,24 @@ def _snapshot(tmp_path):
         memory_snapshot={"version": "v1", "lessons": []},
         interceptor_plugins=[], council_config={"enabled": False, "roles": {}},
     )
+
+
+def test_gate_product_uses_independent_unified_version():
+    assert __version__ == "1.0.0"
+    assert gateway_version == __version__
+    assert web.app.version == __version__
+
+
+def test_gateway_recovers_stale_runs_and_prunes_only_finished_rows(tmp_path):
+    store = GatewayStore(tmp_path / "gateway.db")
+    stale = (datetime.now(timezone(timedelta(hours=8))) - timedelta(days=10)).strftime("%Y-%m-%d %H:%M:%S")
+    with store.connect() as connection:
+        connection.execute("INSERT INTO job_runs(job_name,status,started_at) VALUES ('stale-running','running',?)", (stale,))
+        connection.execute("INSERT INTO job_runs(job_name,status,started_at,finished_at) VALUES ('old-done','success',?,?)", (stale, stale))
+    assert store.recover_stale_job_runs() == 1
+    result = store.prune_job_runs(keep_days=7, vacuum=False)
+    assert result["deleted"] == 2
+    assert store.job_runs(10) == []
 
 
 def test_gate_strategy_values_change_policy_hash(monkeypatch, tmp_path):
@@ -82,6 +104,49 @@ def test_performance_snapshot_marks_missing_exchange_fields_unavailable():
     assert snapshot["max_drawdown_usd"] == 4
     assert snapshot["funding_fee"] is None
     assert set(snapshot["unavailable_fields"]) == {"funding_fee", "slippage_bps"}
+
+
+def test_evolution_loads_gate_contract_names_from_current_pool(monkeypatch, tmp_path):
+    ledger = tmp_path / "trading_ledger.json"
+    ledger.write_text(json.dumps([
+        {"inst": "BTC_USDT", "status": "closed", "close_time": "2026-09-18 08:00:00", "pnl": 3.5},
+        {"inst": "XRP_USDT", "status": "closed", "close_time": "2026-09-18 09:00:00", "pnl": -1.0},
+        {"inst": "LINK_USDT", "status": "closed", "close_time": "2026-09-18 10:00:00", "pnl": 2.0},
+    ]), encoding="utf-8")
+    monkeypatch.setattr(evolution, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(evolution, "LEDGER_JSON_FILE", str(ledger))
+    monkeypatch.setattr(evolution, "load_instruments", lambda: [
+        {"name": "BTC", "instId": "BTC-USDT-SWAP"},
+        {"name": "XRP", "instId": "XRP-USDT-SWAP"},
+    ])
+
+    trades, diagnostics = evolution.load_closed_trades(return_diagnostics=True)
+
+    assert [row["inst"] for row in trades] == ["BTC_USDT", "XRP_USDT"]
+    assert diagnostics["ledger_rows"] == 3
+    assert diagnostics["accepted"] == 2
+    assert diagnostics["filtered_outside_pool"] == 1
+    assert diagnostics["snapshot_missing"] == 2
+
+
+def test_evolution_matches_first_post_fill_snapshot_within_twenty_minutes(monkeypatch, tmp_path):
+    ledger = tmp_path / "trading_ledger.json"
+    ledger.write_text(json.dumps([{
+        "inst": "BTC_USDT", "status": "closed", "open_time": "2026-09-18 08:00:00",
+        "close_time": "2026-09-18 10:00:00", "side": "多", "pnl": 1,
+    }]), encoding="utf-8")
+    (tmp_path / "signal_journal.json").write_text(json.dumps([{
+        "inst": "BTC-USDT-SWAP", "side": "long", "entryTime": "2026-09-18 08:19:59",
+        "snapshot": {"price": 100, "velocity": 0.1},
+    }]), encoding="utf-8")
+    monkeypatch.setattr(evolution, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(evolution, "LEDGER_JSON_FILE", str(ledger))
+    monkeypatch.setattr(evolution, "load_instruments", lambda: [{"name": "BTC", "instId": "BTC-USDT-SWAP"}])
+
+    trades, diagnostics = evolution.load_closed_trades(return_diagnostics=True, start_time_override="2026-09-18")
+
+    assert trades[0]["entry_snapshot"]["velocity"] == 0.1
+    assert diagnostics["snapshot_matched"] == 1
 
 
 def test_trader_heartbeat_reports_freshness(monkeypatch):

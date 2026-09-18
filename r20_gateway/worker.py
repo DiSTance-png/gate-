@@ -76,9 +76,11 @@ def run() -> None:
         pass
     store = GatewayStore(DB_PATH)
     store.recover_processing()
+    recovered_runs = store.recover_stale_job_runs()
+    retention = store.prune_job_runs(vacuum=False)
     scheduler = GatewayScheduler(store)
     scheduler.initialize_migration_baseline()
-    log("gateway worker started with scheduler ownership")
+    log(f"gateway worker started with scheduler ownership; recovered_runs={recovered_runs}; pruned_runs={retention['deleted']}")
     while RUNNING:
         launched = scheduler.tick()
         for job_name in launched:

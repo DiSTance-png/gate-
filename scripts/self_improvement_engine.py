@@ -51,6 +51,11 @@ from scripts.prompt_library import active_profile, apply_module_layout
 from r20_gateway.telemetry import ModelCallTelemetry
 TARGET_INSTRUMENTS = [item["name"] for item in load_instruments()]
 
+
+def current_target_instruments() -> list[str]:
+    """Read the active pool for each cycle instead of freezing it at import time."""
+    return [str(item.get("name") or "").upper() for item in load_instruments() if isinstance(item, dict) and item.get("name")]
+
 def atomic_write_json(path: str, payload: Any) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(prefix=".evolution-", suffix=".tmp", dir=os.path.dirname(path))
@@ -271,7 +276,76 @@ def get_cpa_client_config() -> Tuple[str, str]:
         os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or "",
     )
 
-def load_closed_trades():
+def _gate_contract_name(value: Any) -> str:
+    normalized = str(value or "").strip().upper().replace("-USDT-SWAP", "_USDT").replace("-", "_")
+    if normalized and "_" not in normalized:
+        normalized = f"{normalized}_USDT"
+    return normalized
+
+
+def _current_target_contracts() -> set[str]:
+    contracts = set()
+    for item in load_instruments():
+        if not isinstance(item, dict):
+            continue
+        contract = _gate_contract_name(item.get("instId") or item.get("name"))
+        if contract:
+            contracts.add(contract)
+    return contracts
+
+
+def _parse_bj(value: Any) -> datetime.datetime | None:
+    text = str(value or "").strip()
+    if not text or text == "--":
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=datetime.timezone(datetime.timedelta(hours=8))) if parsed.tzinfo is None else parsed
+    except (TypeError, ValueError):
+        return None
+
+
+def load_signal_journal() -> dict[str, list[dict[str, Any]]]:
+    path = os.path.join(DATA_DIR, "signal_journal.json")
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    if not os.path.exists(path):
+        return grouped
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        for row in payload if isinstance(payload, list) else []:
+            if isinstance(row, dict):
+                grouped.setdefault(_gate_contract_name(row.get("inst") or row.get("name")), []).append(row)
+    except (OSError, json.JSONDecodeError) as exc:
+        log_msg(f"读取 signal_journal 异常: {exc}")
+    return grouped
+
+
+def _match_signal_snapshot(journal: dict[str, list[dict[str, Any]]], contract: str, open_time: Any, side: Any) -> dict[str, Any] | None:
+    open_at = _parse_bj(open_time)
+    if open_at is None:
+        return None
+    side_aliases = {"多": "long", "空": "short", "long": "long", "short": "short"}
+    wanted_side = side_aliases.get(str(side or "").strip().lower())
+    best: tuple[float, dict[str, Any]] | None = None
+    for row in journal.get(contract, []):
+        row_side = side_aliases.get(str(row.get("side") or "").strip().lower())
+        if wanted_side and row_side and wanted_side != row_side:
+            continue
+        observed_at = _parse_bj(row.get("entryTime") or row.get("time"))
+        if observed_at is None:
+            continue
+        delta = (observed_at - open_at).total_seconds()
+        if delta < -6 * 3600 or delta > 20 * 60:
+            continue
+        candidate = (abs(delta), row)
+        if best is None or candidate[0] < best[0]:
+            best = candidate
+    snapshot = (best[1].get("snapshot") if best else None)
+    return snapshot if isinstance(snapshot, dict) else None
+
+
+def load_closed_trades(*, return_diagnostics: bool = False, start_time_override: str | None = None):
     account_init_file = os.path.join(DATA_DIR, "account_initial_state.json")
     reset_time_str = "1970-01-01 00:00:00"
     if os.path.exists(account_init_file):
@@ -282,30 +356,54 @@ def load_closed_trades():
         except Exception:
             pass
 
+    evolution_start = str(start_time_override or os.getenv("GATE_EVOLUTION_START_TIME", "") or reset_time_str).strip()
+    if len(evolution_start) == 10:
+        evolution_start += " 00:00:00"
     closed_trades = []
+    target_contracts = _current_target_contracts()
+    signal_journal = load_signal_journal()
+    diagnostics = {
+        "ledger_rows": 0,
+        "accepted": 0,
+        "filtered_holding": 0,
+        "filtered_before_reset": 0,
+        "filtered_outside_pool": 0,
+        "snapshot_matched": 0,
+        "snapshot_missing": 0,
+        "effective_start_time": evolution_start,
+    }
     if os.path.exists(LEDGER_JSON_FILE):
         try:
             with open(LEDGER_JSON_FILE, "r", encoding="utf-8") as f:
                 t_list = json.load(f)
                 for t in t_list:
+                    diagnostics["ledger_rows"] += 1
                     if t.get("status") == "holding":
+                        diagnostics["filtered_holding"] += 1
                         continue
                     
                     c_time = str(t.get("close_time") or t.get("time") or "")
-                    if c_time and c_time < reset_time_str:
+                    if c_time and c_time < evolution_start:
+                        diagnostics["filtered_before_reset"] += 1
                         continue
 
-                    inst = str(t.get("inst") or t.get("name") or "OTHER")
-                    if inst not in TARGET_INSTRUMENTS:
+                    inst = _gate_contract_name(t.get("inst") or t.get("name"))
+                    if inst not in target_contracts:
+                        diagnostics["filtered_outside_pool"] += 1
                         continue
                     pnl = float(t.get("pnl", 0.0) or 0.0)
                     gross = float(t.get("gross_pnl", pnl) or pnl)
                     fee = abs(float(t.get("fee", 0.0) or 0.0))
                     strat = str(t.get("strategy") or "⚡ 趋势")
                     reason = str(t.get("exit_reason") or t.get("remark") or "")
+                    snapshot = t.get("signal_snapshot") if isinstance(t.get("signal_snapshot"), dict) else _match_signal_snapshot(
+                        signal_journal, inst, t.get("open_time"), t.get("side") or t.get("direction")
+                    )
+                    diagnostics["snapshot_matched" if snapshot else "snapshot_missing"] += 1
 
                     closed_trades.append({
                         "inst": inst,
+                        "side": t.get("side") or t.get("direction") or "",
                         "time": c_time,
                         "open_time": t.get("open_time", ""),
                         "strategy": strat,
@@ -315,12 +413,15 @@ def load_closed_trades():
                         "net_pnl": round(pnl, 2),
                         "funding_fee": t.get("funding_fee"),
                         "slippage_bps": t.get("slippage_bps"),
-                        "exit_reason": reason
+                        "exit_reason": reason,
+                        "entry_snapshot": snapshot,
+                        "snapshot_observability": "OBSERVED" if snapshot else "UNAVAILABLE",
                     })
+                    diagnostics["accepted"] += 1
         except Exception as e:
             log_msg(f"读取交易台账异常: {e}")
 
-    return closed_trades
+    return (closed_trades, diagnostics) if return_diagnostics else closed_trades
 
 EVOLUTION_SYSTEM_PROMPT = """你是 R20 Quantum Trader 的首席投资官，负责基于真实已平仓交易证据进行认知复盘。模型只输出严格 JSON；宿主程序负责北京时间戳与 Markdown 渲染。
 
@@ -351,7 +452,7 @@ def resolve_memory_update(change_status: str, proposed_memory: Any, existing_mem
     return status, list(existing_memory if preserve else proposed), preserve
 
 
-def call_llm_evolution_review(closed_trades: List[Dict[str, Any]], existing_memory_md: str = "", timestamp_str: str = "") -> Dict[str, Any]:
+def call_llm_evolution_review(closed_trades: List[Dict[str, Any]], existing_memory_md: str = "", timestamp_str: str = "", target_instruments: List[str] | None = None) -> Dict[str, Any]:
     base_url, api_key = get_cpa_client_config()
     if not api_key:
         log_msg("[AI Evolution] Error: CPA API Key not found, using fallback heuristics.")
@@ -366,6 +467,7 @@ def call_llm_evolution_review(closed_trades: List[Dict[str, Any]], existing_memo
     win_rate = round(len(wins) / total * 100, 1) if total > 0 else 0.0
     total_net = round(sum(t["net_pnl"] for t in closed_trades), 2)
     total_fees = round(sum(t["fee"] for t in closed_trades), 2)
+    target_instruments = target_instruments or current_target_instruments()
 
     memory_context = f"""======================= 【当前系统已有的历史长期记忆库】 =======================
 {existing_memory_md.strip()}
@@ -380,7 +482,7 @@ def call_llm_evolution_review(closed_trades: List[Dict[str, Any]], existing_memo
 【统计汇总】:
 - 总平仓笔数: {total} 笔 (胜 {len(wins)} / 负 {len(losses)} | 胜率: {win_rate}%)
 - 累计净盈亏: {total_net:+.2f} USDT | 累计手续费消耗: {total_fees:.2f} USDT
-- 当前聚焦标的池: {TARGET_INSTRUMENTS}
+- 当前聚焦标的池: {target_instruments}
 
 【逐笔历史交易明细 (按时间排序)】:
 {json.dumps(closed_trades, indent=2, ensure_ascii=False)}
@@ -410,9 +512,9 @@ def call_llm_evolution_review(closed_trades: List[Dict[str, Any]], existing_memo
         "existing_memory_markdown": existing_memory_md.strip() or "当前长期记忆库为空 (系统初始冷启动状态)",
         "total": total, "wins": len(wins), "losses": len(losses), "win_rate": win_rate,
         "total_net": f"{total_net:+.2f}", "total_fees": f"{total_fees:.2f}",
-        "target_instruments": ", ".join(TARGET_INSTRUMENTS),
+        "target_instruments": ", ".join(target_instruments),
         "closed_trades_json": json.dumps(closed_trades, indent=2, ensure_ascii=False),
-        "active_instruments": ",".join(TARGET_INSTRUMENTS),
+        "active_instruments": ",".join(target_instruments),
         "profile_name": profile.get("name", ""), "timezone": "Asia/Shanghai",
         "strategy_version": os.getenv("R20_VERSION", f"v{__version__}"),
     }
@@ -517,7 +619,8 @@ def run_self_evolution(force: bool = False):
     timestamp_str = now_bj.strftime("%Y-%m-%d %H:%M:%S")
     log_msg("🧬 启动 R20 AI 大脑自进化认知复盘与实战心法提炼 (v7.2.1 Crypto Focus)...")
 
-    closed_trades = load_closed_trades()
+    target_instruments = current_target_instruments()
+    closed_trades, ledger_diagnostics = load_closed_trades(return_diagnostics=True)
     total_trades = len(closed_trades)
     ledger_revision = hashlib.sha256(
         json.dumps(closed_trades, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -547,7 +650,7 @@ def run_self_evolution(force: bool = False):
         AI_MEMORY_MD_FILE, AI_MEMORY_FILE)
 
     # 2. Call LLM for Cognitive Review & Memory Overwriting
-    llm_review = call_llm_evolution_review(closed_trades, existing_memory_md=existing_memory_md, timestamp_str=timestamp_str)
+    llm_review = call_llm_evolution_review(closed_trades, existing_memory_md=existing_memory_md, timestamp_str=timestamp_str, target_instruments=target_instruments)
     if not isinstance(llm_review, dict):
         llm_review = {}
 
@@ -564,7 +667,7 @@ def run_self_evolution(force: bool = False):
         raw_asset_mults = {}
     asset_mults = {
         asset: clamp(raw_asset_mults.get(asset, 1.0), 0.5, 1.5, 1.0)
-        for asset in TARGET_INSTRUMENTS
+        for asset in target_instruments
     }
     change_status, long_term_memory, preserve_existing_memory = resolve_memory_update(
         change_status, llm_review.get("ai_long_term_memory", []), existing_core_lessons
@@ -615,6 +718,8 @@ def run_self_evolution(force: bool = False):
         "timestamp": timestamp_str,
         "ledger_revision": ledger_revision,
         "total_trades": total_trades,
+        "target_instruments": target_instruments,
+        "ledger_diagnostics": ledger_diagnostics,
         "win_rate": win_rate,
         "profit_factor": profit_factor,
         "performance_snapshot": performance_snapshot,
@@ -629,6 +734,11 @@ def run_self_evolution(force: bool = False):
         "actions_taken": actions_taken,
         "core_lessons": long_term_memory,
         "llm_error": str(llm_review.get("__llm_error__") or ""),
+        "no_candidate_reason": "" if candidate_payload else (
+            str(llm_review.get("__llm_error__") or "")
+            or str(llm_review.get("memory_overwrites_reason") or "")
+            or ("没有符合复盘范围的已平仓样本" if total_trades == 0 else "证据不足，保留当前策略且未生成候选")
+        ),
     }
 
     atomic_write_json(REPORT_JSON_FILE, report_payload)

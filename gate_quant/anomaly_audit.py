@@ -65,17 +65,13 @@ def _timestamp_ms(payload: dict[str, Any], *keys: str) -> int:
 
 def _job_findings(job_runs: list[dict[str, Any]], now_ms: int) -> list[dict[str, Any]]:
     result = []
-    latest_success_id = max(
-        (int(row.get("id") or 0) for row in job_runs if row.get("job_name") == "trader" and row.get("status") == "success"),
-        default=0,
-    )
-    for row in job_runs:
-        if row.get("job_name") != "trader":
-            continue
+    latest_by_job: dict[str, dict[str, Any]] = {}
+    for row in sorted(job_runs, key=lambda item: int(item.get("id") or 0), reverse=True):
+        job_name = str(row.get("job_name") or "unknown")
+        latest_by_job.setdefault(job_name, row)
+    for job_name, row in latest_by_job.items():
         status = str(row.get("status") or "")
         if status == "success":
-            continue
-        if status != "running" and int(row.get("id") or 0) < latest_success_id:
             continue
         started_ms = 0
         try:
@@ -86,15 +82,45 @@ def _job_findings(job_runs: list[dict[str, Any]], now_ms: int) -> list[dict[str,
         age_seconds = max(0, int((now_ms - started_ms) / 1000)) if started_ms else None
         if status == "running" and age_seconds is not None and age_seconds <= 20 * 60:
             continue
-        code = "trader_run_timeout" if status == "running" else "trader_run_failed"
+        is_trader = job_name == "trader"
+        code = ("trader_run_timeout" if status == "running" else "trader_run_failed") if is_trader else ("gateway_job_timeout" if status == "running" else "gateway_job_failed")
+        job_label = "AI 决策任务" if is_trader else f"Gateway 任务 {job_name}"
         result.append(finding(
-            code, severity="critical" if status == "running" else "error", category="decision",
-            title="AI 决策任务超时" if status == "running" else "AI 决策任务异常退出",
+            code, severity="critical" if status == "running" else "error", category="decision" if is_trader else "runtime",
+            title=f"{job_label}超时" if status == "running" else f"{job_label}异常退出",
             detail=str(row.get("detail") or "任务没有留下错误摘要"),
-            client_id=f"job-{row.get('id')}", evidence={"run_id": row.get("id"), "return_code": row.get("return_code"), "age_seconds": age_seconds},
+            client_id=f"job-{job_name}-{row.get('id')}", evidence={"job_name": job_name, "run_id": row.get("id"), "return_code": row.get("return_code"), "age_seconds": age_seconds},
             suggestion="检查 Gateway 与 Trader 日志；不得直接重跑旧交易信号。",
         ))
     return result
+
+
+def _job_occurrence_events(job_runs: list[dict[str, Any]], environment: str, now_ms: int) -> list[dict[str, Any]]:
+    events = []
+    for row in job_runs:
+        status = str(row.get("status") or "")
+        if status in {"success", "running", ""}:
+            continue
+        job_name = str(row.get("job_name") or "unknown")
+        run_id = str(row.get("id") or "unknown")
+        item = finding(
+            "trader_run_failed" if job_name == "trader" else "gateway_job_failed",
+            severity="error", category="decision" if job_name == "trader" else "runtime",
+            title=("AI 决策任务" if job_name == "trader" else f"Gateway 任务 {job_name}") + "异常运行记录",
+            detail=str(row.get("detail") or f"任务状态为 {status}"),
+            client_id=f"job-{job_name}-{run_id}",
+            evidence={"job_name": job_name, "run_id": row.get("id"), "return_code": row.get("return_code"), "status": status},
+            suggestion="保留历史证据并检查对应日志；不得直接重放旧交易信号。",
+        )
+        item.update({
+            "environment": environment,
+            "fingerprint": _fingerprint(f"{environment}:{item['code']}", "", item["client_id"]),
+            "occurrence_id": f"job:{job_name}:{run_id}:{status}",
+            "event": "occurred",
+            "observed_at_ms": now_ms,
+        })
+        events.append(item)
+    return events
 
 
 def _heartbeat_findings(name: str, heartbeat: dict[str, Any], max_age_seconds: int, now_ms: int) -> list[dict[str, Any]]:
@@ -365,6 +391,7 @@ def collect_anomalies(
         "items": items,
         "summary": {severity: sum(row["severity"] == severity for row in items) for severity in SEVERITY_ORDER},
         "live_reconciliation": live_reconciliation,
+        "occurrence_events": _job_occurrence_events(job_runs, environment, now_ms),
     }
 
 
@@ -378,11 +405,26 @@ def persist_anomaly_history(path: Path, report: dict[str, Any], *, max_records: 
     except (OSError, json.JSONDecodeError):
         saved = []
     previous = {str(row.get("fingerprint") or ""): row for row in saved if isinstance(row, dict) and row.get("fingerprint")}
+    events_path = path.with_name(f"{path.stem}_events{path.suffix}")
+    try:
+        events = json.loads(events_path.read_text(encoding="utf-8")) if events_path.exists() else []
+        if not isinstance(events, list):
+            events = []
+    except (OSError, json.JSONDecodeError):
+        events = []
+    known_occurrences = {str(row.get("occurrence_id") or "") for row in events if isinstance(row, dict)}
+    for occurrence in report.get("occurrence_events") or []:
+        occurrence_id = str(occurrence.get("occurrence_id") or "")
+        if occurrence_id and occurrence_id not in known_occurrences:
+            events.append(occurrence)
+            known_occurrences.add(occurrence_id)
     active_ids = set()
     for current in report.get("items") or []:
         fingerprint = str(current["fingerprint"])
         active_ids.add(fingerprint)
         old = previous.get(fingerprint) or {}
+        event_name = "observed" if old.get("status") == "active" else "detected"
+        events.append({**current, "event": event_name, "observed_at_ms": now_ms})
         previous[fingerprint] = {
             **old, **current, "status": "active",
             "first_seen_ms": int(old.get("first_seen_ms") or now_ms),
@@ -392,12 +434,17 @@ def persist_anomaly_history(path: Path, report: dict[str, Any], *, max_records: 
     for fingerprint, old in list(previous.items()):
         if fingerprint not in active_ids and old.get("status") == "active" and str(old.get("environment") or "").lower() == environment:
             previous[fingerprint] = {**old, "status": "resolved", "resolved_at_ms": now_ms}
+            events.append({**old, "event": "resolved", "observed_at_ms": now_ms, "resolved_at_ms": now_ms})
     records = sorted(previous.values(), key=lambda row: int(row.get("last_seen_ms") or 0), reverse=True)[:max_records]
+    events = sorted(events, key=lambda row: int(row.get("observed_at_ms") or 0))[-max_records * 5:]
     atomic_json(path, records)
+    atomic_json(events_path, events)
     return {
         **report,
         "items": [row for row in records if row.get("status") == "active" and str(row.get("environment") or "").lower() == environment],
         "history": records,
+        "events": events,
+        "event_total": len(events),
         "active_total": sum(row.get("status") == "active" and str(row.get("environment") or "").lower() == environment for row in records),
         "resolved_total": sum(row.get("status") == "resolved" and str(row.get("environment") or "").lower() == environment for row in records),
     }

@@ -8,6 +8,8 @@
 
 本项目基于 `555cute/r20-quantum-trader` 二次开发。保留和复用的核心是上游的策略提示词、六合约决策契约、持仓/挂单管理契约、因子结构、物理拦截器、管理后台和策略版本机制；重新实现的是交易所边界。当前仓库是一套可独立部署和运行的 Gate 系统。
 
+当前产品版本为独立的 `Gate v1.0.0`，不再沿用上游 R20 的版本编号。
+
 Gate 执行层直接使用 Gate API v4 Futures 原生语义：
 
 - 合约名采用 `BTC_USDT` 等 Gate contract。
@@ -143,6 +145,7 @@ Gate API v4
 - 进入 AI 提示词。
 - 用于保证金和张数计算。
 - 受风险档位最大杠杆限制。
+- `gate-risk-v2` 同时携带分档保本、二阶锁盈、峰值回撤和动能耗散阈值；Gate 适配器会移除继承模板中的旧固定数字，再在 System 管线布局和管理员覆盖层之后追加不可覆盖的本周期风险预算。
 - 下单前通过 Gate 原生持仓杠杆接口设置。
 
 AI 自己返回的 leverage 不会覆盖系统配置。
@@ -401,6 +404,7 @@ SSH 隧道由 Web lifespan 管理。已经存在并且端口可用的隧道会�
 - `GET /api/v1/market/{symbol}/candles`：指定合约 K 线。
 - `GET /api/v1/admin/runtime`：控制面运行遥测，需要管理员会话。
 - `GET /api/v1/admin/incomplete-decisions`：只读异常与未闭环审计；检查决策、执行、保护、心跳、数据质量及状态一致性并保存恢复历史。
+- 异常状态与不可变事件分开保存：`gate_anomaly_history.json` 维护当前/已恢复状态，`gate_anomaly_history_events.json` 记录每次发现、持续和恢复。
 - `GET /api/v1/admin/gate/check`：只读凭证与账户检查。
 - `PUT /api/v1/admin/gate/config`：候选配置验证后保存。
 
@@ -421,6 +425,11 @@ Windows 下 `.venv\Scripts\pythonw.exe` 可能再启动基础解释器 `C:\Pytho
 
 - 8081 只有一个 LISTEN PID。
 - Gateway 的 OS 文件锁只有一个持有者。
+- Gateway 新进程会收编旧进程遗留的僵尸 `running` 任务，并按 `GATE_JOB_RUNS_KEEP_DAYS`（默认 30 天）清理已结束任务历史。
+
+自进化按当前 Gate 标的池动态匹配 `BTC_USDT` 等台账名称。`GATE_EVOLUTION_START_TIME` 可独立限制复盘起点；页面显示样本接受/过滤原因。信号日志允许成交后首次巡检最多 20 分钟的同方向快照匹配，但超过该窗口的未来快照不会作为因果证据。
+
+Gate 止损生命周期使用已验证的安全替换流程：先创建并确认新的 Gate 原生保护单，再撤销旧保护单；创建或确认失败时保留旧保护。当前不使用未被 Gate 官方文档和 Testnet 验证的计划单改单接口。
 - 调度日志没有同一任务同秒重复启动。
 
 不要通过杀死所有 Python 进程处理问题，因为本机其他程序也可能使用 Python。重启前应先解析精确命令行、端口所有者和父子关系。

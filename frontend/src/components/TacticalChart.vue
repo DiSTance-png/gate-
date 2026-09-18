@@ -224,18 +224,20 @@ const liveChangePct = computed(() => {
 // 实盘在手持仓与在途委托
 const activePosition = computed(() => {
   if (!Array.isArray(store.positions)) return undefined
-  const target = currentSymbol.value.toUpperCase()
+  const normalize = (value: string) => String(value || '').toUpperCase().replace(/[-_]/g, '').replace('USDT', '').replace('SWAP', '')
+  const target = normalize(currentSymbol.value)
   return store.positions.find((p) => {
-    const sym = (p.name || p.instId?.replace('-USDT-SWAP', '').replace('-USDT', '') || '').toUpperCase()
-    return sym === target || p.instId === currentInstId.value
+    const sym = normalize(p.name || p.instId || '')
+    return sym === target
   })
 })
 const activeOrder = computed(() => {
   if (!Array.isArray(store.pendingOrders)) return undefined
-  const target = currentSymbol.value.toUpperCase()
+  const normalize = (value: string) => String(value || '').toUpperCase().replace(/[-_]/g, '').replace('USDT', '').replace('SWAP', '')
+  const target = normalize(currentSymbol.value)
   return store.pendingOrders.find((o) => {
-    const sym = (o.name || o.inst || o.instId?.replace('-USDT-SWAP', '').replace('-USDT', '') || '').toUpperCase()
-    return sym === target || o.instId === currentInstId.value
+    const sym = normalize(o.name || o.inst || o.instId || '')
+    return sym === target
   })
 })
 
@@ -280,6 +282,7 @@ const liveTakeProfit = computed(() => {
   if (activePosition.value) {
     const tp = Number(
       activePosition.value.displayTakeProfit ??
+      activePosition.value.takeProfitPx ??
       activePosition.value.exchangeTp ??
       activePosition.value.tpTriggerPx ??
       0

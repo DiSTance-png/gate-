@@ -6,8 +6,16 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 
-PROFILE_VERSION = "gate-risk-v1"
+PROFILE_VERSION = "gate-risk-v2"
 ABSOLUTE_MIN_RR = 2.0
+
+PROFIT_LOCK_PROFILES: dict[str, dict[str, Any]] = {
+    "observe": {"breakeven_r": 0.8, "breakeven_roi_pct": 1.5, "second_lock_r": 1.5, "second_lock_roi_pct": 3.0, "locked_profit_r": 0.6, "peak_exit_roi_pct": 2.5, "peak_exit_r": 1.0, "peak_drawdown_min_pct": 35, "peak_drawdown_max_pct": 45, "dissipation_roi_pct": 1.5, "dissipation_phi": -0.12, "dissipation_curvature": 1.5, "dissipation_requires_all": False},
+    "conservative": {"breakeven_r": 0.8, "breakeven_roi_pct": 1.5, "second_lock_r": 1.5, "second_lock_roi_pct": 3.0, "locked_profit_r": 0.6, "peak_exit_roi_pct": 2.5, "peak_exit_r": 1.0, "peak_drawdown_min_pct": 35, "peak_drawdown_max_pct": 45, "dissipation_roi_pct": 1.5, "dissipation_phi": -0.12, "dissipation_curvature": 1.5, "dissipation_requires_all": False},
+    "standard": {"breakeven_r": 1.0, "breakeven_roi_pct": 1.8, "second_lock_r": 1.8, "second_lock_roi_pct": 3.2, "locked_profit_r": 0.75, "peak_exit_roi_pct": 3.0, "peak_exit_r": 1.3, "peak_drawdown_min_pct": 40, "peak_drawdown_max_pct": 48, "dissipation_roi_pct": 2.0, "dissipation_phi": -0.13, "dissipation_curvature": 1.6, "dissipation_requires_all": False},
+    "active": {"breakeven_r": 1.2, "breakeven_roi_pct": 2.0, "second_lock_r": 2.0, "second_lock_roi_pct": 3.4, "locked_profit_r": 0.9, "peak_exit_roi_pct": 3.2, "peak_exit_r": 1.5, "peak_drawdown_min_pct": 42, "peak_drawdown_max_pct": 52, "dissipation_roi_pct": 2.2, "dissipation_phi": -0.14, "dissipation_curvature": 1.7, "dissipation_requires_all": True},
+    "aggressive": {"breakeven_r": 1.5, "breakeven_roi_pct": 2.2, "second_lock_r": 2.2, "second_lock_roi_pct": 3.5, "locked_profit_r": 1.0, "peak_exit_roi_pct": 3.5, "peak_exit_r": 1.8, "peak_drawdown_min_pct": 45, "peak_drawdown_max_pct": 55, "dissipation_roi_pct": 2.5, "dissipation_phi": -0.15, "dissipation_curvature": 1.8, "dissipation_requires_all": True},
+}
 
 
 @dataclass(frozen=True)
@@ -36,6 +44,7 @@ class RiskProfile:
                 "leverage": float(leverage),
                 "environment": environment,
                 "absolute_min_rr": ABSOLUTE_MIN_RR,
+                "profit_lock": dict(PROFIT_LOCK_PROFILES[self.key]),
             }
         )
         canonical = json.dumps(values, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -84,6 +93,9 @@ def validate_profile_catalog() -> None:
             raise ValueError(f"{profile.key} stop ATR range is invalid")
         if not 0 <= profile.max_entries_per_cycle <= 2:
             raise ValueError(f"{profile.key} max entries per cycle must be between 0 and 2")
+        lock = PROFIT_LOCK_PROFILES[profile.key]
+        if lock["second_lock_r"] <= lock["breakeven_r"] or lock["peak_drawdown_min_pct"] >= lock["peak_drawdown_max_pct"]:
+            raise ValueError(f"{profile.key} profit-lock thresholds are invalid")
 
 
 validate_profile_catalog()

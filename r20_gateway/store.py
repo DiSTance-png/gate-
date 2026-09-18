@@ -1,6 +1,7 @@
 """SQLite-backed durable event and per-channel delivery queue."""
 from __future__ import annotations
 import json
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -177,6 +178,37 @@ class GatewayStore:
                 "UPDATE job_runs SET status=?, finished_at=?, return_code=?, detail=? WHERE id=?",
                 (status, now, return_code, detail[-2000:], run_id),
             )
+
+    def recover_stale_job_runs(self) -> int:
+        """Mark runs left open by a previous worker as interrupted."""
+        now = datetime.now(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE job_runs SET status='interrupted', finished_at=?, detail='进程终止未收尾，Gateway 启动时已收编' WHERE status='running'",
+                (now,),
+            )
+            return int(cursor.rowcount or 0)
+
+    def prune_job_runs(self, keep_days: int | None = None, *, vacuum: bool = True) -> dict[str, Any]:
+        days = keep_days if keep_days is not None else int(os.getenv("GATE_JOB_RUNS_KEEP_DAYS", "30"))
+        if days < 1:
+            raise ValueError("keep_days must be at least 1")
+        cutoff = (datetime.now(BJ_TZ) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM job_runs WHERE started_at < ? AND status <> 'running'",
+                (cutoff,),
+            )
+            deleted = int(cursor.rowcount or 0)
+        vacuumed = False
+        if deleted and vacuum:
+            try:
+                with self.connect() as connection:
+                    connection.execute("VACUUM")
+                vacuumed = True
+            except sqlite3.Error:
+                vacuumed = False
+        return {"deleted": deleted, "vacuumed": vacuumed, "keep_days": days, "cutoff": cutoff}
 
     def job_runs(self, limit: int = 30) -> list[dict[str, Any]]:
         with self.connect() as connection:

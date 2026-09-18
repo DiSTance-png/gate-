@@ -68,6 +68,7 @@ from r20_gateway.scheduler import scheduler_snapshot
 from r20_gateway.supervisor import current_pid, _worker_lock_held
 from r20_gateway.agents import agent_statuses
 from r20_gateway.secrets import status as secret_store_status
+from r20_backend.version import __version__
 
 DATA_DIR = ROOT / "data"
 LOG_SOURCES = {"trader": "gate_trader.log", "backend": "gate_backend.log", "scheduler": "r20_gateway.log"}
@@ -262,7 +263,7 @@ async def lifespan(_: FastAPI):
         _backend_log("Gate control-plane stopped")
 
 
-app = FastAPI(title="Gate Quantum Trading System", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="Gate Quantum Trading System", version=__version__, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=ROOT / "web"), name="static")
 if (ROOT / "frontend" / "dist" / "assets").exists():
     app.mount("/assets", StaticFiles(directory=ROOT / "frontend" / "dist" / "assets"), name="frontend-assets")
@@ -439,12 +440,28 @@ def safe_private(call, fallback):
         return fallback, str(exc)
 
 
-def _account_book_stats(rows: list[dict[str, Any]] | None) -> dict[str, Any]:
+def _ledger_close_timestamp(row: dict[str, Any]) -> int:
+    raw = row.get("close_time") or row.get("time") or row.get("timestamp")
+    if isinstance(raw, (int, float)):
+        return int(raw / 1000 if raw > 10_000_000_000 else raw)
+    text = str(raw or "").strip()
+    if not text:
+        return 0
+    try:
+        parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone(dt.timedelta(hours=8)))
+        return int(parsed.timestamp())
+    except (TypeError, ValueError, OSError):
+        return 0
+
+
+def _account_book_stats(rows: list[dict[str, Any]] | None, position_closes: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Aggregate Gate's exchange-side account ledger for the current BJ day."""
     now = dt.datetime.now(dt.timezone(dt.timedelta(hours=8)))
     day_start = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
     fees = funding = realized = 0.0
-    win_trades = loss_trades = 0
+    settlement_wins = settlement_losses = 0
     for row in rows or []:
         try:
             if int(float(row.get("time") or 0)) < day_start:
@@ -460,11 +477,18 @@ def _account_book_stats(rows: list[dict[str, Any]] | None) -> dict[str, Any]:
         elif kind == "pnl":
             realized += amount
             if amount > 0:
-                win_trades += 1
+                settlement_wins += 1
             elif amount < 0:
-                loss_trades += 1
-    closed_trades = win_trades + loss_trades
-    return {"realized_gross": round(realized, 8), "fees_paid": round(fees, 8), "funding_paid": round(funding, 8), "net_realized": round(realized + fees + funding, 8), "total_pnl": round(realized + fees + funding, 8), "win_trades": win_trades, "loss_trades": loss_trades, "closed_trades": closed_trades, "win_rate": round(win_trades / closed_trades * 100, 2) if closed_trades else None, "source": "Gate Futures account_book", "timezone": "Asia/Shanghai"}
+                settlement_losses += 1
+    today_closes = [row for row in (position_closes or []) if _ledger_close_timestamp(row) >= day_start]
+    if position_closes is None:
+        win_trades, loss_trades = settlement_wins, settlement_losses
+    else:
+        win_trades = sum(float(row.get("pnl") or row.get("net_pnl") or 0) > 0 for row in today_closes)
+        loss_trades = sum(float(row.get("pnl") or row.get("net_pnl") or 0) < 0 for row in today_closes)
+    closed_trades = len(today_closes) if position_closes is not None else settlement_wins + settlement_losses
+    settlement_events = settlement_wins + settlement_losses
+    return {"realized_gross": round(realized, 8), "fees_paid": round(fees, 8), "funding_paid": round(funding, 8), "net_realized": round(realized + fees + funding, 8), "total_pnl": round(realized + fees + funding, 8), "win_trades": win_trades, "loss_trades": loss_trades, "closed_trades": closed_trades, "settlement_events": settlement_events, "win_rate": round(win_trades / closed_trades * 100, 2) if closed_trades else None, "source": "Gate Futures position_close + account_book", "timezone": "Asia/Shanghai"}
 
 
 @app.get("/")
@@ -601,7 +625,6 @@ def all_dashboard():
         calculus = snapshot.get("calculus", {}) if isinstance(snapshot, dict) else {}
         factors.append({"instId": contract_name, "name": contract_name, "type": "Gate Futures", "price": float(t.get("last") or 0), "chg24h": float(t.get("change_percentage") or 0), "high24h": float(t.get("high_24h") or 0), "low24h": float(t.get("low_24h") or 0), "vol24h": float(t.get("volume_24h_quote") or 0), "atr1h": snapshot.get("atr1h") or snapshot.get("atr_1h") or snapshot.get("atr"), "c_1h_ret": snapshot.get("c_1h_ret"), "trend_direction": snapshot.get("structure_1h", "NEUTRAL"), "adx_1h": snapshot.get("adx_1h"), "smart_money": snapshot.get("smart_money", {}), "calculus": {"velocity_1h": calculus.get("velocity"), "accel_1h": calculus.get("acceleration"), "jerk_1h": calculus.get("max_abs_jerk"), "impulse_1h": calculus.get("impulse"), "energy_1h": (calculus.get("definite_integrals") or {}).get("energy_integral"), "action_area_1h": (calculus.get("definite_integrals") or {}).get("deviation_area_integral"), "state_1h": calculus.get("regime")}, "decision": decision})
     errors = [e for e in (account_error, position_error, order_error, trigger_error, protection_error, account_book_error) if e]
-    book_stats = _account_book_stats(account_book)
     history_view = []
     for row in reversed(decision_history[-200:]):
         stamp = int(row.get("generated_at_ms") or 0) if isinstance(row, dict) else 0
@@ -617,6 +640,7 @@ def all_dashboard():
         key=lambda row: str(row.get("close_time") or row.get("open_time") or ""),
         reverse=True,
     )
+    book_stats = _account_book_stats(account_book, ledger_rows)
     normalized_protections = _dashboard_protection_orders(protections_raw or [], positions_raw or [])
     return {"timestamp": str(int(time.time() * 1000)), "is_stale": bool(errors), "account": {"total_eq": float(account.get("total") or 0), "avail_eq": float(account.get("available") or 0), "upl": float(account.get("unrealised_pnl") or 0), "currency": s.settle.upper(), "margin_usage_pct": 0, "initial_capital": s.initial_capital_usd or None}, "positions_summary": {"total_count": len(positions), "long_count": sum(p["side"] == "long" for p in positions), "short_count": sum(p["side"] == "short" for p in positions), "items": positions}, "pending_orders": pending, "trigger_entry_orders": trigger_entries_raw or [], "factors": factors, "factor_library": factor_snapshot, "macro_assessment": "Gate Futures 原生行情、因子与账户数据巡检中", "llm_runtime": {"model": os.getenv("LLM_MODEL", "Gate AI Worker"), "provider_name": "Gate-native", "reasoning_effort": os.getenv("LLM_REASONING_EFFORT", "high"), "api_format": "openai_chat"}, "logs": [f"Gate {s.environment.upper()} · {profile.label} · {s.leverage:g}x · 私有数据{'可用' if not errors else '未配置或不可用'}"], "trades": ledger_rows, "today_stats": book_stats, "news_intelligence": [], "protection_orders": protections_raw or [], "protection_orders_normalized": normalized_protections, "ai_brain_history": history_view, "risk_snapshot": risk_snapshot, "safety_status": _safety_status(), "gate_environment": s.environment, "gate_public_market_environment": s.public_market_environment, "errors": sorted(set(errors))}
 
@@ -861,6 +885,7 @@ def gate_admin_incomplete_decisions(limit: int = 100, x_gate_session: str | None
     persisted = run_anomaly_audit()
     history_limit = max(20, min(limit, 500))
     persisted["history"] = persisted["history"][:history_limit]
+    persisted["events"] = list(reversed(persisted.get("events") or []))[:history_limit]
     persisted["total"] = persisted["active_total"]
     persisted["repair_policy"] = "只读检测、记录与对账；不会自动重跑 AI、提交订单、撤单或平仓"
     return persisted
@@ -896,7 +921,7 @@ def gate_gateway_status(limit: int = 50, x_gate_session: str | None = Header(def
     store = GatewayStore(GATEWAY_DB_PATH)
     pid = current_pid()
     running = bool(pid or _worker_lock_held())
-    return {"version": "gate-0.4.0", "running": running, "pid": pid or None, "stats": store.stats(), "event_health": store.event_health(), "deliveries": store.recent(limit), "scheduler": scheduler_snapshot(store)}
+    return {"version": __version__, "running": running, "pid": pid or None, "stats": store.stats(), "event_health": store.event_health(), "deliveries": store.recent(limit), "scheduler": scheduler_snapshot(store)}
 
 
 @app.post("/api/v1/admin/gateway/activate")

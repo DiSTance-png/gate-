@@ -8,9 +8,10 @@ const loading = ref(false)
 const error = ref('')
 const items = ref<any[]>([])
 const history = ref<any[]>([])
+const events = ref<any[]>([])
 const summary = ref<Record<string, number>>({})
 const checkedAt = ref(0)
-const activeTab = ref<'active' | 'resolved'>('active')
+const activeTab = ref<'all' | 'active' | 'resolved'>('all')
 const category = ref('all')
 
 const severityLabel: Record<string, string> = { critical: '紧急', error: '错误', warning: '警告', info: '提示' }
@@ -25,7 +26,10 @@ const severityClass: Record<string, string> = {
   info: 'text-sky-300 border-sky-500/50 bg-sky-500/10',
 }
 
-const sourceRows = computed(() => activeTab.value === 'active' ? items.value : history.value.filter(row => row.status === 'resolved'))
+const sourceRows = computed(() => {
+  if (activeTab.value === 'all') return events.value
+  return activeTab.value === 'active' ? items.value : history.value.filter(row => row.status === 'resolved')
+})
 const filtered = computed(() => category.value === 'all' ? sourceRows.value : sourceRows.value.filter(row => row.category === category.value))
 const categories = computed(() => [...new Set(sourceRows.value.map(row => row.category).filter(Boolean))])
 
@@ -41,6 +45,7 @@ async function load() {
     const result = await api('/api/v1/admin/incomplete-decisions?limit=500')
     items.value = result.items || []
     history.value = result.history || []
+    events.value = result.events || []
     summary.value = result.summary || {}
     checkedAt.value = result.checked_at_ms || 0
   } catch (cause: any) {
@@ -67,19 +72,19 @@ onMounted(load)
       <div class="metric"><span>紧急</span><b class="text-red-300">{{ summary.critical || 0 }}</b></div><div class="metric"><span>错误</span><b class="text-orange-300">{{ summary.error || 0 }}</b></div><div class="metric"><span>警告</span><b class="text-amber-300">{{ summary.warning || 0 }}</b></div><div class="metric"><span>提示</span><b class="text-sky-300">{{ summary.info || 0 }}</b></div>
     </section>
     <div class="flex flex-wrap items-center gap-2">
-      <button class="filter-btn" :class="activeTab === 'active' ? 'selected' : ''" @click="activeTab = 'active'">当前异常（{{ items.length }}）</button><button class="filter-btn" :class="activeTab === 'resolved' ? 'selected' : ''" @click="activeTab = 'resolved'">已恢复历史</button>
+      <button class="filter-btn" :class="activeTab === 'all' ? 'selected' : ''" @click="activeTab = 'all'">最近全部（{{ events.length }}）</button><button class="filter-btn" :class="activeTab === 'active' ? 'selected' : ''" @click="activeTab = 'active'">当前异常（{{ items.length }}）</button><button class="filter-btn" :class="activeTab === 'resolved' ? 'selected' : ''" @click="activeTab = 'resolved'">已恢复历史</button>
       <select v-model="category" class="select ml-auto"><option value="all">全部类别</option><option v-for="value in categories" :key="value" :value="value">{{ categoryLabel[value] || value }}</option></select>
     </div>
     <section v-if="filtered.length" class="space-y-3">
-      <article v-for="item in filtered" :key="`${item.fingerprint}-${item.status}`" class="panel p-4">
+      <article v-for="(item, index) in filtered" :key="`${item.fingerprint}-${item.event || item.status}-${item.observed_at_ms || item.last_seen_ms}-${index}`" class="panel p-4">
         <div class="flex flex-wrap items-center justify-between gap-2"><div class="flex flex-wrap items-center gap-2"><span class="tag" :class="severityClass[item.severity]">{{ severityLabel[item.severity] || item.severity }}</span><strong :class="item.status === 'resolved' ? 'text-emerald-300' : 'text-amber-200'">{{ item.title }}</strong><span class="text-[10px] muted">{{ categoryLabel[item.category] || item.category }} · {{ (item.environment || '').toUpperCase() }}</span></div><span class="text-xs font-mono muted">{{ item.contract || item.client_id || item.code }}</span></div>
         <p class="mt-3 text-xs leading-relaxed">{{ item.detail }}</p>
-        <div class="grid sm:grid-cols-3 gap-2 mt-3 text-[11px] muted"><span>首次发现：{{ formatTime(item.first_seen_ms) }}</span><span>最后发现：{{ formatTime(item.last_seen_ms) }}</span><span v-if="item.status === 'resolved'" class="text-emerald-300">恢复：{{ formatTime(item.resolved_at_ms) }}</span><span v-else>累计：{{ item.occurrences || 1 }} 次</span></div>
+        <div class="grid sm:grid-cols-3 gap-2 mt-3 text-[11px] muted"><span>首次发现：{{ formatTime(item.first_seen_ms || item.observed_at_ms) }}</span><span>{{ item.event ? '本次记录' : '最后发现' }}：{{ formatTime(item.observed_at_ms || item.last_seen_ms) }}</span><span v-if="item.event === 'resolved' || item.status === 'resolved'" class="text-emerald-300">已恢复</span><span v-else-if="item.event">事件：{{ { detected: '首次发现', observed: '持续出现', occurred: '任务异常' }[item.event] || item.event }}</span><span v-else>累计：{{ item.occurrences || 1 }} 次</span></div>
         <p class="mt-3 rounded p-2 text-[11px] bg-black/20 text-sky-200">建议：{{ item.suggestion }}</p>
         <details v-if="item.evidence && Object.keys(item.evidence).length" class="mt-2"><summary class="text-[11px] muted cursor-pointer">查看检测证据</summary><pre class="mt-2 whitespace-pre-wrap text-[11px] bg-black/20 rounded p-3 overflow-x-auto">{{ JSON.stringify(item.evidence, null, 2) }}</pre></details>
       </article>
     </section>
-    <section v-else class="panel p-10 text-center"><CheckCircle2 v-if="activeTab === 'active'" class="w-8 h-8 text-emerald-300 mx-auto mb-3" /><AlertTriangle v-else class="w-8 h-8 text-slate-400 mx-auto mb-3" /><p class="text-sm" :class="activeTab === 'active' ? 'text-emerald-300' : 'muted'">{{ activeTab === 'active' ? '当前没有检测到异常闭环' : '没有符合筛选条件的恢复记录' }}</p></section>
+    <section v-else class="panel p-10 text-center"><CheckCircle2 v-if="activeTab === 'active'" class="w-8 h-8 text-emerald-300 mx-auto mb-3" /><AlertTriangle v-else class="w-8 h-8 text-slate-400 mx-auto mb-3" /><p class="text-sm" :class="activeTab === 'active' ? 'text-emerald-300' : 'muted'">{{ activeTab === 'active' ? '当前没有检测到异常闭环' : activeTab === 'all' ? '暂无异常事件记录' : '没有符合筛选条件的恢复记录' }}</p></section>
   </div>
 </template>
 

@@ -75,6 +75,30 @@ def test_old_failed_job_is_not_current_after_newer_success():
     assert "trader_run_failed" not in codes(report)
 
 
+def test_latest_failure_from_every_gateway_job_is_reported():
+    report = collect_anomalies(**healthy_inputs(job_runs=[
+        {"id": 8, "job_name": "trader", "status": "success", "started_at": "2033-05-18 03:32:00", "return_code": 0},
+        {"id": 7, "job_name": "gate_ledger", "status": "failed", "started_at": "2033-05-18 03:31:00", "return_code": 1, "detail": "ledger failed"},
+        {"id": 6, "job_name": "self_improvement", "status": "failed", "started_at": "2033-05-18 03:30:00", "return_code": 2, "detail": "review failed"},
+    ]))
+    job_items = [row for row in report["items"] if row["code"] == "gateway_job_failed"]
+    assert {row["evidence"]["job_name"] for row in job_items} == {"gate_ledger", "self_improvement"}
+
+
+def test_recovered_job_failure_is_kept_as_occurrence_event(tmp_path):
+    report = collect_anomalies(**healthy_inputs(job_runs=[
+        {"id": 3, "job_name": "news", "status": "success", "started_at": "2033-05-18 03:32:00", "return_code": 0},
+        {"id": 2, "job_name": "news", "status": "failed", "started_at": "2033-05-18 03:31:00", "return_code": 1, "detail": "temporary upstream error"},
+        {"id": 1, "job_name": "trader", "status": "success", "started_at": "2033-05-18 03:30:00", "return_code": 0},
+    ]))
+    assert "gateway_job_failed" not in codes(report)
+    saved = persist_anomaly_history(tmp_path / "history.json", report)
+    matching = [row for row in saved["events"] if row.get("occurrence_id") == "job:news:2:failed"]
+    assert len(matching) == 1
+    saved = persist_anomaly_history(tmp_path / "history.json", report)
+    assert len([row for row in saved["events"] if row.get("occurrence_id") == "job:news:2:failed"]) == 1
+
+
 def test_stale_closed_safety_snapshot_is_distinguished_from_live_safe_state():
     report = collect_anomalies(**healthy_inputs(
         safety_snapshot={"checked_at_ms": NOW - 30 * 60 * 1000, "safe_for_new_risk": False},
@@ -124,3 +148,15 @@ def test_anomaly_history_preserves_first_seen_and_marks_recovery(tmp_path):
     assert api_record["status"] == "resolved"
     disk_record = next(row for row in json.loads(path.read_text(encoding="utf-8")) if row["code"] == "private_api_unavailable")
     assert disk_record["resolved_at_ms"] == NOW + 60_000
+
+
+def test_anomaly_history_keeps_immutable_occurrence_events(tmp_path):
+    path = tmp_path / "history.json"
+    first = persist_anomaly_history(path, collect_anomalies(**healthy_inputs(private_errors=["timeout"])))
+    second = persist_anomaly_history(path, collect_anomalies(**healthy_inputs(private_errors=["timeout"], now_ms=NOW + 60_000)))
+    recovered = persist_anomaly_history(path, collect_anomalies(**healthy_inputs(now_ms=NOW + 120_000)))
+
+    fingerprint = next(row["fingerprint"] for row in first["items"] if row["code"] == "private_api_unavailable")
+    events = [row for row in recovered["events"] if row["fingerprint"] == fingerprint]
+    assert [row["event"] for row in events] == ["detected", "observed", "resolved"]
+    assert second["event_total"] > first["event_total"]

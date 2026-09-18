@@ -49,6 +49,7 @@
 - VPS Web 不直接监听公网地址。配置 VPN/HTTPS 前通过 SSH 本地转发访问，不能通过纯 HTTP 公网页面提交 API 凭证。
 - Windows 默认由 Web lifespan 启动独立 SSH 隧道和 Gateway supervisor；Linux systemd 部署设置 `R20_GATEWAY_WORKER_ENABLED=false`，由独立 Gateway 服务持有调度所有权。
 - Gateway 运行 `r20_gateway.worker`，负责定时任务与通知，不负责保持交易所长连接，也不是“有信号才启动”。
+- Gateway 启动时收编旧进程遗留的 `running` 任务，并按 `GATE_JOB_RUNS_KEEP_DAYS`（默认 30 天）保留已结束任务历史。
 - Windows 虚拟环境启动器会表现为一对父子 `pythonw.exe` PID。Web 和 Gateway 各出现一对通常是正常现象，不能据此判断重复实例。
 - 单实例依据是：8081 只有一个监听者、`.r20_gateway.lock` 只有一个持有者、调度日志只有一套周期。
 - 禁止使用 `Stop-Process -Name python*`、`taskkill /IM python.exe` 等宽泛命令。需要重启时只处理命令行明确包含 `gate_quant.web:app` 或已确认属于本目录父子链的 `r20_gateway.worker`。
@@ -128,7 +129,8 @@ git diff --check
 ## 当前验证基线
 
 - 当前部署前基线提交：`71d2e11`。
-- 离线测试：134 项通过。
+- 独立产品版本：`Gate v1.0.0`。
+- 离线测试：2026-09-18 本地融合后为 154 项通过；另需保持 Python 编译、前端生产构建和 `git diff --check` 通过。
 - 已在 Gate Testnet 正常链验证行情、账户、持仓、挂单、成交、撤单、保护单、过期撤单、原生平仓台账，以及突破计划多空触发、`trade_id` 对账、真实成交价保护重算和清理归零。双向持仓原生 `auto_size` 平仓已完成 Testnet 最小仓位回归；“复核阈值 + 绝对上限”已完成离线验证，尚未等待真实时长做 Testnet 回归。
 - 超时找回、部分成交递增保护、保护失败回滚和重启恢复已做离线故障注入，但尚未主动在 Testnet 制造这些异常。
 - Gate Live 从未执行过交易，不能声称已经完成实盘回归。

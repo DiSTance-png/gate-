@@ -11,6 +11,8 @@ from gate_quant.ai_worker import _extract_decision_object, _extract_response_obj
 from gate_quant.execution_journal import ExecutionJournal
 from gate_quant.strategy_adapter import validate_decision
 from gate_quant.risk_profiles import get_risk_profile
+from gate_quant.strategy_adapter import build_gate_risk_budget, strip_legacy_risk_values
+from gate_quant import strategy_adapter
 from r20_gateway.scheduler import JOBS, GatewayScheduler
 from gate_quant.safety import classify_error, cooldown_state, daily_loss_state, position_age_stage, reconcile_exchange_state
 from gate_quant.protection_lifecycle import actionable_recovery_plans, intent_from_history, is_system_protection, recovery_plans
@@ -525,6 +527,46 @@ def test_risk_profiles_are_versioned_and_observe_disables_execution():
     assert active["min_rr"] >= 2.0
     assert len(active["risk_profile_hash"]) == 16
     assert not _execution_enabled(GateSettings(environment="testnet", testnet_execute_trades=True, risk_profile="observe"))
+
+
+def test_gate_risk_budget_is_single_dynamic_source_for_money_and_profit_locking():
+    snapshot = get_risk_profile("aggressive").snapshot(leverage=4, environment="testnet")
+    text = build_gate_risk_budget(
+        snapshot, execution_leverage=4, max_order_margin_usdt=120,
+        max_total_margin_usdt=500, current_margin_usdt=80,
+    )
+    assert "固定使用 4x 杠杆" in text
+    assert "有效单笔保证金上限=120.00 USDT" in text
+    assert "1.5R" in text and "2.2%" in text
+    assert "45%~55%" in text
+    assert snapshot["profit_lock"]["breakeven_r"] == 1.5
+
+
+def test_gate_prompt_removes_inherited_fixed_risk_values():
+    inherited = """宽止损隔绝杂波：杠杆控制在 2x~3x、保证金控制在 100~200U。\n普通策略说明。\n- 单笔保证金建议 5%~15%；杠杆 2x~5x。\n- 底仓必须 ROI ≥ +0.8%；单标的累计保证金 ≤ 600 USDT；AI 置信度 ≥ 75%。"""
+    cleaned = strip_legacy_risk_values(inherited)
+    assert "普通策略说明。" in cleaned
+    assert "止损必须位于有效结构外" in cleaned
+    assert "同向加仓" in cleaned
+    assert "100~200U" not in cleaned and "600 USDT" not in cleaned and "75%" not in cleaned
+
+
+def test_gate_final_prompt_orders_layout_admin_override_and_immutable_constraints(monkeypatch):
+    monkeypatch.setattr(strategy_adapter, "construct_full_market_prompt", lambda *args, **kwargs: "用户策略\n- 单笔保证金建议 5%~15%；杠杆 2x~5x。")
+    monkeypatch.setattr(strategy_adapter, "active_profile", lambda: {"name": "测试", "pipelines": {}})
+    monkeypatch.setattr(strategy_adapter, "apply_module_layout", lambda base, *args, **kwargs: base + "\n模块布局已应用")
+    monkeypatch.setattr(strategy_adapter, "get_effective_system_prompt", lambda base=None: (base or "") + "\n管理员覆盖层")
+    snapshot = get_risk_profile("standard").snapshot(leverage=3, environment="testnet")
+
+    system_prompt, user_prompt = strategy_adapter.build_prompt(
+        [], positions=[], pending_orders=[], available_usdt=1000, execution_leverage=3,
+        max_order_margin_usdt=100, max_total_margin_usdt=300, current_margin_usdt=20,
+        risk_snapshot=snapshot,
+    )
+
+    assert system_prompt.index("模块布局已应用") < system_prompt.index("管理员覆盖层") < system_prompt.index("Gate 当前周期唯一风险预算")
+    assert "100~200U" not in system_prompt and "600 USDT" not in system_prompt
+    assert "2x~5x" not in user_prompt and "有效单笔保证金上限=65.00 USDT" in user_prompt
 
 
 def test_profile_leverage_cap_is_fail_closed():

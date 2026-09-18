@@ -1850,7 +1850,7 @@ def admin_about(
     import platform
     store = GatewayStore(GATEWAY_DB_PATH)
     return {
-        "product": {"name": APP_NAME, "version": __version__, "control_plane": "R20 Gateway Runtime", "gateway_version": GATEWAY_VERSION},
+        "product": {"name": APP_NAME, "version": __version__, "control_plane": "Gate Gateway Runtime", "gateway_version": GATEWAY_VERSION},
         "runtime": {"python": platform.python_version(), "platform": platform.platform(), "backend_pid": os.getpid(), "gateway": gateway_status(x_r20_admin_token)},
         "components": [
             {"name": "FastAPI Control Plane", "version": __version__},

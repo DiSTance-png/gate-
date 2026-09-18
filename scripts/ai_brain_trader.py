@@ -144,16 +144,17 @@ def get_cpa_client_config() -> Tuple[str, str]:
         os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or "",
     )
 
-def get_effective_system_prompt() -> str:
+def get_effective_system_prompt(base_prompt: str | None = None) -> str:
     """Append a locally managed admin override without replacing audited safety rules."""
+    effective_base = base_prompt or SYSTEM_PROMPT
     try:
         if os.path.exists(PROMPT_OVERRIDE_FILE):
             override = open(PROMPT_OVERRIDE_FILE, "r", encoding="utf-8").read().strip()
             if override:
-                return f"{SYSTEM_PROMPT}\n\n【管理员提示词覆盖层（同样必须遵守上述风控和 JSON 约束）】\n{override}"
+                return f"{effective_base}\n\n【管理员提示词覆盖层（同样必须遵守上述风控和 JSON 约束）】\n{override}"
     except OSError:
         pass
-    return SYSTEM_PROMPT
+    return effective_base
 
 
 def fetch_single_instrument_package(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -1036,9 +1037,9 @@ def execute_batch_ai_brain_cycle(
     prompt = construct_full_market_prompt(packages, pos_summary, positions_context, pending_orders_detail=pending_orders_list, current_time_str=time_str, usdt_available=usdt_available, runtime_context_out=runtime_context, policy_snapshot=policy_snapshot)
 
     profile = active_profile()
-    effective_system_prompt = apply_module_layout(
-        get_effective_system_prompt(), profile, "trading_system", f"{profile.get('name', '稳健')}交易系统提示词模板", context=runtime_context
-    )
+    effective_system_prompt = get_effective_system_prompt(apply_module_layout(
+        SYSTEM_PROMPT, profile, "trading_system", f"{profile.get('name', '稳健')}交易系统提示词模板", context=runtime_context
+    ))
 
     # Save Realtime Prompt Snapshot for Web Transparent Inspection
     try:

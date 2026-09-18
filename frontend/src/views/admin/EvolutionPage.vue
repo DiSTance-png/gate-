@@ -429,6 +429,13 @@ onMounted(loadData)
           <div><h3 class="text-xs font-black" style="color: var(--text-main);">待审核自进化候选</h3><p class="text-[10px] mt-1" style="color: var(--text-muted);">定时复盘只生成候选，默认不会自动覆盖当前稳定心法。</p></div>
           <span class="text-xs" style="color: var(--text-muted);">{{ evolutionCandidates.filter((x: any) => x.status === 'pending').length }} 待处理</span>
         </div>
+        <div v-if="evolutionReport.ledger_diagnostics" class="p-2.5 rounded-lg border text-[11px]" style="background-color: var(--bg-card-subtle); border-color: var(--border-subtle); color: var(--text-muted);">
+          <b style="color: var(--text-main);">复盘证据范围：</b>
+          起始 {{ evolutionReport.ledger_diagnostics.effective_start_time }} · 原始 {{ evolutionReport.ledger_diagnostics.ledger_rows }} 笔 · 接受 {{ evolutionReport.ledger_diagnostics.accepted }} 笔 · 池外过滤 {{ evolutionReport.ledger_diagnostics.filtered_outside_pool }} 笔 · 时间过滤 {{ evolutionReport.ledger_diagnostics.filtered_before_reset }} 笔 · 快照匹配 {{ evolutionReport.ledger_diagnostics.snapshot_matched }} 笔 / 缺失 {{ evolutionReport.ledger_diagnostics.snapshot_missing }} 笔
+        </div>
+        <div v-if="evolutionReport.no_candidate_reason" class="p-2.5 rounded-lg border text-[11px] text-amber-300" style="background-color: var(--bg-card-subtle); border-color: var(--border-subtle);">
+          未生成候选：{{ evolutionReport.no_candidate_reason }}
+        </div>
         <div v-for="candidate in evolutionCandidates.slice(0, 10)" :key="candidate.id" class="rounded-lg border p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3" style="border-color: var(--border-subtle); background-color: var(--bg-card-subtle);">
           <div class="min-w-0"><div class="text-xs font-bold truncate">{{ candidate.id }} · {{ candidate.change_status }}</div><div class="text-[10px] mt-1" style="color: var(--text-muted);">{{ candidate.sample_size }} 笔样本 · {{ candidate.status }} · {{ candidate.reason || '无补充说明' }}</div></div>
           <div v-if="candidate.status === 'pending'" class="flex gap-2 shrink-0">
