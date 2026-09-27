@@ -117,7 +117,7 @@ P0/P1 安全层还会记录 Gate 对账、日亏损熔断、挂单生命周期�
 
 每轮 AI 决策、交易结果和历史记录都绑定 `policy_version` 与 `policy_hash`。版本指纹覆盖提示词、自进化心法、物理拦截器、模型委员会、Gate 风险档位/杠杆/资金上限/生命周期参数和标的池；归档与回滚明确排除 API Key、Secret、代理、`GATE_ENVIRONMENT` 和 Live 开关。
 
-自动复盘默认只写入 `data/evolution_candidates/` 候选，不会直接覆盖当前稳定心法或标的倍率。超级管理员可在“自进化配置”审核应用或拒绝候选；没有有效心法变化时记录 `NO_CHANGE` 且不生成候选，旧空候选只能拒绝归档。`evolution_actions` 中明确的 `ADD_MEMORY` 会保留旧心法并追加新规则；`REVISE_MEMORY` 和 `INVALIDATE_MEMORY` 必须逐字指定旧心法目标，不能把废止文本误发为新规则。收益快照基于真实平仓台账统计净盈亏、手续费、最大回撤和分标的表现；台账没有资金费或滑点字段时显示“不可用”，不会估算或伪造。新入场会在执行台账固化完整因子、决策、风险与策略版本快照，平仓同步后供复盘使用；旧记录仍可按成交后 20 分钟内同方向信号快照匹配。
+自动复盘默认只写入 `data/evolution_candidates/` 候选，不会直接覆盖当前稳定心法或标的倍率。超级管理员可在“自进化配置”审核应用或拒绝候选；没有有效心法变化时记录 `NO_CHANGE` 且不生成候选，旧空候选只能拒绝归档。候选现在保存结构化 `memory_operations`：`ADD` 追加、`REVISE` 修改指定非 baseline 规则、`INVALIDATE` 停用但保留历史、`COLLECT_EVIDENCE` 只提出采集建议。`structured_trading_memory.json` 是唯一权威，必须通过管理员显式初始化 baseline；`AI_TRADING_MEMORY.md` 只是派生镜像。baseline 永远不能被删除、修改或停用，版本冲突会拒绝发布。记忆候选不会写入 `asset_multipliers.json`，资产参数必须走独立审批流程。报告同时记录 `COLD_START`、`NO_CHANGE`、`INSUFFICIENT_EVIDENCE`、`WAITING_REVIEW`、`LLM_ERROR`、`PARSE_ERROR`、`PUBLICATION_ERROR` 和 `CONFLICT` 等状态，以及主机侧证据覆盖率。收益快照基于真实平仓台账统计净盈亏、手续费、最大回撤和分标的表现；台账没有资金费或滑点字段时显示“不可用”，不会估算或伪造。新入场会在执行台账固化完整因子、决策、风险与策略版本快照，平仓同步后供复盘使用；旧记录仍可按成交后 20 分钟内同方向信号快照匹配。
 
 Gateway 启动时会把上一次异常终止遗留的 `running` 任务标为“已中断”，并默认保留 30 天任务历史；可用 `GATE_JOB_RUNS_KEEP_DAYS` 调整，但不能小于 1 天。
 

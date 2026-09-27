@@ -435,7 +435,7 @@ Windows 下 `.venv\Scripts\pythonw.exe` 可能再启动基础解释器 `C:\Pytho
 - Gateway 的 OS 文件锁只有一个持有者。
 - Gateway 新进程会收编旧进程遗留的僵尸 `running` 任务，并按 `GATE_JOB_RUNS_KEEP_DAYS`（默认 30 天）清理已结束任务历史。
 
-自进化按当前 Gate 标的池动态匹配 `BTC_USDT` 等台账名称。`GATE_EVOLUTION_START_TIME` 可独立限制复盘起点；页面显示样本接受/过滤原因。新成交优先使用执行台账中下单前固化的结构化入场快照，旧记录仍可使用成交后首次巡检最多 20 分钟的同方向信号快照。自动任务只生成候选，必须由超级管理员审核；无有效变化时降级为 `NO_CHANGE`。`ADD_MEMORY` 保留旧心法并追加；`REVISE_MEMORY` 和 `INVALIDATE_MEMORY` 必须用 `target` 逐字指定旧心法，前者替换目标，后者删除目标，不能把废止内容重新发布成新规则。
+自进化按当前 Gate 标的池动态匹配 `BTC_USDT` 等台账名称。`GATE_EVOLUTION_START_TIME` 可独立限制复盘起点；页面显示样本接受/过滤原因。新成交优先使用执行台账中下单前固化的结构化入场快照，旧记录仍可使用成交后首次巡检最多 20 分钟的同方向信号快照。自动任务只生成候选，必须由超级管理员审核；无有效变化时降级为 `NO_CHANGE`。候选采用结构化 memory operation：`ADD` 追加、`REVISE` 修改指定非 baseline 规则、`INVALIDATE` 停用但保留历史、`COLLECT_EVIDENCE` 不产生发布候选。`structured_trading_memory.json` 是唯一权威，必须由管理员通过 `/api/v1/admin/memory/initialize-baseline` 显式初始化；`AI_TRADING_MEMORY.md` 只是派生镜像。baseline 永远不能删除、修改或停用；版本哈希不匹配时拒绝发布。记忆候选不会修改资产倍数或其他交易参数。主机程序将样本分类为 `OBSERVED`、`PARTIAL`、`PRICE_ONLY`、`UNAVAILABLE`，只有完整证据才可用于因果长期规则；缺失指标不得补写或推断。报告会区分 `COLD_START`、`NO_CHANGE`、`INSUFFICIENT_EVIDENCE`、`WAITING_REVIEW`、`LLM_ERROR`、`PARSE_ERROR`、`PUBLICATION_ERROR` 和 `CONFLICT`。
 
 Gate 单止损限制下，止损替换流程为先确认撤销唯一旧止损，再创建并确认更严格的新止损；新建或确认失败时立即按旧价格恢复并确认。替换窗口内禁止新增风险，恢复状态不明时保持 fail-closed。当前不使用未被 Gate 官方文档和 Testnet 验证的计划单改单接口。
 - 调度日志没有同一任务同秒重复启动。

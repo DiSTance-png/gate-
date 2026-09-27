@@ -2966,6 +2966,16 @@ def get_admin_memory(x_r20_admin_token: str | None = Header(default=None), x_r20
     return _memory_service_call("admin_memory_view")
 
 
+@app.post("/api/v1/admin/memory/initialize-baseline")
+def initialize_admin_memory_baseline(expected_version: str | None = "missing", x_r20_admin_token: str | None = Header(default=None), x_r20_session: str | None = Header(default=None, alias="X-R20-Session")) -> dict[str, Any]:
+    """Explicitly initialize the structured authority; never run from a scheduler."""
+    refresh_settings()
+    actor = require_admin_header(x_r20_admin_token, x_r20_session)
+    snapshot = _memory_service_call("initialize_baseline_memory", expected_version=expected_version or "missing")
+    audit_record("memory.initialize_baseline", "success", {"actor": actor.get("username", "admin"), "version": snapshot.get("version")})
+    return {"ok": True, "snapshot": snapshot}
+
+
 @app.post("/api/v1/admin/memory/toggle/{lesson_id}")
 def toggle_admin_memory_lesson(lesson_id: str, expected_version: str | None = None, x_r20_admin_token: str | None = Header(default=None), x_r20_session: str | None = Header(default=None, alias="X-R20-Session")) -> dict[str, Any]:
     refresh_settings()

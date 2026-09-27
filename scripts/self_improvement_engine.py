@@ -48,6 +48,7 @@ EVOLUTION_LOCK_FILE = os.path.join(DATA_DIR, ".self_improvement.lock")
 from r20_backend.version import __version__
 from scripts.instrument_pool import load_instruments
 from scripts.prompt_library import active_profile, apply_module_layout
+from scripts.evolution.observability import classify_trade, summarize_trades
 from r20_gateway.telemetry import ModelCallTelemetry
 TARGET_INSTRUMENTS = [item["name"] for item in load_instruments()]
 
@@ -105,25 +106,27 @@ def apply_evolution_candidate(candidate_id: str, expected_version: str) -> Dict[
         raise ValueError("心法版本已变化，请重新复盘生成候选；未覆盖当前数据")
 
     from scripts import evolution_shield as memory_service
-    published = memory_service.publish_review(
-        payload.get("proposed_memory") or [], expected_version=expected_version,
-        sample_size=int(payload.get("sample_size") or 0),
-        change_status=str(payload.get("change_status") or "NO_CHANGE"),
-    )
+    operations = payload.get("memory_operations")
+    if isinstance(operations, list):
+        published = memory_service.publish_operations(
+            operations, expected_version=expected_version,
+            sample_size=int(payload.get("sample_size") or 0),
+        )
+    else:
+        published = memory_service.publish_review(
+            payload.get("proposed_memory") or [], expected_version=expected_version,
+            sample_size=int(payload.get("sample_size") or 0),
+            change_status=str(payload.get("change_status") or "NO_CHANGE"),
+        )
     if not published:
         raise ValueError("候选未产生可发布的心法变化")
     payload.update({"status": "applied", "applied_at": datetime.datetime.now(datetime.timezone.utc).isoformat()})
     atomic_write_json(path, payload)
-    multipliers = payload.get("asset_multipliers")
-    if isinstance(multipliers, dict):
-        try:
-            atomic_write_json(os.path.join(DATA_DIR, "asset_multipliers.json"), {
-                "timestamp": payload.get("created_at"), "multipliers": multipliers,
-                "updated_by": "approved_evolution_candidate", "candidate_id": candidate_id,
-            })
-        except OSError as exc:
-            payload["asset_multiplier_warning"] = f"{type(exc).__name__}: {exc}"
-            atomic_write_json(path, payload)
+    # Asset multipliers require a separate parameter-candidate workflow. They
+    # are deliberately ignored when a memory candidate is approved.
+    if isinstance(payload.get("asset_multipliers"), dict):
+        payload["asset_multiplier_status"] = "not_applied_memory_only"
+        atomic_write_json(path, payload)
     memory_service.sync_markdown_mirror()
     return payload
 
@@ -401,7 +404,7 @@ def load_closed_trades(*, return_diagnostics: bool = False, start_time_override:
                     )
                     diagnostics["snapshot_matched" if snapshot else "snapshot_missing"] += 1
 
-                    closed_trades.append({
+                    trade_row = {
                         "inst": inst,
                         "side": t.get("side") or t.get("direction") or "",
                         "time": c_time,
@@ -415,8 +418,11 @@ def load_closed_trades(*, return_diagnostics: bool = False, start_time_override:
                         "slippage_bps": t.get("slippage_bps"),
                         "exit_reason": reason,
                         "entry_snapshot": snapshot,
-                        "snapshot_observability": "OBSERVED" if snapshot else "UNAVAILABLE",
-                    })
+                    }
+                    observability, missing_fields = classify_trade(snapshot, trade_row)
+                    trade_row["snapshot_observability"] = observability
+                    trade_row["missing_evidence_fields"] = missing_fields
+                    closed_trades.append(trade_row)
                     diagnostics["accepted"] += 1
         except Exception as e:
             log_msg(f"读取交易台账异常: {e}")
@@ -437,7 +443,10 @@ EVOLUTION_SYSTEM_PROMPT = """你是 R20 Quantum Trader 的首席投资官，负�
 - REVISE：新证据明确限定旧经验的适用条件。
 - INVALIDATE：充分反例证明旧经验失效。
 - NO_CHANGE：证据不足、无新增交易或结论无法区分策略问题与随机性。
+- COLLECT_EVIDENCE：只提出补充数据建议，不产生长期记忆候选。
 - 输出 0~4 条结论即可；没有高质量新证据时宁可空数组，不得凑数。
+
+长期记忆必须使用结构化 memory operation，并引用 evidence_refs；普通诊断和行动建议不得进入长期记忆。
 
 必须输出严格 JSON 对象，不得输出 Markdown、代码围栏或额外解释。
 """
@@ -462,8 +471,74 @@ def _memory_actions(actions: Any) -> tuple[str | None, List[Dict[str, str]]]:
             inferred_status = normalized
         text = str(item.get("rule_text") or item.get("detail") or item.get("lesson") or "").strip()
         target = str(item.get("target") or item.get("memory_id") or "").strip()
-        operations.append({"action": normalized, "target": target, "rule_text": text})
+        operations.append({"action": normalized, "target": target, "target_id": target, "rule_text": text})
     return inferred_status, operations
+
+
+def _coerce_display_str(value: Any) -> str:
+    """Convert model strings/objects/lists to safe human-readable text."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("{") or text.startswith("["):
+            try:
+                return _coerce_display_str(json.loads(text))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return text
+        return text
+    if isinstance(value, dict):
+        for key in ("rule_text", "lesson", "detail", "observation", "analysis", "reason", "title"):
+            text = _coerce_display_str(value.get(key))
+            if text:
+                return text
+        return ""
+    if isinstance(value, list):
+        return "\n".join(item for item in (_coerce_display_str(v) for v in value) if item)
+    return str(value).strip()
+
+
+def normalize_evolution_response(raw: Any) -> Dict[str, Any]:
+    """Normalize schema drift while keeping actions separate from memory rules."""
+    if isinstance(raw, str):
+        text = raw.strip().removeprefix("```json").removesuffix("```").strip()
+        try:
+            raw = json.loads(text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {"change_status": "PARSE_ERROR", "parse_error": "invalid_json", "diagnosis_insights": [], "evolution_actions": [], "memory_operations": [], "raw_proposal_count": 0, "normalized_proposal_count": 0, "dropped_proposal_count": 0, "drop_reasons": ["invalid_json"]}
+    if not isinstance(raw, dict):
+        return {"change_status": "PARSE_ERROR", "parse_error": "invalid_root", "diagnosis_insights": [], "evolution_actions": [], "memory_operations": [], "raw_proposal_count": 0, "normalized_proposal_count": 0, "dropped_proposal_count": 0, "drop_reasons": ["invalid_root"]}
+    insights = raw.get("diagnosis_insights", [])
+    actions = raw.get("evolution_actions", [])
+    memory = raw.get("ai_long_term_memory", [])
+    insights = [_coerce_display_str(v) for v in (insights if isinstance(insights, list) else [insights])]
+    insights = [v for v in insights if v]
+    actions = actions if isinstance(actions, list) else [actions]
+    memory = memory if isinstance(memory, list) else [memory]
+    operations: List[Dict[str, Any]] = []
+    drops: List[str] = []
+    raw_count = len(memory) + len(actions)
+    for item in memory + actions:
+        if not isinstance(item, dict):
+            if item in memory:
+                drops.append("memory_item_without_explicit_rule")
+            continue
+        action = str(item.get("action") or item.get("action_type") or "").upper()
+        if action in {"COLLECT_EVIDENCE", "NO_CHANGE"}:
+            continue
+        normalized = {"ADD_MEMORY": "ADD", "REVISE_MEMORY": "REVISE", "INVALIDATE_MEMORY": "INVALIDATE"}.get(action, action)
+        rule_text = _coerce_display_str(item.get("rule_text") or item.get("lesson") or item.get("detail"))
+        if normalized not in {"ADD", "REVISE", "INVALIDATE"} or (normalized in {"ADD", "REVISE"} and not rule_text):
+            drops.append("action_without_explicit_memory_rule")
+            continue
+        target = str(item.get("target_id") or item.get("target") or item.get("memory_id") or "").strip()
+        operations.append({"action": normalized, "target_id": target, "rule_text": rule_text, "evidence_refs": item.get("evidence_refs") or [], "evidence_summary": _coerce_display_str(item.get("evidence_summary") or item.get("reason")), "confidence": item.get("confidence"), "scope": _coerce_display_str(item.get("scope"))})
+    status = str(raw.get("change_status") or "NO_CHANGE").upper()
+    if status not in {"ADD", "REVISE", "INVALIDATE", "NO_CHANGE"}:
+        status = "NO_CHANGE"
+    if operations and status == "NO_CHANGE":
+        status = operations[0]["action"]
+    return {**raw, "change_status": status, "diagnosis_insights": insights, "evolution_actions": actions, "memory_operations": operations, "raw_proposal_count": raw_count, "normalized_proposal_count": len(operations), "dropped_proposal_count": len(drops), "drop_reasons": drops}
 
 
 def resolve_memory_update(change_status: str, proposed_memory: Any, existing_memory: List[str],
@@ -537,6 +612,7 @@ def call_llm_evolution_review(closed_trades: List[Dict[str, Any]], existing_memo
     total_net = round(sum(t["net_pnl"] for t in closed_trades), 2)
     total_fees = round(sum(t["fee"] for t in closed_trades), 2)
     target_instruments = target_instruments or current_target_instruments()
+    observability = summarize_trades(closed_trades)
 
     memory_context = f"""======================= 【当前系统已有的历史长期记忆库】 =======================
 {existing_memory_md.strip()}
@@ -552,6 +628,8 @@ def call_llm_evolution_review(closed_trades: List[Dict[str, Any]], existing_memo
 - 总平仓笔数: {total} 笔 (胜 {len(wins)} / 负 {len(losses)} | 胜率: {win_rate}%)
 - 累计净盈亏: {total_net:+.2f} USDT | 累计手续费消耗: {total_fees:.2f} USDT
 - 当前聚焦标的池: {target_instruments}
+- 主机侧证据审计: {json.dumps(observability, ensure_ascii=False)}
+- 只有 OBSERVED 样本可用于因果长期规则；缺失字段不得推断。
 
 【逐笔历史交易明细 (按时间排序)】:
 {json.dumps(closed_trades, indent=2, ensure_ascii=False)}
@@ -564,7 +642,7 @@ def call_llm_evolution_review(closed_trades: List[Dict[str, Any]], existing_memo
     "0~4 条有台账字段支持的诊断；区分已验证事实与待验证假设"
   ],
   "evolution_actions": [
-    {{"action": "ADD_MEMORY|REVISE_MEMORY|INVALIDATE_MEMORY|COLLECT_EVIDENCE|NO_CHANGE", "target": "REVISE/INVALIDATE 时必须逐字填写被修改的旧心法；ADD 时留空", "rule_text": "ADD/REVISE 时填写可直接审核的完整新心法；INVALIDATE 时留空", "reason": "证据依据"}}
+    {{"action": "ADD_MEMORY|REVISE_MEMORY|INVALIDATE_MEMORY|COLLECT_EVIDENCE|NO_CHANGE", "target_id": "REVISE/INVALIDATE 时填写明确的结构化 memory id；兼容旧数据时才使用旧心法原文", "rule_text": "ADD/REVISE 时填写可直接审核的完整新心法；INVALIDATE 时留空", "reason": "证据依据"}}
   ],
   "ai_long_term_memory": [
     "0~4 条有多个独立样本支持的软启发式；不得覆盖任何硬风控"
@@ -668,9 +746,7 @@ def call_llm_evolution_review(closed_trades: List[Dict[str, Any]], existing_memo
         if content.endswith("```"):
             content = content[:-3]
         
-        review_json = json.loads(content.strip())
-        if not isinstance(review_json, dict):
-            review_json = {}
+        review_json = normalize_evolution_response(content)
         telemetry.finish("success", raw_res, output_chars=len(content))
         log_msg(f"✅ AI 大脑认知复盘完成 (耗时 {round(time.time() - t0, 2)}s)")
         return review_json
@@ -679,7 +755,7 @@ def call_llm_evolution_review(closed_trades: List[Dict[str, Any]], existing_memo
         log_msg(f"Error in LLM evolution review: {e}")
         # Surface the upstream failure in the dashboard report instead of silently
         # degrading to an unexplained NO_CHANGE (which looks like a stale cache).
-        return {"__llm_error__": f"{type(e).__name__}: {e}"}
+        return {"__llm_error__": f"{type(e).__name__}: {e}", "change_status": "LLM_ERROR"}
 
 @single_evolution_cycle
 def run_self_evolution(force: bool = False):
@@ -721,7 +797,8 @@ def run_self_evolution(force: bool = False):
     # 2. Call LLM for Cognitive Review & Memory Overwriting
     llm_review = call_llm_evolution_review(closed_trades, existing_memory_md=existing_memory_md, timestamp_str=timestamp_str, target_instruments=target_instruments)
     if not isinstance(llm_review, dict):
-        llm_review = {}
+        llm_review = {"change_status": "PARSE_ERROR"}
+    llm_review = normalize_evolution_response(llm_review)
 
     insights = llm_review.get("diagnosis_insights", [])
     actions_taken = llm_review.get("evolution_actions", [])
@@ -741,6 +818,7 @@ def run_self_evolution(force: bool = False):
         llm_review.get("change_status", "NO_CHANGE"), llm_review.get("ai_long_term_memory", []),
         existing_core_lessons, actions_taken
     )
+    memory_operations = llm_review.get("memory_operations", [])
 
     candidate_payload = None
     if not preserve_existing_memory:
@@ -758,13 +836,14 @@ def run_self_evolution(force: bool = False):
             change_status = "NO_CHANGE"
             preserve_existing_memory = True
 
-        if safe_long_term:
+        if safe_long_term or memory_operations:
             candidate_id = f"ev_{now_bj.strftime('%Y%m%d_%H%M%S')}_{ledger_revision[:10]}"
             candidate_payload = {
                 "id": candidate_id, "status": "pending", "created_at": now_bj.isoformat(),
                 "ledger_revision": ledger_revision, "expected_memory_version": memory_snapshot["version"],
                 "sample_size": total_trades, "change_status": change_status,
-                "proposed_memory": safe_long_term, "asset_multipliers": asset_mults,
+                "proposed_memory": safe_long_term, "memory_operations": memory_operations,
+                "asset_multipliers": asset_mults,
                 "performance_snapshot": build_performance_snapshot(closed_trades),
                 "diagnosis_insights": insights, "evolution_actions": actions_taken,
                 "reason": llm_review.get("memory_overwrites_reason", ""),
@@ -794,12 +873,13 @@ def run_self_evolution(force: bool = False):
         "total_trades": total_trades,
         "target_instruments": target_instruments,
         "ledger_diagnostics": ledger_diagnostics,
+        "observability": summarize_trades(closed_trades),
         "win_rate": win_rate,
         "profit_factor": profit_factor,
         "performance_snapshot": performance_snapshot,
         "auto_rollback": auto_rollback,
         "mode": "R20 Native Heuristic Memory (启发式长期记忆)",
-        "change_status": change_status,
+        "change_status": change_status if not llm_review.get("__llm_error__") else "LLM_ERROR",
         "memory_preserved": preserve_existing_memory,
         "candidate": candidate_payload,
         "insights": insights,
@@ -808,6 +888,14 @@ def run_self_evolution(force: bool = False):
         "actions_taken": actions_taken,
         "core_lessons": long_term_memory,
         "llm_error": str(llm_review.get("__llm_error__") or ""),
+        "memory_state": "ready" if memory_snapshot.get("exists") else "COLD_START",
+        "publication_status": "WAITING_REVIEW" if candidate_payload else "not_requested",
+        "publication_error": "",
+        "baseline_available": True,
+        "raw_proposal_count": int(llm_review.get("raw_proposal_count") or 0),
+        "normalized_proposal_count": int(llm_review.get("normalized_proposal_count") or 0),
+        "dropped_proposal_count": int(llm_review.get("dropped_proposal_count") or 0),
+        "drop_reasons": llm_review.get("drop_reasons") or [],
         "no_candidate_reason": "" if candidate_payload else (
             str(llm_review.get("__llm_error__") or "")
             or str(llm_review.get("memory_overwrites_reason") or "")

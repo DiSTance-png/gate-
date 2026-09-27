@@ -177,6 +177,20 @@ def load_structured_memory() -> List[Dict[str, Any]]:
     return read_memory_snapshot()["lessons"]
 
 
+def initialize_baseline_memory(*, expected_version: str = "missing") -> Dict[str, Any]:
+    """Explicitly create the authority from the immutable baseline constitution."""
+    with _memory_lock():
+        snapshot = read_memory_snapshot()
+        _check_version(snapshot, expected_version)
+        if snapshot["exists"]:
+            raise MemoryConflictError("结构化记忆已存在，拒绝重复初始化")
+        lessons = copy.deepcopy(BASELINE_LESSONS)
+        _commit(lessons)
+        result = read_memory_snapshot()
+    sync_markdown_mirror()
+    return result
+
+
 def is_lesson_expired(item: Dict[str, Any], now: Optional[datetime.datetime] = None) -> bool:
     """Checks if a non-baseline lesson has exceeded its natural half-life (TTL days)."""
     if item.get("is_baseline"):
@@ -349,6 +363,78 @@ def _review_candidates(texts, old, sample_size, strict):
     # Preserve disabled tombstones even when omitted by a model or legacy editor.
     result.extend(copy.deepcopy(i) for i in old if not i["enabled"] and i["rule_text"].strip() not in seen)
     return result
+
+
+def _merge_operations(operations, old, sample_size):
+    """Apply explicit ADD/REVISE/INVALIDATE operations without dropping old rules."""
+    if not isinstance(operations, list):
+        raise ValueError("Expected memory operations")
+    result = copy.deepcopy(old)
+    by_id = {item["id"]: item for item in result}
+    for operation in operations:
+        if not isinstance(operation, dict):
+            raise ValueError("Invalid memory operation")
+        action = str(operation.get("action") or "").upper()
+        target_id = str(operation.get("target_id") or operation.get("target") or "").strip()
+        target = by_id.get(target_id) if target_id else None
+        if target is None and target_id:
+            target = next((item for item in result if item.get("rule_text", "").strip() == target_id), None)
+            if target is not None:
+                target_id = target["id"]
+        if action == "COLLECT_EVIDENCE" or action == "NO_CHANGE":
+            continue
+        if action == "ADD":
+            text = str(operation.get("rule_text") or "").strip()
+            passed, reason = audit_proposed_lesson(text, sample_size=sample_size)
+            if not passed:
+                raise ValueError(reason)
+            if any(item["rule_text"].strip() == text for item in result):
+                continue
+            item = _new_lesson(text, sample_size)
+            result.append(item)
+            by_id[item["id"]] = item
+        elif action in {"REVISE", "INVALIDATE"}:
+            if target is None:
+                raise ValueError("REVISE/INVALIDATE 必须提供有效 target_id")
+            if target.get("is_baseline"):
+                raise ValueError("baseline 规则不可修改或停用")
+            if action == "INVALIDATE":
+                target["enabled"] = False
+                target["shield_status"] = "INVALIDATED"
+            else:
+                text = str(operation.get("rule_text") or "").strip()
+                passed, reason = audit_proposed_lesson(text, sample_size=sample_size)
+                if not passed:
+                    raise ValueError(reason)
+                target["rule_text"] = text
+                target["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        else:
+            raise ValueError(f"Unsupported memory operation: {action}")
+    # Constitution: every baseline remains present and enabled exactly as defined.
+    existing_ids = {item["id"] for item in result}
+    for baseline in BASELINE_LESSONS:
+        if baseline["id"] not in existing_ids:
+            result.insert(BASELINE_LESSONS.index(baseline), copy.deepcopy(baseline))
+        else:
+            current = next(item for item in result if item["id"] == baseline["id"])
+            current.clear()
+            current.update(copy.deepcopy(baseline))
+    return result
+
+
+def publish_operations(operations, *, expected_version, sample_size) -> bool:
+    """Publish structured memory operations atomically with optimistic concurrency."""
+    with _memory_lock():
+        snapshot = read_memory_snapshot()
+        _check_version(snapshot, expected_version)
+        if not snapshot["exists"]:
+            raise MemoryConflictError("结构化记忆尚未初始化，请先显式初始化 baseline")
+        candidates = _merge_operations(operations, snapshot["lessons"], sample_size)
+        if candidates == snapshot["lessons"]:
+            return False
+        _commit(candidates)
+    sync_markdown_mirror()
+    return True
 
 
 def publish_review(texts, *, expected_version, sample_size, change_status):
