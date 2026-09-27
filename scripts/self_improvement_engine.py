@@ -523,11 +523,11 @@ def normalize_evolution_response(raw: Any) -> Dict[str, Any]:
             if item in memory:
                 drops.append("memory_item_without_explicit_rule")
             continue
-        action = str(item.get("action") or item.get("action_type") or "").upper()
+        action = str(item.get("action") or item.get("action_type") or item.get("op") or "").upper()
         if action in {"COLLECT_EVIDENCE", "NO_CHANGE"}:
             continue
         normalized = {"ADD_MEMORY": "ADD", "REVISE_MEMORY": "REVISE", "INVALIDATE_MEMORY": "INVALIDATE"}.get(action, action)
-        rule_text = _coerce_display_str(item.get("rule_text") or item.get("lesson") or item.get("detail"))
+        rule_text = _coerce_display_str(item.get("rule_text") or item.get("lesson") or item.get("detail") or (item.get("content") if normalized in {"ADD", "REVISE"} else ""))
         if normalized not in {"ADD", "REVISE", "INVALIDATE"} or (normalized in {"ADD", "REVISE"} and not rule_text):
             drops.append("action_without_explicit_memory_rule")
             continue

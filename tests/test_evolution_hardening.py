@@ -32,6 +32,18 @@ def test_normalize_model_schema_drift_and_keep_collection_separate():
     assert result["dropped_proposal_count"] == 1
 
 
+def test_normalize_legacy_op_content_action_with_evidence():
+    result = evolution.normalize_evolution_response({
+        "evolution_actions": [{
+            "op": "ADD", "content": "多个独立样本支持把手续费纳入期望评估",
+            "evidence_refs": ["trade_1", "trade_2"], "reason": "成本数据可观测",
+        }],
+        "ai_long_term_memory": [],
+    })
+    assert result["normalized_proposal_count"] == 1
+    assert result["memory_operations"][0]["rule_text"] == "多个独立样本支持把手续费纳入期望评估"
+
+
 def test_baseline_initialization_is_explicit_and_idempotent(monkeypatch, tmp_path):
     _memory_paths(monkeypatch, tmp_path)
     snapshot = evolution_shield.initialize_baseline_memory()
