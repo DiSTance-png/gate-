@@ -7,12 +7,15 @@ from gate_quant.client import GateFuturesClient, AmbiguousOrderError
 from gate_quant.config import GateSettings
 from gate_quant.risk import RiskLimits
 from gate_quant.service import GateTradingService, protection_coverage_status
-from gate_quant.ai_worker import _extract_decision_object, _extract_response_object, _as_instruction_list, _order_size_for_margin, _protection_matches, _reduce_crossed_protection_slice, _execution_enabled, _account_committed_margin, _portfolio_position_notional, _requote_decision, _confirm_pending_requotes, _preflight_candidate_quotes, _run_serial_candidates, _entry_execution_plan, _breakout_compatible_size, _manage_breakout_plans, _untracked_trigger_entries
+from gate_quant.ai_worker import _extract_decision_object, _extract_response_object, _as_instruction_list, _order_size_for_margin, _protection_matches, _reduce_crossed_protection_slice, _execution_enabled, _account_committed_margin, _portfolio_position_notional, _requote_decision, _confirm_pending_requotes, _confirmed_requote_candidates, _preflight_candidate_quotes, _run_serial_candidates, _entry_execution_plan, _breakout_compatible_size, _manage_breakout_plans, _untracked_trigger_entries, _features, _strategy_package, _stop_is_at_breakeven, _add_on_rejection, _chronological_candles
 from gate_quant.execution_journal import ExecutionJournal
 from gate_quant.strategy_adapter import validate_decision
 from gate_quant.risk_profiles import get_risk_profile
 from gate_quant.strategy_adapter import build_gate_risk_budget, strip_legacy_risk_values
 from gate_quant import strategy_adapter
+from gate_quant.entry_confirmation import evaluate_retracement_confirmation
+from gate_quant.portfolio_risk import correlated_exposure_gate
+from gate_quant.regime import classify_market_regime, normalize_direction_bias
 from gate_quant import ai_worker
 from r20_gateway.scheduler import JOBS, GatewayScheduler
 from gate_quant.safety import classify_error, cooldown_state, daily_loss_state, position_age_stage, reconcile_exchange_state
@@ -148,13 +151,182 @@ def test_breakout_size_never_rounds_fractional_contracts_up():
 def test_deferred_signal_requires_same_direction_next_cycle(monkeypatch, tmp_path):
     import gate_quant.ai_worker as worker
     monkeypatch.setattr(worker, "PENDING_REQUOTES", tmp_path / "pending.json")
-    pending = {"ETH_USDT": {"action": "BUY_LONG", "created_at_ms": 1000}}
-    decisions = {"ETH_USDT": {"decision": {"action": "SELL_SHORT", "confidence": 90}}}
-    assert _confirm_pending_requotes(pending, decisions, min_confidence=50, now_ms=2000) == set()
+    pending = {"ETH_USDT": {"action": "BUY_LONG", "created_at_ms": 1000, "signal_closed_15m_at_ms": 900_000}}
+    decisions = {"ETH_USDT": {"decision": {"action": "SELL_SHORT", "confidence": 90}, "indicators": {"latest_closed_15m_at_ms": 1_800_000}}}
+    assert _confirm_pending_requotes(pending, decisions, min_confidence=50, now_ms=2000) == {}
     assert pending == {}
-    pending = {"ETH_USDT": {"action": "BUY_LONG", "created_at_ms": 1000}}
+    pending = {"ETH_USDT": {"action": "BUY_LONG", "created_at_ms": 1000, "signal_closed_15m_at_ms": 900_000}}
     decisions["ETH_USDT"]["decision"] = {"action": "BUY_LONG", "confidence": 90}
-    assert _confirm_pending_requotes(pending, decisions, min_confidence=50, now_ms=2000) == {"ETH_USDT"}
+    assert set(_confirm_pending_requotes(pending, decisions, min_confidence=50, now_ms=2000)) == {"ETH_USDT"}
+
+
+def test_deferred_signal_cannot_confirm_on_same_unclosed_bar(monkeypatch, tmp_path):
+    import gate_quant.ai_worker as worker
+    monkeypatch.setattr(worker, "PENDING_REQUOTES", tmp_path / "pending.json")
+    pending = {"ETH_USDT": {"action": "BUY_LONG", "created_at_ms": 1000, "signal_closed_15m_at_ms": 900_000}}
+    decisions = {"ETH_USDT": {"decision": {"action": "BUY_LONG", "confidence": 90}, "indicators": {"latest_closed_15m_at_ms": 900_000}}}
+    assert _confirm_pending_requotes(pending, decisions, min_confidence=50, now_ms=2000) == {}
+    assert "ETH_USDT" in pending
+
+
+def test_wait_with_matching_direction_bias_confirms_saved_plan(monkeypatch, tmp_path):
+    import gate_quant.ai_worker as worker
+    monkeypatch.setattr(worker, "PENDING_REQUOTES", tmp_path / "pending.json")
+    saved = {
+        "action": "BUY_LONG", "direction_bias": "LONG", "confidence": 88,
+        "entry_intent": "retracement", "entry_price": 100,
+        "take_profit_price": 110, "stop_loss_price": 95, "margin_usdt": 12,
+    }
+    pending = {"ETH_USDT": {
+        **saved, "decision": dict(saved), "created_at_ms": 1000,
+        "signal_closed_15m_at_ms": 900_000,
+        "reason": "retracement_requires_touch_and_reclaim",
+    }}
+    decisions = {"ETH_USDT": {
+        "instId": "ETH_USDT",
+        "decision": {"action": "WAIT", "direction_bias": "LONG", "confidence": 90},
+        "indicators": {
+            "latest_closed_15m_at_ms": 1_800_000,
+            "recent_15m": [[99, 101, 98, 100.5, 12], [98.5, 99.5, 98, 99, 10]],
+            "calculus": {"acceleration": 0.01}, "last": 100.5,
+        },
+    }}
+
+    confirmed = _confirm_pending_requotes(pending, decisions, min_confidence=50, now_ms=2000)
+    candidates = _confirmed_requote_candidates(confirmed, decisions)
+
+    assert set(confirmed) == {"ETH_USDT"}
+    assert candidates[0]["decision"] == saved
+    assert pending == {}
+
+
+def test_confirmed_requote_cannot_use_new_cycle_price_as_a_fresh_plan(monkeypatch, tmp_path):
+    import gate_quant.ai_worker as worker
+    monkeypatch.setattr(worker, "PENDING_REQUOTES", tmp_path / "pending.json")
+    saved = {
+        "action": "BUY_LONG", "direction_bias": "LONG", "confidence": 88,
+        "entry_intent": "retracement", "entry_price": 100,
+        "take_profit_price": 110, "stop_loss_price": 95, "margin_usdt": 12,
+    }
+    confirmed = {"ETH_USDT": {**saved, "decision": dict(saved), "confirmed_at_ms": 2000}}
+    current = {"ETH_USDT": {
+        "instId": "ETH_USDT",
+        "decision": {"action": "BUY_LONG", "direction_bias": "LONG", "confidence": 92,
+                     "entry_price": 110, "take_profit_price": 120, "stop_loss_price": 105},
+        "indicators": {"last": 110, "latest_closed_15m_at_ms": 1_800_000},
+    }}
+    candidates = _confirmed_requote_candidates(confirmed, current)
+
+    class Quotes:
+        def tickers(self, symbol):
+            return [{"mark_price": "110"}]
+
+    eligible, blocked = _preflight_candidate_quotes(
+        Quotes(), candidates, {}, confirmed, now_ms=2000, entry_intent_enabled=True,
+    )
+
+    assert eligible == []
+    assert blocked[0]["status"] == "blocked_price_deviation"
+    assert blocked[0]["requote"]["original_entry_price"] == 100
+
+
+def test_retracement_requires_touch_and_reclaim_not_just_repeated_ai_direction(monkeypatch, tmp_path):
+    import gate_quant.ai_worker as worker
+    monkeypatch.setattr(worker, "PENDING_REQUOTES", tmp_path / "pending.json")
+    pending = {"ETH_USDT": {
+        "action": "BUY_LONG", "entry_price": 99, "stop_loss_price": 95,
+        "created_at_ms": 1000, "signal_closed_15m_at_ms": 900_000,
+        "reason": "retracement_requires_touch_and_reclaim", "confirmation_state": "WAITING_TOUCH",
+    }}
+    decisions = {"ETH_USDT": {
+        "decision": {"action": "BUY_LONG", "confidence": 90},
+        "indicators": {
+            "latest_closed_15m_at_ms": 1_800_000,
+            "recent_15m": [[100, 101, 99.5, 100.5, 10], [99.5, 100.5, 99.2, 100, 9]],
+            "calculus": {"acceleration": 0.01},
+        },
+    }}
+    assert _confirm_pending_requotes(pending, decisions, min_confidence=50, now_ms=2000) == {}
+    assert pending["ETH_USDT"]["confirmation_state"] == "WAITING_TOUCH"
+
+    decisions["ETH_USDT"]["indicators"].update({
+        "latest_closed_15m_at_ms": 2_700_000,
+        "recent_15m": [[98.8, 100.2, 98.5, 99.8, 12], [100, 101, 99.5, 100.5, 10]],
+    })
+    assert set(_confirm_pending_requotes(pending, decisions, min_confidence=50, now_ms=3000)) == {"ETH_USDT"}
+    assert pending == {}
+
+
+def test_retracement_confirmation_waits_after_touch_without_reclaim():
+    pending = {"action": "BUY_LONG", "entry_price": 99, "stop_loss_price": 95}
+    state = evaluate_retracement_confirmation(
+        pending,
+        {"recent_15m": [[100, 100.2, 98.5, 98.8, 1], [101, 101.2, 99.5, 100, 1]],
+         "calculus": {"acceleration": -0.01}},
+        now_ms=2000,
+    )
+    assert state["state"] == "WAITING_RECLAIM"
+    assert pending["touched_at_ms"] == 2000
+
+
+@pytest.mark.parametrize(("action", "entry", "reference"), [
+    ("BUY_LONG", 99, 100),
+    ("SELL_SHORT", 101, 100),
+])
+def test_retracement_and_rebound_entries_require_next_closed_bar(monkeypatch, tmp_path, action, entry, reference):
+    import gate_quant.ai_worker as worker
+    monkeypatch.setattr(worker, "PENDING_REQUOTES", tmp_path / "pending.json")
+    class Quotes:
+        def tickers(self, symbol): return [{"mark_price": str(reference)}]
+    candidate = {"instId": "ETH_USDT", "indicators": {"last": reference, "latest_closed_15m_at_ms": 900_000}, "decision": {
+        "action": action, "confidence": 90, "entry_price": entry,
+        "take_profit_price": 110 if action == "BUY_LONG" else 90,
+        "stop_loss_price": 95 if action == "BUY_LONG" else 105,
+    }}
+    eligible, blocked = _preflight_candidate_quotes(Quotes(), [candidate], {}, set(), now_ms=1000)
+    assert eligible == []
+    assert blocked[0]["status"] == "blocked_pending_reconfirmation"
+
+
+def test_waiting_retracement_state_is_not_reset_on_each_new_bar(monkeypatch, tmp_path):
+    import gate_quant.ai_worker as worker
+    monkeypatch.setattr(worker, "PENDING_REQUOTES", tmp_path / "pending.json")
+    class Quotes:
+        def tickers(self, symbol): return [{"mark_price": "100"}]
+    pending = {"ETH_USDT": {
+        "contract": "ETH_USDT", "action": "BUY_LONG", "entry_price": 99,
+        "signal_closed_15m_at_ms": 900_000, "created_at_ms": 1000,
+        "touched_at_ms": 1500, "confirmation_state": "WAITING_RECLAIM",
+        "reason": "retracement_requires_touch_and_reclaim",
+    }}
+    candidate = {"instId": "ETH_USDT", "indicators": {
+        "last": 100, "latest_closed_15m_at_ms": 1_800_000,
+    }, "decision": {"action": "BUY_LONG", "confidence": 90, "entry_price": 99.2,
+                     "take_profit_price": 105, "stop_loss_price": 96}}
+    eligible, blocked = _preflight_candidate_quotes(Quotes(), [candidate], pending, set(), now_ms=2000)
+    assert eligible == []
+    assert blocked[0]["confirmation_state"] == "WAITING_RECLAIM"
+    assert pending["ETH_USDT"]["entry_price"] == 99
+    assert pending["ETH_USDT"]["touched_at_ms"] == 1500
+
+
+def test_confirmed_retracement_reprices_to_current_quote(monkeypatch, tmp_path):
+    import gate_quant.ai_worker as worker
+    monkeypatch.setattr(worker, "PENDING_REQUOTES", tmp_path / "pending.json")
+    class Quotes:
+        def tickers(self, symbol): return [{"mark_price": "100"}]
+    candidate = {"instId": "ETH_USDT", "indicators": {"last": 100}, "decision": {
+        "action": "BUY_LONG", "confidence": 90, "entry_price": 99,
+        "take_profit_price": 105, "stop_loss_price": 96,
+    }}
+    eligible, blocked = _preflight_candidate_quotes(
+        Quotes(), [candidate], {}, {"ETH_USDT"}, now_ms=2000,
+    )
+    assert blocked == []
+    assert eligible[0]["decision"]["entry_price"] == 100
+    assert eligible[0]["decision"]["take_profit_price"] == 106
+    assert eligible[0]["decision"]["stop_loss_price"] == 97
+    assert eligible[0]["quote_preflight"]["confirmation_state"] == "CONFIRMED"
 
 
 def test_deferred_high_confidence_candidate_does_not_hide_next_signal(monkeypatch, tmp_path):
@@ -185,7 +357,7 @@ def test_rejected_eth_reconfirmation_does_not_block_other_second_cycle_signal(mo
         "BTC_USDT": {"decision": {"action": "BUY_LONG", "confidence": 79}},
     }
     confirmed = _confirm_pending_requotes(pending, decisions, min_confidence=72, now_ms=2000)
-    assert confirmed == set()
+    assert confirmed == {}
     assert "ETH_USDT" not in pending
     assert decisions["BTC_USDT"]["decision"]["action"] == "BUY_LONG"
 
@@ -286,12 +458,74 @@ def test_safety_reconciliation_detects_stale_order_and_protection_gap():
     assert {item["code"] for item in result["issues"]} >= {"protection_gap", "stale_entry_orders"}
 
 
+def test_safety_checks_both_hedge_mode_positions_without_contract_overwrite():
+    protections = [
+        {"order_type": "close-short-position", "initial": {"contract": "BTC_USDT", "auto_size": "close_short"}, "trigger": {"rule": 2}},
+        {"order_type": "close-short-position", "initial": {"contract": "BTC_USDT", "auto_size": "close_short"}, "trigger": {"rule": 1}},
+    ]
+    result = reconcile_exchange_state(
+        [
+            {"contract": "BTC_USDT", "mode": "dual_long", "size": "2"},
+            {"contract": "BTC_USDT", "mode": "dual_short", "size": "-3"},
+        ],
+        [], protections, max_pending_age_seconds=60, now=1000,
+    )
+
+    gaps = [item for item in result["issues"] if item["code"] == "protection_gap"]
+    assert not result["safe_for_new_risk"]
+    assert [(item["position_mode"], item["position_side"]) for item in gaps] == [("dual_long", "long")]
+
+
+def test_entry_candidate_holds_outer_gate_write_lock(monkeypatch):
+    events = []
+
+    class Lock:
+        def __enter__(self):
+            events.append("locked")
+
+        def __exit__(self, exc_type, exc, traceback):
+            events.append("unlocked")
+
+    monkeypatch.setattr(ai_worker, "gate_write_lock", lambda: Lock())
+    monkeypatch.setattr(ai_worker, "_execute_entry_candidate_locked", lambda *args, **kwargs: events.append("executed") or {"ok": True})
+
+    result = ai_worker._execute_entry_candidate(
+        object(), {}, settings=object(), risk_profile=object(), risk_snapshot={},
+        policy_snapshot={}, confirmed_requotes=set(), now_ms=1, sequence=1, risk_state={},
+    )
+
+    assert result == {"ok": True}
+    assert events == ["locked", "executed", "unlocked"]
+
+
 def test_safety_daily_loss_uses_stricter_absolute_or_equity_limit(tmp_path):
     ledger = tmp_path / "ledger.json"
     ledger.write_text('[{"status":"closed","close_time":"1970-01-01 00:16:40","net_pnl":-60}]', encoding="utf-8")
     state = daily_loss_state(ledger, max_loss_usd=100, max_loss_ratio=0.05, equity=1000, now=1000)
     assert state["tripped"]
     assert state["limit_usd"] == 50
+
+
+def test_safety_daily_loss_manual_reset_only_counts_later_closes(tmp_path):
+    ledger = tmp_path / "ledger.json"
+    reset = tmp_path / "reset.json"
+    ledger.write_text(json.dumps([
+        {"status": "closed", "close_time": "1970-01-01 00:10:00", "net_pnl": -60},
+        {"status": "closed", "close_time": "1970-01-01 00:15:00", "net_pnl": -7},
+    ]), encoding="utf-8")
+    reset.write_text(json.dumps({
+        "environment": "live", "local_day": "1970-01-01",
+        "reset_at_local": "1970-01-01 00:12:00",
+    }), encoding="utf-8")
+
+    state = daily_loss_state(
+        ledger, max_loss_usd=100, max_loss_ratio=0.05, equity=1000,
+        now=1000, reset_path=reset, environment="live",
+    )
+
+    assert state["manual_reset_active"] is True
+    assert state["net_pnl_usd"] == -7
+    assert state["tripped"] is False
 
 
 def test_stop_cooldown_is_scoped_to_the_losing_contract(tmp_path):
@@ -1054,3 +1288,259 @@ def test_stop_loss_update_rejects_looser_or_crossed_price_without_cancelling():
     with pytest.raises(ValueError, match="wrong side"):
         service.replace_stop_loss_safely(contract="SOL_USDT", position_size="17.9", mark_price="101.49", trigger_price="102", client_id="t-gate-slu-crossed")
     assert [row["id"] for row in client.rows] == ["old-sl"]
+
+
+def _gate_candles(count, interval_seconds, closes):
+    newest = int(ai_worker.time.time()) // interval_seconds * interval_seconds
+    rows = []
+    for index, close in enumerate(closes):
+        rows.append({
+            "t": newest - (count - 1 - index) * interval_seconds,
+            "o": str(close - 0.05), "h": str(close + 0.1),
+            "l": str(close - 0.1), "c": str(close), "v": str(100 + index),
+        })
+    return rows
+
+
+class CandleClient:
+    def __init__(self, reverse=False):
+        self.reverse = reverse
+        self.rows = {
+            "15m": _gate_candles(160, 900, [100 + index * 0.1 for index in range(160)]),
+            "1h": _gate_candles(100, 3600, [130 - index * 0.1 for index in range(100)]),
+            "4h": _gate_candles(60, 14400, [90 + index * 0.2 for index in range(60)]),
+        }
+
+    def candlesticks(self, contract, interval, limit):
+        rows = self.rows[interval]
+        return list(reversed(rows)) if self.reverse else list(rows)
+
+
+def test_gate_candle_order_normalization_is_direction_independent():
+    ticker = {"mark_price": "115.9", "highest_bid": "115.8", "lowest_ask": "116"}
+    ascending = _features(CandleClient(), "BTC_USDT", ticker)
+    descending = _features(CandleClient(reverse=True), "BTC_USDT", ticker)
+
+    assert ascending == descending
+    assert ascending["last"] == pytest.approx(115.8)
+    assert ascending["macro_4h"] == "4H_MACRO_BULL"
+
+
+def test_gate_candle_normalization_excludes_forming_bar():
+    now = 10_000
+    rows = [
+        {"t": 8_200, "c": "1"},
+        {"t": 9_100, "c": "2"},
+        {"t": 10_000, "c": "99"},
+    ]
+    closed = _chronological_candles(rows, contract="SUI_USDT", interval_seconds=900, now=now)
+    assert [row["c"] for row in closed] == ["1", "2"]
+
+
+def test_gate_candle_ticker_divergence_fails_closed_before_llm():
+    with pytest.raises(RuntimeError, match="candle/ticker divergence"):
+        _features(CandleClient(), "BTC_USDT", {"mark_price": "100"})
+
+
+def test_one_hour_calculus_uses_one_hour_returns_not_fifteen_minute_returns():
+    feature = _features(CandleClient(), "BTC_USDT", {"mark_price": "115.9"})
+    package = _strategy_package(feature)
+    assert package["calculus"]["probability_theory"]["continuation_prob_pct"] == 0
+    assert package["calculus"]["timeframes"]["1H"]["probability_theory"]["breakdown_prob_pct"] == 100
+    assert package["calculus"]["timeframes"]["1H"]["impulse"] < 0
+
+
+@pytest.mark.parametrize(("action", "package", "reason_fragment"), [
+    ("BUY_LONG", {"rsi_1h": 78, "vwap_bias": 0, "chg24h": 0}, "RSI"),
+    ("SELL_SHORT", {"rsi_1h": 22, "vwap_bias": 0, "chg24h": 0}, "RSI"),
+    ("BUY_LONG", {"rsi_1h": 50, "vwap_bias": 6, "chg24h": 0}, "VWAP"),
+    ("SELL_SHORT", {"rsi_1h": 50, "vwap_bias": -6, "chg24h": 0}, "VWAP"),
+    ("BUY_LONG", {"rsi_1h": 50, "vwap_bias": 0, "chg24h": 18, "calculus": {"timeframes": {"15M": {"acceleration": -0.01}}}}, "15M"),
+    ("SELL_SHORT", {"rsi_1h": 50, "vwap_bias": 0, "chg24h": -18, "calculus": {"timeframes": {"15M": {"acceleration": 0.01}}}}, "15M"),
+])
+def test_anti_chase_gate_is_symmetric(action, package, reason_fragment):
+    package.update({"name": "SUI", "instId": "SUI_USDT", "data_quality": "valid", "macro_4h": "RANGE", "adx_1h": 30})
+    decision = {
+        "action": action, "confidence": 90, "entry_price": 100,
+        "take_profit_price": 110 if action == "BUY_LONG" else 90,
+        "stop_loss_price": 95 if action == "BUY_LONG" else 105,
+    }
+    result, reason, _ = validate_decision(
+        package, decision, active_inst_ids=set(), active_position_sides={},
+        risk_snapshot=get_risk_profile("aggressive").snapshot(leverage=3, environment="testnet"),
+    )
+    assert result == "WAIT"
+    assert reason_fragment in reason
+
+
+@pytest.mark.parametrize("action", ["BUY_LONG", "SELL_SHORT"])
+def test_anti_chase_gate_allows_normal_symmetric_signal(action):
+    package = {
+        "name": "SUI", "instId": "SUI_USDT", "data_quality": "valid",
+        "macro_4h": "RANGE", "adx_1h": 30, "rsi_1h": 50,
+        "vwap_bias": 0, "chg24h": 0,
+    }
+    decision = {
+        "action": action, "confidence": 90, "entry_price": 100,
+        "take_profit_price": 110 if action == "BUY_LONG" else 90,
+        "stop_loss_price": 95 if action == "BUY_LONG" else 105,
+    }
+    result, _, _ = validate_decision(
+        package, decision, active_inst_ids=set(), active_position_sides={},
+        risk_snapshot=get_risk_profile("aggressive").snapshot(leverage=3, environment="testnet"),
+    )
+    assert result == action
+
+
+def _regime_package(*, acceleration, cont15, break15, cont1h, break1h,
+                    structure="BULL", macro="4H_MACRO_BULL", vwap=3.0,
+                    rsi15=55.0, change24=4.0):
+    package = {
+        "instId": "TEST_USDT", "data_quality": "valid", "adx_1h": 40,
+        "structure_1h": structure, "macro_4h": macro,
+        "acceleration_1h": acceleration, "vwap_bias": vwap,
+        "rsi_15m": rsi15, "chg24h": change24,
+        "calculus": {"probability_theory": {
+            "continuation_prob_pct": cont15, "breakdown_prob_pct": break15,
+        }, "timeframes": {"1H": {"acceleration": acceleration, "probability_theory": {
+            "continuation_prob_pct": cont1h, "breakdown_prob_pct": break1h,
+        }}}},
+    }
+    package["market_regime"] = classify_market_regime(package)
+    return package
+
+
+@pytest.mark.parametrize("package", [
+    _regime_package(acceleration=-0.0136, cont15=45, break15=55, cont1h=70, break1h=30, structure="CHOP"),
+    _regime_package(acceleration=-0.0023, cont15=40, break15=60, cont1h=55, break1h=45),
+    _regime_package(acceleration=-0.0055, cont15=60, break15=40, cont1h=50, break1h=50),
+    _regime_package(acceleration=0.009, cont15=45, break15=50, cont1h=55, break1h=45,
+                    vwap=5.58, rsi15=71.54, change24=8.2),
+])
+def test_regime_gate_rejects_september_26_long_setups(package):
+    decision = {"action": "BUY_LONG", "confidence": 90, "entry_price": 100,
+                "take_profit_price": 110, "stop_loss_price": 95}
+    action, reason, _ = validate_decision(
+        package, decision, active_inst_ids=set(), active_position_sides={},
+        risk_snapshot=get_risk_profile("aggressive").snapshot(leverage=3, environment="testnet"),
+    )
+    assert action == "WAIT"
+    assert "行情状态门禁" in reason
+
+
+@pytest.mark.parametrize("package", [
+    _regime_package(acceleration=0.0057, cont15=65, break15=35, cont1h=75, break1h=25, vwap=0.31),
+    _regime_package(acceleration=0.0054, cont15=50, break15=50, cont1h=65, break1h=35, vwap=3.21, rsi15=69.1, change24=6.8),
+    _regime_package(acceleration=0.0076, cont15=45, break15=55, cont1h=65, break1h=35, vwap=3.01),
+])
+def test_regime_gate_keeps_september_25_long_setups(package):
+    decision = {"action": "BUY_LONG", "confidence": 90, "entry_price": 100,
+                "take_profit_price": 110, "stop_loss_price": 95}
+    action, _, _ = validate_decision(
+        package, decision, active_inst_ids=set(), active_position_sides={},
+        risk_snapshot=get_risk_profile("aggressive").snapshot(leverage=3, environment="testnet"),
+    )
+    assert action == "BUY_LONG"
+
+
+def test_direction_bias_is_independent_from_wait_action():
+    assert normalize_direction_bias("LONG", "WAIT") == "LONG"
+    assert normalize_direction_bias("", "BUY_LONG") == "LONG"
+    assert normalize_direction_bias("", "WAIT") == "NEUTRAL"
+
+
+def test_correlated_portfolio_risk_scales_second_and_blocks_third_position():
+    first = [{"contract": "BTC_USDT", "size": "1"}]
+    second = correlated_exposure_gate(first, [], contract="SOL_USDT", action="BUY_LONG")
+    assert second["allowed"] is True
+    assert second["margin_scale"] == 0.5
+
+    third = correlated_exposure_gate(
+        first, [{"contract": "SOL_USDT", "side": "long"}],
+        contract="DOGE_USDT", action="BUY_LONG",
+    )
+    assert third["allowed"] is False
+    assert set(third["same_direction_contracts"]) == {"BTC_USDT", "SOL_USDT"}
+
+
+@pytest.mark.parametrize(("macro", "action"), [
+    ("BULL", "SELL_SHORT"),
+    ("4H_MACRO_BEAR", "BUY_LONG"),
+])
+def test_macro_filter_accepts_gate_and_canonical_enums(macro, action):
+    decision = {
+        "action": action, "confidence": 90, "entry_price": 100,
+        "take_profit_price": 90 if action == "SELL_SHORT" else 110,
+        "stop_loss_price": 105 if action == "SELL_SHORT" else 95,
+    }
+    result, reason, _ = validate_decision(
+        {"instId": "BTC_USDT", "data_quality": "valid", "macro_4h": macro, "adx_1h": 30},
+        decision, active_inst_ids=set(), active_position_sides={},
+        risk_snapshot=get_risk_profile("aggressive").snapshot(leverage=3, environment="testnet"),
+    )
+    assert result == "WAIT"
+    assert "4H" in reason
+
+
+def test_add_on_requires_breakeven_stop_and_is_counted_once(tmp_path):
+    long_position = {"size": "4", "entry_price": "100", "unrealised_pnl": "2", "open_time": "1"}
+    protections = [
+        {"initial": {"size": -4, "is_reduce_only": True}, "trigger": {"rule": 1, "price": "110"}},
+        {"initial": {"size": -4, "is_reduce_only": True}, "trigger": {"rule": 2, "price": "99"}},
+    ]
+    assert not _stop_is_at_breakeven(protections, long_position)
+    protections[1]["trigger"]["price"] = "100"
+    assert _stop_is_at_breakeven(protections, long_position)
+    protections[1]["trigger"]["price"] = "0"
+    assert not _stop_is_at_breakeven(protections, long_position)
+    protections[1]["trigger"]["price"] = "100"
+
+    journal = ExecutionJournal(tmp_path / "execution.db")
+    assert _add_on_rejection(
+        long_position, protections, journal, environment="testnet", contract="BTC_USDT"
+    ) is None
+    journal.prepare({
+        "client_id": "t-gate-ai-add-1", "environment": "testnet", "contract": "BTC_USDT",
+        "requested_size": "2", "baseline_position_size": "4", "entry_price": "101",
+        "take_profit_price": "110", "stop_loss_price": "100", "is_add_on": True,
+        "position_cycle_started_at_ms": 1_000, "created_at_ms": 2_000,
+    })
+    assert journal.add_on_count("testnet", "BTC_USDT", 1_000) == 1
+    rejection = _add_on_rejection(
+        long_position, protections, journal, environment="testnet", contract="BTC_USDT"
+    )
+    assert rejection["status"] == "blocked_add_limit"
+
+
+def test_execution_journal_finds_latest_unfilled_for_reentry_cooldown(tmp_path):
+    journal = ExecutionJournal(tmp_path / "execution.db")
+    for created_at_ms, status in ((1000, "filled_protected"), (2000, "unfilled")):
+        client_id = f"t-gate-ai-{created_at_ms}"
+        journal.prepare({
+            "client_id": client_id, "environment": "live", "contract": "SUI_USDT",
+            "requested_size": "1", "entry_price": "1", "take_profit_price": "1.1",
+            "stop_loss_price": "0.9", "created_at_ms": created_at_ms,
+        })
+        journal.update(client_id, status)
+    latest = journal.latest_terminal("live", "SUI_USDT", ("unfilled", "no_fill"))
+    assert latest is not None
+    assert latest["client_id"] == "t-gate-ai-2000"
+
+
+def test_entry_snapshot_persists_and_attaches_to_position_close(tmp_path):
+    journal = ExecutionJournal(tmp_path / "execution.db")
+    snapshot = {"feature": {"last": 100, "calculus": {"impulse": 0.2}}, "decision": {"action": "BUY_LONG"}}
+    journal.prepare({
+        "client_id": "t-gate-ai-snapshot", "environment": "testnet", "contract": "BTC_USDT",
+        "requested_size": "2", "baseline_position_size": "0", "entry_price": "100",
+        "take_profit_price": "110", "stop_loss_price": "95", "entry_snapshot": snapshot,
+        "created_at_ms": 1_780_000_060_000,
+    })
+    journal.update("t-gate-ai-snapshot", "filled_protected", filled_size="2", fill_price="100")
+    mapped = _ledger_row({
+        "id": "close-1", "contract": "BTC_USDT", "side": "long", "long_price": "100",
+        "short_price": "105", "max_size": "2", "first_open_time": 1_780_000_000,
+        "time": 1_780_003_600, "lever": "2", "pnl": "1",
+    }, quanto_multiplier=0.001, journal=journal, environment="testnet")
+    assert mapped["signal_snapshot"] == snapshot
+    assert mapped["entry_snapshots"][0]["client_id"] == "t-gate-ai-snapshot"

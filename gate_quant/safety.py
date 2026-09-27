@@ -78,16 +78,22 @@ def reconcile_exchange_state(
     max_pending_age_seconds: int, now: float | None = None,
 ) -> dict[str, Any]:
     now = now or time.time()
-    active = {str(p.get("contract") or "").upper(): p for p in positions if decimal_value(p.get("size")) != 0}
+    active = [p for p in positions if decimal_value(p.get("size")) != 0]
+    active_contracts = {str(p.get("contract") or "").upper() for p in active}
     pending_contracts = {str(o.get("contract") or "").upper() for o in orders if _is_entry_order(o)}
     issues: list[dict[str, Any]] = []
     stale_orders: list[dict] = []
     orphan_protections: list[dict] = []
-    for contract, position in active.items():
+    for position in active:
+        contract = str(position.get("contract") or "").upper()
         contract_protections = [p for p in protections if str((p.get("initial") or {}).get("contract") or p.get("contract") or "").upper() == contract]
         coverage = protection_coverage_status(contract_protections, decimal_value(position.get("size")))
         if not coverage["fully_protected"]:
-            issues.append({"code": "protection_gap", "contract": contract, "required": str(coverage["required"]), "tp": str(coverage["take_profit"]), "sl": str(coverage["stop_loss"])})
+            issues.append({"code": "protection_gap", "contract": contract,
+                           "position_mode": str(position.get("mode") or ""),
+                           "position_side": "long" if decimal_value(position.get("size")) > 0 else "short",
+                           "required": str(coverage["required"]), "tp": str(coverage["take_profit"]),
+                           "sl": str(coverage["stop_loss"])})
     for order in orders:
         if not _is_entry_order(order):
             continue
@@ -99,7 +105,7 @@ def reconcile_exchange_state(
     for protection in protections:
         initial = protection.get("initial") or {}
         contract = str(initial.get("contract") or protection.get("contract") or "").upper()
-        if contract and contract not in active and contract not in pending_contracts:
+        if contract and contract not in active_contracts and contract not in pending_contracts:
             orphan_protections.append(protection)
     if stale_orders:
         issues.append({"code": "stale_entry_orders", "count": len(stale_orders)})
@@ -108,16 +114,35 @@ def reconcile_exchange_state(
     return {"safe_for_new_risk": not issues, "issues": issues, "stale_orders": stale_orders, "orphan_protections": orphan_protections, "checked_at_ms": int(now * 1000)}
 
 
-def daily_loss_state(ledger_path: Path, *, max_loss_usd: float, max_loss_ratio: float, equity: float, now: float | None = None) -> dict[str, Any]:
+def daily_loss_state(
+    ledger_path: Path, *, max_loss_usd: float, max_loss_ratio: float, equity: float,
+    now: float | None = None, reset_path: Path | None = None, environment: str = "",
+) -> dict[str, Any]:
     now = now or time.time()
     local_day = datetime.fromtimestamp(now).strftime("%Y-%m-%d")
     try:
         rows = json.loads(ledger_path.read_text(encoding="utf-8")) if ledger_path.exists() else []
     except (OSError, json.JSONDecodeError):
         return {"tripped": True, "reason": "ledger_unreadable", "loss_usd": 0.0}
+    reset = {}
+    if reset_path and reset_path.exists():
+        try:
+            candidate = json.loads(reset_path.read_text(encoding="utf-8"))
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("local_day") == local_day
+                and (not environment or candidate.get("environment") == environment)
+            ):
+                reset = candidate
+        except (OSError, json.JSONDecodeError):
+            return {"tripped": True, "reason": "daily_loss_reset_unreadable", "loss_usd": 0.0}
+    reset_at_local = str(reset.get("reset_at_local") or "")
     pnl = Decimal("0")
     for row in rows if isinstance(rows, list) else []:
-        if row.get("status") != "closed" or local_day not in str(row.get("close_time") or ""):
+        close_time = str(row.get("close_time") or "")
+        if row.get("status") != "closed" or local_day not in close_time:
+            continue
+        if reset_at_local and close_time <= reset_at_local:
             continue
         pnl += decimal_value(row.get("net_pnl", row.get("pnl")))
     loss = max(Decimal("0"), -pnl)
@@ -125,7 +150,12 @@ def daily_loss_state(ledger_path: Path, *, max_loss_usd: float, max_loss_ratio: 
     ratio_limit = decimal_value(equity) * decimal_value(max_loss_ratio)
     limits = [value for value in (absolute_limit, ratio_limit) if value > 0]
     limit = min(limits) if limits else Decimal("0")
-    return {"tripped": limit <= 0 or loss >= limit, "reason": "daily_loss_limit" if limit > 0 and loss >= limit else ("daily_loss_limit_unconfigured" if limit <= 0 else "ok"), "loss_usd": float(loss), "limit_usd": float(limit), "net_pnl_usd": float(pnl)}
+    return {
+        "tripped": limit <= 0 or loss >= limit,
+        "reason": "daily_loss_limit" if limit > 0 and loss >= limit else ("daily_loss_limit_unconfigured" if limit <= 0 else "ok"),
+        "loss_usd": float(loss), "limit_usd": float(limit), "net_pnl_usd": float(pnl),
+        "manual_reset_active": bool(reset), "reset_at_local": reset_at_local or None,
+    }
 
 
 def cooldown_state(ledger_path: Path, *, cooldown_seconds: int, contract: str | None = None, now: float | None = None) -> dict[str, Any]:

@@ -21,6 +21,7 @@
 - Testnet 与 Live 凭证必须使用不同键名，不能复制或自动回退到另一环境。
 - 网络超时后禁止盲目重复下单。只能先按既有客户端订单号 `text` 查单。
 - 所有新增持仓必须有 Gate 原生止损和止盈覆盖。保护顺序固定为先止损、后止盈。
+- 同一持仓周期最多一次同向加仓；必须确认当前浮盈为正、完整保护、止损已到保本或更优位置，并能从持仓时间与执行台账确认加仓次数，否则 fail-closed。
 - 止损无法确认时，先撤未成交余量，再用 `reduce_only` 仅减本次新增仓位；不得误平加仓前已有仓位。
 - 不得把普通反向计划单当作保护单。覆盖统计只认可 `reduce_only/is_reduce_only` 或 `close/is_close`。
 - 存在未完成执行意图、保护缺口、孤立保护单、过期挂单、私有 API 错误或日亏损熔断时，新增风险必须 fail-closed。
@@ -31,6 +32,7 @@
 - `gate_quant/client.py`：Gate API v4 签名、请求和 Gate Futures 原生端点。
 - `gate_quant/config.py`：环境选择、凭证选择和 fail-closed 配置校验。
 - `gate_quant/strategy_adapter.py`：把 Gate 数据适配到上游 R20 策略契约；不要另造平行策略链。
+- `gate_quant/regime.py`、`gate_quant/entry_confirmation.py`、`gate_quant/portfolio_risk.py`：确定性行情状态、回踩确认与相关敞口门禁；AI 输出不得绕过。
 - `gate_quant/ai_worker.py`：15 分钟 AI 决策、持仓/挂单管理和入场入口。
 - `gate_quant/execution_journal.py`：下单前 SQLite 执行意图台账。
 - `gate_quant/execution_reconciler.py`：10 秒成交、持仓与保护单对账。
@@ -128,11 +130,11 @@ git diff --check
 
 ## 当前验证基线
 
-- 当前部署前基线提交：`71d2e11`。
+- 部署基线以当时 `origin/main` 与服务实际加载提交为准，不在文档中硬编码旧提交号。
 - 独立产品版本：`Gate v1.0.0`。
-- 离线测试：2026-09-18 本地融合后为 154 项通过；另需保持 Python 编译、前端生产构建和 `git diff --check` 通过。
+- 离线测试：2026-09-27 行情状态、回踩确认、组合相关风险、自进化候选及既有执行故障覆盖共 199 项通过；另需保持 Python 编译、前端生产构建和 `git diff --check` 通过。
 - 已在 Gate Testnet 正常链验证行情、账户、持仓、挂单、成交、撤单、保护单、过期撤单、原生平仓台账，以及突破计划多空触发、`trade_id` 对账、真实成交价保护重算和清理归零。双向持仓原生 `auto_size` 平仓已完成 Testnet 最小仓位回归；“复核阈值 + 绝对上限”已完成离线验证，尚未等待真实时长做 Testnet 回归。
 - 超时找回、部分成交递增保护、保护失败回滚和重启恢复已做离线故障注入，但尚未主动在 Testnet 制造这些异常。
-- Gate Live 从未执行过交易，不能声称已经完成实盘回归。
+- Gate Live 台账和账户历史已有真实交易；不得把“存在实盘历史”误写成某次代码变更已经完成实盘回归，回归范围必须逐项据实说明。
 
 完整原理、配置表、状态机和运维说明见 `docs/SYSTEM_GUIDE_ZH.md`。

@@ -36,7 +36,7 @@ JOBS = (
     JobSpec("anomaly_audit", "-m gate_quant.anomaly_audit", 60, 45),
     JobSpec("factor_library", "-m gate_quant.factor_worker", 60, 300),
     JobSpec("news", "-m gate_quant.news_worker", 10 * 60, 120, offset_seconds=180),
-    JobSpec("gate_ledger", "sync_gate_ledger.py", 15 * 60, 180, offset_seconds=60),
+    JobSpec("gate_ledger", "-m scripts.sync_gate_ledger", 15 * 60, 180, offset_seconds=60),
     JobSpec("self_improvement", "self_improvement_engine.py", None, 1200, "self_improvement_times", ("02:00", "08:00", "14:00", "20:00")),
 )
 

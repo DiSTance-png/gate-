@@ -1,4 +1,5 @@
 import importlib
+import json
 import os
 import sys
 from contextlib import nullcontext
@@ -483,3 +484,49 @@ def test_gate_check_distinguishes_uninitialized_futures_account(monkeypatch):
     assert result["ok"] is False
     assert result["authenticated"] is True
     assert "尚未创建 USDT Futures 账户" in result["detail"]
+
+
+def test_daily_loss_reset_requires_flat_clean_account_and_is_audited(monkeypatch, tmp_path):
+    import gate_quant.web as web
+
+    now = 1_800_000_000
+    local_day = web.dt.datetime.fromtimestamp(now).strftime("%Y-%m-%d")
+    close_time = f"{local_day} 01:00:00"
+    ledger = tmp_path / "trading_ledger.json"
+    ledger.write_text(json.dumps([
+        {"status": "closed", "close_time": close_time, "net_pnl": -60},
+    ]), encoding="utf-8")
+    events = []
+    monkeypatch.setattr(web, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(web, "DAILY_LOSS_RESET", tmp_path / "gate_daily_loss_reset.json")
+    monkeypatch.setattr(web, "TRADING_LEDGER", ledger)
+    monkeypatch.setattr(web.time, "time", lambda: now)
+    monkeypatch.setattr(web, "_require_control_admin", lambda token: {"username": "tester"})
+    monkeypatch.setattr(web, "load_settings", lambda: configured_settings(
+        environment="live", public_market_environment="live", live_trading_enabled=True,
+        max_daily_loss_usd=100, max_daily_loss_ratio=0.05,
+    ))
+    monkeypatch.setattr(web, "gate_write_lock", lambda: nullcontext())
+    monkeypatch.setattr(web.store, "add", lambda *args, **kwargs: events.append((args, kwargs)))
+    monkeypatch.setattr(web, "ExecutionJournal", lambda path: SimpleNamespace(active=lambda environment: []))
+
+    class CleanGate:
+        def account(self): return {"total": "1000"}
+        def positions(self): return []
+        def open_orders(self): return []
+        def trigger_entry_orders(self): return []
+        def protection_orders(self): return []
+
+    monkeypatch.setattr(web, "GateFuturesClient", lambda settings: CleanGate())
+    result = web.reset_gate_daily_loss(
+        web.GateDailyLossResetRequest(confirmation="RESET GATE DAILY LOSS"), None,
+    )
+
+    assert result["safe_for_new_risk"] is True
+    assert result["daily_loss"]["manual_reset_active"] is True
+    assert result["daily_loss"]["loss_usd"] == 0
+    assert events[0][0][0] == "gate.daily_loss.reset"
+    with pytest.raises(web.HTTPException, match="今日已经人工重置"):
+        web.reset_gate_daily_loss(
+            web.GateDailyLossResetRequest(confirmation="RESET GATE DAILY LOSS"), None,
+        )

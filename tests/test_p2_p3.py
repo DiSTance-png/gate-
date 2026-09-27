@@ -1,6 +1,9 @@
 import json
 from datetime import datetime, timedelta, timezone
 
+import pytest
+from fastapi import HTTPException
+
 from gate_quant import web
 from r20_backend.policy_snapshot import GATE_POLICY_ENV_KEYS, capture_full_strategy_package, generate_policy_snapshot
 from scripts import evolution_shield
@@ -84,6 +87,68 @@ def test_evolution_candidate_requires_manual_apply(monkeypatch, tmp_path):
     assert applied["status"] == "applied"
     assert len(calls) == 1
     assert json.loads((tmp_path / "ev_test.json").read_text(encoding="utf-8"))["status"] == "applied"
+
+
+def test_empty_evolution_memory_is_normalized_to_no_change():
+    status, memory, preserve = evolution.resolve_memory_update("ADD", [], ["existing rule"])
+    assert status == "NO_CHANGE"
+    assert memory == ["existing rule"]
+    assert preserve is True
+
+
+def test_add_memory_action_cannot_be_lost_behind_no_change_status():
+    status, memory, preserve = evolution.resolve_memory_update(
+        "NO_CHANGE", [], ["existing rule"],
+        [{"action": "ADD_MEMORY", "rule_text": "多个独立样本支持减少高位延展区追价入场。"}],
+    )
+    assert status == "ADD"
+    assert memory == ["existing rule", "多个独立样本支持减少高位延展区追价入场。"]
+    assert preserve is False
+
+
+def test_add_memory_action_is_merged_even_when_top_level_list_only_repeats_old_rules():
+    status, memory, preserve = evolution.resolve_memory_update(
+        "ADD", ["existing rule"], ["existing rule"],
+        [{"action": "ADD_MEMORY", "rule_text": "new independently supported rule"}],
+    )
+    assert status == "ADD"
+    assert memory == ["existing rule", "new independently supported rule"]
+    assert preserve is False
+
+
+def test_revise_memory_action_replaces_its_exact_target():
+    status, memory, preserve = evolution.resolve_memory_update(
+        "NO_CHANGE", [], ["old rule", "unchanged rule"],
+        [{"action": "REVISE_MEMORY", "target": "old rule", "rule_text": "revised rule"}],
+    )
+    assert status == "REVISE"
+    assert memory == ["revised rule", "unchanged rule"]
+    assert preserve is False
+
+
+def test_invalidate_memory_action_removes_target_without_republishing_it():
+    status, memory, preserve = evolution.resolve_memory_update(
+        "NO_CHANGE", [], ["invalid rule", "retained rule"],
+        [{"action": "INVALIDATE_MEMORY", "target": "invalid rule", "rule_text": ""}],
+    )
+    assert status == "INVALIDATE"
+    assert memory == ["retained rule"]
+    assert preserve is False
+
+
+def test_admin_raw_order_endpoint_rejects_new_position_before_exchange_access(monkeypatch):
+    monkeypatch.setattr(web, "_require_control_admin", lambda session: {"username": "admin"})
+    monkeypatch.setattr(web, "client", lambda: pytest.fail("exchange client must not be reached"))
+    payload = web.GateOrderRequest(
+        contract="BTC_USDT", size=1, client_id="t-admin-entry",
+        reduce_only=False, close=False,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        web.place_order(payload, "session")
+
+    assert exc_info.value.status_code == 400
+    assert "只允许 reduce_only/close" in exc_info.value.detail
 
 
 def test_auto_rollback_is_forbidden_in_live(monkeypatch):

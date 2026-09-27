@@ -68,6 +68,9 @@ class ExecutionJournal:
                   take_profit_revision INTEGER NOT NULL DEFAULT 0,
                   policy_version TEXT NOT NULL DEFAULT '',
                   policy_hash TEXT NOT NULL DEFAULT '',
+                  is_add_on INTEGER NOT NULL DEFAULT 0,
+                  position_cycle_started_at_ms INTEGER NOT NULL DEFAULT 0,
+                  entry_snapshot_json TEXT NOT NULL DEFAULT '{}',
                   last_error TEXT NOT NULL DEFAULT '',
                   created_at_ms INTEGER NOT NULL,
                   updated_at_ms INTEGER NOT NULL
@@ -97,6 +100,9 @@ class ExecutionJournal:
                 ("estimated_margin_usdt", "TEXT NOT NULL DEFAULT ''"),
                 ("price_tick", "TEXT NOT NULL DEFAULT ''"),
                 ("fill_price", "TEXT NOT NULL DEFAULT ''"),
+                ("is_add_on", "INTEGER NOT NULL DEFAULT 0"),
+                ("position_cycle_started_at_ms", "INTEGER NOT NULL DEFAULT 0"),
+                ("entry_snapshot_json", "TEXT NOT NULL DEFAULT '{}'"),
             ):
                 if name not in columns:
                     connection.execute(f"ALTER TABLE entry_intents ADD COLUMN {name} {definition}")
@@ -124,6 +130,9 @@ class ExecutionJournal:
             "status": "prepared",
             "policy_version": str(payload.get("policy_version") or ""),
             "policy_hash": str(payload.get("policy_hash") or ""),
+            "is_add_on": int(bool(payload.get("is_add_on"))),
+            "position_cycle_started_at_ms": int(payload.get("position_cycle_started_at_ms") or 0),
+            "entry_snapshot_json": json.dumps(payload.get("entry_snapshot") or {}, ensure_ascii=False, default=str),
             "created_at_ms": now,
             "updated_at_ms": now,
         }
@@ -133,12 +142,12 @@ class ExecutionJournal:
                      client_id,environment,contract,requested_size,baseline_position_size,
                      entry_price,take_profit_price,stop_loss_price,take_profit_distance_pct,stop_loss_distance_pct,
                      order_type,entry_action,max_slippage_pct,expiration_seconds,order_notional_usdt,estimated_margin_usdt,price_tick,status,policy_version,
-                     policy_hash,created_at_ms,updated_at_ms
+                     policy_hash,is_add_on,position_cycle_started_at_ms,entry_snapshot_json,created_at_ms,updated_at_ms
                    ) VALUES (
                      :client_id,:environment,:contract,:requested_size,:baseline_position_size,
                      :entry_price,:take_profit_price,:stop_loss_price,:take_profit_distance_pct,:stop_loss_distance_pct,
                      :order_type,:entry_action,:max_slippage_pct,:expiration_seconds,:order_notional_usdt,:estimated_margin_usdt,:price_tick,:status,:policy_version,
-                     :policy_hash,:created_at_ms,:updated_at_ms
+                     :policy_hash,:is_add_on,:position_cycle_started_at_ms,:entry_snapshot_json,:created_at_ms,:updated_at_ms
                    )""",
                 values,
             )
@@ -178,6 +187,70 @@ class ExecutionJournal:
                 (environment.lower(), *ACTIVE_STATUSES, max(1, min(limit, 1000))),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def add_on_count(self, environment: str, contract: str, position_cycle_started_at_ms: int) -> int:
+        """Count submitted add-ons belonging to the currently open position cycle."""
+        if position_cycle_started_at_ms <= 0:
+            raise ValueError("position cycle start is unavailable")
+        ignored = (
+            "order_rejected", "trigger_cancelled", "trigger_expired", "trigger_failed",
+            "no_fill", "unfilled", "abandoned_unconfirmed",
+        )
+        placeholders = ",".join("?" for _ in ignored)
+        with self._connect() as connection:
+            row = connection.execute(
+                f"""SELECT COUNT(*) FROM entry_intents
+                    WHERE environment=? AND contract=? AND is_add_on=1
+                      AND created_at_ms>=? AND status NOT IN ({placeholders})""",
+                (environment.lower(), contract.upper(), position_cycle_started_at_ms, *ignored),
+            ).fetchone()
+        return int(row[0] or 0)
+
+    def latest_terminal(self, environment: str, contract: str, statuses: tuple[str, ...]) -> dict[str, Any] | None:
+        if not statuses:
+            return None
+        placeholders = ",".join("?" for _ in statuses)
+        with self._connect() as connection:
+            row = connection.execute(
+                f"""SELECT * FROM entry_intents
+                    WHERE environment=? AND contract=? AND status IN ({placeholders})
+                    ORDER BY updated_at_ms DESC LIMIT 1""",
+                (environment.lower(), contract.upper(), *statuses),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def entry_snapshots_for_position(
+        self, *, environment: str, contract: str, side: str,
+        opened_at_ms: int, closed_at_ms: int,
+    ) -> list[dict[str, Any]]:
+        """Return structured entry evidence for one exchange position-close cycle."""
+        if opened_at_ms <= 0 or closed_at_ms <= 0:
+            return []
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT client_id,requested_size,fill_price,entry_price,is_add_on,
+                          policy_version,policy_hash,created_at_ms,entry_snapshot_json
+                     FROM entry_intents
+                    WHERE environment=? AND contract=? AND created_at_ms>=? AND created_at_ms<=?
+                      AND CAST(filled_size AS REAL) != 0
+                    ORDER BY created_at_ms""",
+                (environment.lower(), contract.upper(), opened_at_ms - 20 * 60 * 1000, closed_at_ms),
+            ).fetchall()
+        wanted_positive = str(side).lower() == "long"
+        result = []
+        for raw in rows:
+            row = dict(raw)
+            try:
+                if (float(row.get("requested_size") or 0) > 0) != wanted_positive:
+                    continue
+                snapshot = json.loads(row.pop("entry_snapshot_json") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(snapshot, dict) or not snapshot:
+                continue
+            row["entry_snapshot"] = snapshot
+            result.append(row)
+        return result
 
     @staticmethod
     def _append_event(connection: sqlite3.Connection, client_id: str, event_type: str, detail: Any, now: int) -> None:

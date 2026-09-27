@@ -240,6 +240,10 @@ async function triggerEvolutionNow() {
 
 async function reviewCandidate(candidate: any, action: 'apply' | 'reject') {
   if (!auth.isSuperadmin || busy.value) return
+  if (action === 'apply' && (!Array.isArray(candidate.proposed_memory) || candidate.proposed_memory.length === 0)) {
+    bannerMsg.value = { text: '该候选无可发布心法，只能拒绝归档。', type: 'err' }
+    return
+  }
   const verb = action === 'apply' ? '应用' : '拒绝'
   if (!confirm(`确认${verb}自进化候选 ${candidate.id}？${action === 'apply' ? '\n应用后下一轮 AI 决策会使用新心法；凭证、环境与代理不会改变。' : ''}`)) return
   busy.value = action === 'apply' ? 'save' : 'delete'
@@ -437,10 +441,10 @@ onMounted(loadData)
           未生成候选：{{ evolutionReport.no_candidate_reason }}
         </div>
         <div v-for="candidate in evolutionCandidates.slice(0, 10)" :key="candidate.id" class="rounded-lg border p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3" style="border-color: var(--border-subtle); background-color: var(--bg-card-subtle);">
-          <div class="min-w-0"><div class="text-xs font-bold truncate">{{ candidate.id }} · {{ candidate.change_status }}</div><div class="text-[10px] mt-1" style="color: var(--text-muted);">{{ candidate.sample_size }} 笔样本 · {{ candidate.status }} · {{ candidate.reason || '无补充说明' }}</div></div>
+          <div class="min-w-0"><div class="text-xs font-bold truncate">{{ candidate.id }} · {{ candidate.change_status }}</div><div class="text-[10px] mt-1" style="color: var(--text-muted);">{{ candidate.sample_size }} 笔样本 · {{ candidate.status }} · {{ candidate.reason || '无补充说明' }}</div><div v-if="!Array.isArray(candidate.proposed_memory) || !candidate.proposed_memory.length" class="text-[10px] mt-1 text-amber-400">无可发布心法</div></div>
           <div v-if="candidate.status === 'pending'" class="flex gap-2 shrink-0">
             <button @click="reviewCandidate(candidate, 'reject')" :disabled="!auth.isSuperadmin || !!busy" class="btn-admin-secondary text-xs">拒绝</button>
-            <button @click="reviewCandidate(candidate, 'apply')" :disabled="!auth.isSuperadmin || !!busy" class="btn-admin-primary text-xs">审核并应用</button>
+            <button @click="reviewCandidate(candidate, 'apply')" :disabled="!auth.isSuperadmin || !!busy || !Array.isArray(candidate.proposed_memory) || !candidate.proposed_memory.length" class="btn-admin-primary text-xs">审核并应用</button>
           </div>
         </div>
         <div v-if="!evolutionCandidates.length" class="text-xs py-4 text-center" style="color: var(--text-muted);">暂无候选，等待下一轮有新平仓证据的复盘。</div>

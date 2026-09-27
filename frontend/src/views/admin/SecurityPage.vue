@@ -25,6 +25,17 @@ async function confirmEnableLive(){
   if(!runtime.value.live_trading_enabled) form.live_trading_enabled=false
 }
 async function disableLive(){ form.live_trading_enabled=false; form.live_confirmation=''; await save() }
+async function resetDailyLoss(){
+  const confirmation = window.prompt('此操作会忽略确认时刻之前的今日已实现亏损，并从零重新累计今日风险；每天每个环境仅允许一次。请输入：RESET GATE DAILY LOSS')
+  if (confirmation === null) return
+  loading.value = true; message.value = '正在重新核对账户并重置今日亏损基线…'
+  try {
+    const result = await api('/api/v1/admin/gate/daily-loss/reset', { method: 'POST', body: JSON.stringify({ confirmation }) })
+    message.value = `✓ 今日亏损基线已重置；重置前亏损 ${Number(result.marker?.loss_usd_before_reset || 0).toFixed(4)} USDT，后续亏损重新按 ${Number(result.marker?.limit_usd || 0).toFixed(4)} USDT 上限累计。`
+    await loadRuntime()
+  } catch(e:any) { message.value = `✕ ${e.message}` }
+  finally { loading.value = false }
+}
 async function readAccount(){ loading.value=true; message.value=''; try{snapshot.value=await api('/api/v1/admin/gate/account-snapshot')}catch(e:any){message.value=e.message}finally{loading.value=false} }
 async function stopAndFlattenTestnet(){
   const confirmation = window.prompt('此操作将关闭 Testnet 新增交易、撤销入场挂单并平掉全部 Testnet 持仓。请输入确认短语：STOP TESTNET AND FLATTEN')
@@ -49,6 +60,7 @@ onMounted(loadRuntime)
     <label>Live API Key（{{runtime.credentials.live_configured?'已配置':'未配置'}}）<input v-model="form.live_api_key" @input="verifiedEnvironment=''" class="input" autocomplete="off"/></label><label>Live API Secret<input v-model="form.live_api_secret" @input="verifiedEnvironment=''" class="input" type="password" autocomplete="new-password"/></label>
   </div><template v-if="form.environment==='testnet'"><label class="testnet"><input v-model="form.testnet_execute_trades" type="checkbox" :disabled="loading || (!form.testnet_execute_trades && verifiedEnvironment!=='testnet')"/> 启用 Gate Testnet 自动交易（仅模拟盘）</label><span v-if="verifiedEnvironment!=='testnet'" class="block mt-2 text-xs font-mono text-amber-300">请先保存配置并通过当前 TESTNET 私有 API 只读检测，自动交易选项才会解锁。</span></template><div v-else class="live-control mt-4"><div class="flex flex-wrap items-center justify-between gap-2"><b class="text-xs font-mono text-red-300">Gate Live 自动交易</b><span class="px-2.5 py-1 rounded border text-xs font-bold font-mono" :class="runtime.live_trading_enabled?'text-red-300 border-red-500':'text-emerald-300 border-emerald-500'">{{runtime.live_trading_enabled?'LIVE 自动交易已确认开启':'LIVE 自动交易已关闭'}}</span></div><template v-if="!runtime.live_trading_enabled"><span v-if="verifiedEnvironment!=='live'" class="block mt-3 text-xs font-mono text-amber-300">请先保存配置并通过当前 LIVE 私有 API 只读检测，确认按钮才会解锁。</span><template v-else><label class="mt-3 text-xs font-mono text-red-300">Live 实盘确认短语<input v-model="form.live_confirmation" class="input" autocomplete="off" placeholder="ENABLE GATE LIVE"/><span>开启时服务端会再次执行 Live 账户只读检测，失败则保持关闭。</span></label><button type="button" @click="confirmEnableLive" :disabled="loading || form.live_confirmation.trim()!=='ENABLE GATE LIVE'" class="btn danger mt-3"><ShieldCheck class="w-4 h-4"/>确认并开启 Live 自动交易</button></template></template><template v-else><p class="mt-3 text-xs font-mono text-red-300">系统允许提交 Gate Live 实盘订单；修改其他配置时仍需重新填写确认短语。</p><label class="mt-3 text-xs font-mono text-red-300">再次确认短语<input v-model="form.live_confirmation" class="input" autocomplete="off" placeholder="ENABLE GATE LIVE"/></label><button type="button" @click="disableLive" :disabled="loading" class="btn secondary mt-3"><OctagonAlert class="w-4 h-4"/>关闭 Live 自动交易</button></template></div></section>
   <section class="panel p-4 danger-panel"><div class="title"><OctagonAlert class="w-4 h-4 text-red-400"/><h2>Testnet 紧急停止</h2></div><p class="text-xs muted mb-3">关闭 Testnet 新增交易，撤销入场挂单，平掉当前 Testnet 持仓，并在 Gate 确认持仓归零后清理本系统保护单。不会切换到 Live。</p><button @click="stopAndFlattenTestnet" :disabled="loading || form.environment !== 'testnet'" class="btn danger"><OctagonAlert class="w-4 h-4"/>停止 Testnet 自动交易并平仓</button><span v-if="form.environment !== 'testnet'" class="text-xs text-amber-300 ml-3">请先切换到 Gate Testnet</span></section>
+  <section v-if="runtime.safety_status?.daily_loss?.tripped" class="panel p-4 danger-panel"><div class="title"><OctagonAlert class="w-4 h-4 text-red-400"/><h2>日亏损熔断</h2></div><p class="text-xs muted mb-3">已实现亏损 {{Number(runtime.safety_status.daily_loss.loss_usd || 0).toFixed(4)}} USDT，超过当前上限 {{Number(runtime.safety_status.daily_loss.limit_usd || 0).toFixed(4)}} USDT。人工重置不会删除交易记录；仅忽略确认时刻之前的今日盈亏，之后从零重新累计，且今日不能再次重置。</p><button @click="resetDailyLoss" :disabled="loading" class="btn danger"><ShieldCheck class="w-4 h-4"/>人工确认并重置今日亏损基线</button></section>
   <section class="panel p-4"><div class="title"><ShieldCheck class="w-4 h-4 text-blue-400"/><h2>AI 风险档位与 Gate 执行参数</h2></div>
     <div class="grid lg:grid-cols-2 gap-4 mb-4 text-xs font-mono">
       <label>AI 策略风险程度<select v-model="form.risk_profile" @change="onProfileChange" class="input"><option v-for="p in runtime.risk_profiles||[]" :key="p.key" :value="p.key">{{p.label}}</option></select><span>{{selectedProfile.description}}</span></label>

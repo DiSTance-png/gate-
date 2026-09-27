@@ -16,8 +16,42 @@ from scripts.ai_brain_trader import (
     validate_and_filter_decision,
 )
 from scripts.prompt_library import active_profile, apply_module_layout
+from .regime import market_regime_rejection
 
 _GATE_DATA = Path(__file__).resolve().parents[1] / "data"
+
+ANTI_CHASE_RSI_HIGH = 78.0
+ANTI_CHASE_RSI_LOW = 22.0
+ANTI_CHASE_VWAP_BIAS_PCT = 6.0
+ANTI_CHASE_24H_MOVE_PCT = 18.0
+
+
+def anti_chase_rejection(package: dict[str, Any], action: str) -> str:
+    """Return a symmetric, deterministic rejection for exhausted entries."""
+    try:
+        rsi_1h = float(package.get("rsi_1h", 50) or 50)
+        vwap_bias = float(package.get("vwap_bias", 0) or 0)
+        change_24h = float(package.get("chg24h", 0) or 0)
+        timeframes = (package.get("calculus") or {}).get("timeframes") or {}
+        acceleration_15m = float((timeframes.get("15M") or {}).get("acceleration", 0) or 0)
+    except (TypeError, ValueError):
+        return "追涨杀跌门禁所需指标无效，安全降级为 WAIT。"
+
+    if action == "BUY_LONG":
+        if rsi_1h >= ANTI_CHASE_RSI_HIGH:
+            return f"防追涨门禁：1H RSI {rsi_1h:.2f} 已达到 {ANTI_CHASE_RSI_HIGH:g}，禁止在超买区开多。"
+        if vwap_bias >= ANTI_CHASE_VWAP_BIAS_PCT:
+            return f"防追涨门禁：价格高于 VWAP {vwap_bias:.2f}%，超过 {ANTI_CHASE_VWAP_BIAS_PCT:g}% 上限。"
+        if change_24h >= ANTI_CHASE_24H_MOVE_PCT and acceleration_15m < 0:
+            return f"防追涨门禁：24H 已上涨 {change_24h:.2f}% 且 15M 加速度转负，禁止末端追多。"
+    elif action == "SELL_SHORT":
+        if rsi_1h <= ANTI_CHASE_RSI_LOW:
+            return f"防杀跌门禁：1H RSI {rsi_1h:.2f} 已低于 {ANTI_CHASE_RSI_LOW:g}，禁止在超卖区开空。"
+        if vwap_bias <= -ANTI_CHASE_VWAP_BIAS_PCT:
+            return f"防杀跌门禁：价格低于 VWAP {abs(vwap_bias):.2f}%，超过 {ANTI_CHASE_VWAP_BIAS_PCT:g}% 下限。"
+        if change_24h <= -ANTI_CHASE_24H_MOVE_PCT and acceleration_15m > 0:
+            return f"防杀跌门禁：24H 已下跌 {abs(change_24h):.2f}% 且 15M 加速度转正，禁止末端追空。"
+    return ""
 
 def strip_legacy_risk_values(text: str) -> str:
     """Preserve strategy meaning while removing inherited fixed risk numbers."""
@@ -106,6 +140,14 @@ def build_prompt(packages: list[dict[str, Any]], *, positions: list[dict[str, An
         "允许不同 Gate 合约同时持仓，也允许已有合约沿原方向受控加仓；禁止反向开仓，所有加仓仍受累计保证金、总敞口和双保护覆盖约束；"
         "本周期只允许使用以上动态数值；不得恢复继承模板中的历史固定金额、杠杆、门槛或锁盈阈值。"
         "任何动态配置都不能覆盖数据有效、4H 方向、价格几何、绝对 2R、保证金/仓位上限、双保护覆盖和超时查单等 P0 条件。"
+        f"防追涨杀跌 P0：BUY_LONG 时 1H RSI 必须低于 {ANTI_CHASE_RSI_HIGH:g} 且 VWAP 正偏离必须低于 {ANTI_CHASE_VWAP_BIAS_PCT:g}%；"
+        f"SELL_SHORT 时 1H RSI 必须高于 {ANTI_CHASE_RSI_LOW:g} 且 VWAP 负偏离绝对值必须低于 {ANTI_CHASE_VWAP_BIAS_PCT:g}%；"
+        f"24H 涨跌绝对值达到 {ANTI_CHASE_24H_MOVE_PCT:g}% 后，若 15M 加速度朝反转方向变化则必须 WAIT。"
+        "每个决策必须区分 direction_bias 与 action：direction_bias 只允许 LONG、SHORT、NEUTRAL；"
+        "即使中期方向偏多或偏空，只要当前入场未确认，action 必须为 WAIT。"
+        "4H 方向只限定研究方向，不构成立即入场理由；ADX 只代表强度，必须结合 +DI/-DI 判断方向。"
+        "PULLBACK/REBOUND 不是入场信号；TRANSITION 或 EXHAUSTION 状态必须 WAIT。"
+        "不得为了通过置信度门槛抬高置信度，也不得因存在候选而强制开单。"
         + entry_contract
     )
     profile = active_profile()
@@ -130,6 +172,12 @@ def validate_decision(package: dict[str, Any], decision: dict[str, Any], *, acti
         for key, value in active_position_sides.items()
     }
     action = str(decision.get("action") or "WAIT").upper()
+    regime_reason = market_regime_rejection(package, action) if action != "WAIT" else ""
+    if regime_reason:
+        return "WAIT", regime_reason, 0.0
+    anti_chase_reason = anti_chase_rejection(package, action)
+    if anti_chase_reason:
+        return "WAIT", anti_chase_reason, 0.0
     if action != "WAIT" and inst_id in normalized_active:
         side = normalized_sides.get(inst_id, "")
         same_direction = (side == "long" and action == "BUY_LONG") or (side == "short" and action == "SELL_SHORT")

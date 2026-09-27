@@ -442,14 +442,83 @@ EVOLUTION_SYSTEM_PROMPT = """你是 R20 Quantum Trader 的首席投资官，负�
 必须输出严格 JSON 对象，不得输出 Markdown、代码围栏或额外解释。
 """
 
-def resolve_memory_update(change_status: str, proposed_memory: Any, existing_memory: List[str]) -> Tuple[str, List[str], bool]:
+def _memory_actions(actions: Any) -> tuple[str | None, List[Dict[str, str]]]:
+    status_priority = {"ADD": 1, "REVISE": 2, "INVALIDATE": 3}
+    inferred_status = None
+    operations: List[Dict[str, str]] = []
+    for item in actions if isinstance(actions, list) else []:
+        if not isinstance(item, dict):
+            continue
+        action = str(item.get("action") or item.get("action_type") or "").upper()
+        normalized = (
+            "ADD" if action in {"ADD", "ADD_MEMORY"}
+            else "REVISE" if action in {"REVISE", "REVISE_MEMORY"}
+            else "INVALIDATE" if action in {"INVALIDATE", "INVALIDATE_MEMORY"}
+            else None
+        )
+        if not normalized:
+            continue
+        if inferred_status is None or status_priority[normalized] > status_priority[inferred_status]:
+            inferred_status = normalized
+        text = str(item.get("rule_text") or item.get("detail") or item.get("lesson") or "").strip()
+        target = str(item.get("target") or item.get("memory_id") or "").strip()
+        operations.append({"action": normalized, "target": target, "rule_text": text})
+    return inferred_status, operations
+
+
+def resolve_memory_update(change_status: str, proposed_memory: Any, existing_memory: List[str],
+                          evolution_actions: Any = None) -> Tuple[str, List[str], bool]:
     """Normalize LLM memory change and preserve existing lessons when evidence is insufficient."""
+    def lesson_text(item: Any) -> str:
+        if isinstance(item, dict):
+            return str(item.get("rule_text") or item.get("text") or item.get("lesson") or "").strip()
+        return str(item or "").strip()
+
     status = str(change_status or "NO_CHANGE").upper()
     if status not in {"NO_CHANGE", "ADD", "REVISE", "INVALIDATE"}:
         status = "NO_CHANGE"
-    proposed = proposed_memory if isinstance(proposed_memory, list) else []
-    preserve = status == "NO_CHANGE" or not proposed
-    return status, list(existing_memory if preserve else proposed), preserve
+    existing = [lesson_text(item) for item in existing_memory if lesson_text(item)]
+    proposed = [lesson_text(item) for item in proposed_memory if lesson_text(item)] if isinstance(proposed_memory, list) else []
+    action_status, operations = _memory_actions(evolution_actions)
+
+    if status == "ADD":
+        candidate = list(dict.fromkeys([*existing, *proposed]))
+    elif status in {"REVISE", "INVALIDATE"} and proposed:
+        candidate = list(dict.fromkeys(proposed))
+    else:
+        candidate = list(existing)
+
+    applied_status = None
+    status_priority = {"ADD": 1, "REVISE": 2, "INVALIDATE": 3}
+    for operation in operations:
+        action = operation["action"]
+        target = operation["target"]
+        text = operation["rule_text"]
+        changed = False
+        if action == "ADD" and text and text not in candidate:
+            candidate.append(text)
+            changed = True
+        elif action == "REVISE" and target in candidate and text and text != target:
+            candidate[candidate.index(target)] = text
+            candidate = list(dict.fromkeys(candidate))
+            changed = True
+        elif action == "INVALIDATE":
+            invalidated = target or (text if text in candidate else "")
+            if invalidated in candidate:
+                candidate.remove(invalidated)
+                changed = True
+        if changed and (applied_status is None or status_priority[action] > status_priority[applied_status]):
+            applied_status = action
+
+    if candidate == existing:
+        return "NO_CHANGE", existing, True
+    if applied_status:
+        status = applied_status
+    elif status == "NO_CHANGE":
+        status = action_status or "NO_CHANGE"
+    if status == "NO_CHANGE":
+        return "NO_CHANGE", existing, True
+    return status, candidate, False
 
 
 def call_llm_evolution_review(closed_trades: List[Dict[str, Any]], existing_memory_md: str = "", timestamp_str: str = "", target_instruments: List[str] | None = None) -> Dict[str, Any]:
@@ -495,7 +564,7 @@ def call_llm_evolution_review(closed_trades: List[Dict[str, Any]], existing_memo
     "0~4 条有台账字段支持的诊断；区分已验证事实与待验证假设"
   ],
   "evolution_actions": [
-    "0~4 条可执行改进；证据不足时只提出数据采集或观察建议"
+    {{"action": "ADD_MEMORY|REVISE_MEMORY|INVALIDATE_MEMORY|COLLECT_EVIDENCE|NO_CHANGE", "target": "REVISE/INVALIDATE 时必须逐字填写被修改的旧心法；ADD 时留空", "rule_text": "ADD/REVISE 时填写可直接审核的完整新心法；INVALIDATE 时留空", "reason": "证据依据"}}
   ],
   "ai_long_term_memory": [
     "0~4 条有多个独立样本支持的软启发式；不得覆盖任何硬风控"
@@ -654,7 +723,6 @@ def run_self_evolution(force: bool = False):
     if not isinstance(llm_review, dict):
         llm_review = {}
 
-    change_status, _, _ = resolve_memory_update(llm_review.get("change_status", "NO_CHANGE"), [], [])
     insights = llm_review.get("diagnosis_insights", [])
     actions_taken = llm_review.get("evolution_actions", [])
     if not isinstance(insights, list):
@@ -670,7 +738,8 @@ def run_self_evolution(force: bool = False):
         for asset in target_instruments
     }
     change_status, long_term_memory, preserve_existing_memory = resolve_memory_update(
-        change_status, llm_review.get("ai_long_term_memory", []), existing_core_lessons
+        llm_review.get("change_status", "NO_CHANGE"), llm_review.get("ai_long_term_memory", []),
+        existing_core_lessons, actions_taken
     )
 
     candidate_payload = None
@@ -685,19 +754,24 @@ def run_self_evolution(force: bool = False):
             if val:
                 safe_long_term.append(val)
 
-        candidate_id = f"ev_{now_bj.strftime('%Y%m%d_%H%M%S')}_{ledger_revision[:10]}"
-        candidate_payload = {
-            "id": candidate_id, "status": "pending", "created_at": now_bj.isoformat(),
-            "ledger_revision": ledger_revision, "expected_memory_version": memory_snapshot["version"],
-            "sample_size": total_trades, "change_status": change_status,
-            "proposed_memory": safe_long_term, "asset_multipliers": asset_mults,
-            "performance_snapshot": build_performance_snapshot(closed_trades),
-            "diagnosis_insights": insights, "evolution_actions": actions_taken,
-            "reason": llm_review.get("memory_overwrites_reason", ""),
-        }
-        atomic_write_json(_candidate_path(candidate_id), candidate_payload)
-        preserve_existing_memory = True
-        log_msg(f"Self-evolution candidate created for administrator review: {candidate_id}")
+        if not safe_long_term:
+            change_status = "NO_CHANGE"
+            preserve_existing_memory = True
+
+        if safe_long_term:
+            candidate_id = f"ev_{now_bj.strftime('%Y%m%d_%H%M%S')}_{ledger_revision[:10]}"
+            candidate_payload = {
+                "id": candidate_id, "status": "pending", "created_at": now_bj.isoformat(),
+                "ledger_revision": ledger_revision, "expected_memory_version": memory_snapshot["version"],
+                "sample_size": total_trades, "change_status": change_status,
+                "proposed_memory": safe_long_term, "asset_multipliers": asset_mults,
+                "performance_snapshot": build_performance_snapshot(closed_trades),
+                "diagnosis_insights": insights, "evolution_actions": actions_taken,
+                "reason": llm_review.get("memory_overwrites_reason", ""),
+            }
+            atomic_write_json(_candidate_path(candidate_id), candidate_payload)
+            preserve_existing_memory = True
+            log_msg(f"Self-evolution candidate created for administrator review: {candidate_id}")
 
     # Keep the legacy markdown mirror in lock-step with the authority so the
     # public dashboard can never freeze on a hand-edited snapshot.

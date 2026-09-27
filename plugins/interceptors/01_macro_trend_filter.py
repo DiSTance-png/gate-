@@ -19,10 +19,15 @@ def check_risk(package: dict, decision: dict, context: dict) -> tuple[bool, str]
     if action == "WAIT":
         return True, ""
 
-    macro_4h = str(package.get("macro_4h", "") or "")
-    if action == "SELL_SHORT" and "4H_MACRO_BULL" in macro_4h:
+    macro_4h = str(package.get("macro_4h", "") or "").upper().strip()
+    macro_direction = (
+        "BULL" if macro_4h == "BULL" or "4H_MACRO_BULL" in macro_4h
+        else "BEAR" if macro_4h == "BEAR" or "4H_MACRO_BEAR" in macro_4h
+        else "RANGE"
+    )
+    if action == "SELL_SHORT" and macro_direction == "BULL":
         return False, "4H大级别处于多头主升通道，顺势铁律拦截逆势摸顶开空，安全降级为 WAIT。"
-    if action == "BUY_LONG" and "4H_MACRO_BEAR" in macro_4h:
+    if action == "BUY_LONG" and macro_direction == "BEAR":
         return False, "4H大级别处于空头承压通道，顺势铁律拦截逆势接飞刀做多，安全降级为 WAIT。"
 
     return True, ""

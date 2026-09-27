@@ -9,6 +9,8 @@ from pathlib import Path
 
 from gate_quant.client import GateFuturesClient
 from gate_quant.config import load_settings
+from gate_quant.execution_journal import ExecutionJournal
+from gate_quant.execution_reconciler import JOURNAL_PATH
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
@@ -52,7 +54,8 @@ def _exit_reason(row: dict) -> str:
     return "Gate 原生平仓成交"
 
 
-def _ledger_row(row: dict, quanto_multiplier: float = 0.0) -> dict | None:
+def _ledger_row(row: dict, quanto_multiplier: float = 0.0, *, journal: ExecutionJournal | None = None,
+                environment: str = "") -> dict | None:
     close_id = str(row.get("id") or row.get("order_id") or row.get("text") or "")
     contract = str(row.get("contract") or row.get("name") or "")
     if not close_id or not contract:
@@ -71,7 +74,7 @@ def _ledger_row(row: dict, quanto_multiplier: float = 0.0) -> dict | None:
     roi = net_pnl / margin * 100 if margin > 0 else 0.0
     first_open_time = row.get("first_open_time")
     close_time = row.get("time") or row.get("create_time") or row.get("finish_time")
-    return {
+    mapped = {
         "id": f"gate_closed_{close_id}", "venue": "gate", "inst": contract,
         "side": "多" if is_long else ("空" if side_value == "short" else "未知"),
         "strategy": "Gate Futures", "margin": round(margin, 8), "sz": size,
@@ -86,6 +89,16 @@ def _ledger_row(row: dict, quanto_multiplier: float = 0.0) -> dict | None:
         "margin_mode": str(row.get("margin_mode") or ""),
         "source": "Gate Futures position_close",
     }
+    if journal:
+        snapshots = journal.entry_snapshots_for_position(
+            environment=environment, contract=contract, side=side_value,
+            opened_at_ms=int(_number(first_open_time) * 1000),
+            closed_at_ms=int(_number(close_time) * 1000),
+        )
+        if snapshots:
+            mapped["entry_snapshots"] = snapshots
+            mapped["signal_snapshot"] = snapshots[0]["entry_snapshot"]
+    return mapped
 
 
 def sync() -> int:
@@ -94,6 +107,7 @@ def sync() -> int:
         print("Gate credentials unavailable; ledger sync skipped")
         return 0
     client = GateFuturesClient(settings)
+    journal = ExecutionJournal(JOURNAL_PATH)
     rows = client.position_close(limit=100) or []
     if not isinstance(rows, list):
         rows = []
@@ -117,7 +131,10 @@ def sync() -> int:
     for row in rows:
         if not isinstance(row, dict):
             continue
-        mapped = _ledger_row(row, multipliers.get(str(row.get("contract") or ""), 0.0))
+        mapped = _ledger_row(
+            row, multipliers.get(str(row.get("contract") or ""), 0.0),
+            journal=journal, environment=settings.environment,
+        )
         if not mapped:
             continue
         by_id[mapped["id"]] = mapped

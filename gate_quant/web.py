@@ -27,7 +27,7 @@ def _backend_log(message: str) -> None:
     with BACKEND_LOG.open("a", encoding="utf-8") as handle:
         handle.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
 
-from .client import GateFuturesClient
+from .client import AmbiguousOrderError, GateFuturesClient
 from .anomaly_audit import run_anomaly_audit
 from .config import load_settings
 from .execution_journal import ExecutionJournal
@@ -60,7 +60,7 @@ from .protection_lifecycle import is_system_protection
 from .store import EventStore
 from .proxy_tunnel import gate_tunnel
 from .risk_profiles import get_risk_profile, profile_catalog
-from .safety import order_age_seconds
+from .safety import atomic_json, daily_loss_state, order_age_seconds, reconcile_exchange_state
 from r20_gateway.supervisor import start_supervisor as start_gateway_supervisor, stop_supervisor as stop_gateway_supervisor
 from r20_gateway.publisher import DB_PATH as GATEWAY_DB_PATH
 from r20_gateway.store import GatewayStore
@@ -71,6 +71,8 @@ from r20_gateway.secrets import status as secret_store_status
 from r20_backend.version import __version__
 
 DATA_DIR = ROOT / "data"
+DAILY_LOSS_RESET = DATA_DIR / "gate_daily_loss_reset.json"
+TRADING_LEDGER = DATA_DIR / "trading_ledger.json"
 LOG_SOURCES = {"trader": "gate_trader.log", "backend": "gate_backend.log", "scheduler": "r20_gateway.log"}
 
 def _read_json_file(name: str, default):
@@ -323,6 +325,10 @@ class GateProtectionRequest(BaseModel):
 
 
 class GateTestnetShutdownRequest(BaseModel):
+    confirmation: str = Field(min_length=1, max_length=64)
+
+
+class GateDailyLossResetRequest(BaseModel):
     confirmation: str = Field(min_length=1, max_length=64)
 
 
@@ -665,8 +671,10 @@ def get_order(contract: str, order_id: str, x_gate_session: str | None = Header(
 @app.post("/api/v1/orders")
 def place_order(payload: GateOrderRequest, x_gate_session: str | None = Header(default=None, alias="X-R20-Session")):
     actor = _require_control_admin(x_gate_session)
-    if payload.size == 0:
-        raise HTTPException(400, "Gate order size cannot be zero")
+    if not payload.reduce_only and not payload.close:
+        raise HTTPException(400, "管理员原始订单接口只允许 reduce_only/close；新增仓位必须使用带执行台账和双保护的自动执行链")
+    if payload.size == 0 and not payload.close:
+        raise HTTPException(400, "Gate reduce-only order size cannot be zero unless close=true")
     try:
         with gate_write_lock():
             c = client()
@@ -675,16 +683,17 @@ def place_order(payload: GateOrderRequest, x_gate_session: str | None = Header(d
                 raise PermissionError(f"Gate {settings.environment} order writes are disabled by the execution switch or risk profile")
             if payload.leverage is not None and abs(payload.leverage - settings.leverage) > 1e-9:
                 raise ValueError(f"Order leverage must match configured Gate leverage {settings.leverage:g}x")
-            risk = _order_risk(c, contract=payload.contract, size=payload.size, leverage=settings.leverage)
             try:
-                position = c.positions(payload.contract) or {}
-            except RuntimeError as exc:
-                if "POSITION_NOT_FOUND" not in str(exc):
+                result = c.create_order(
+                    contract=payload.contract, size=payload.size, price=payload.price,
+                    tif=payload.tif, client_id=payload.client_id,
+                    reduce_only=payload.reduce_only, close=payload.close,
+                )
+            except AmbiguousOrderError:
+                found = c.find_by_client_id(payload.client_id, payload.contract)
+                if not found:
                     raise
-                position = {}
-            cross_margin = str(position.get("pos_margin_mode") or "cross").lower() == "cross" or float(position.get("leverage") or 0) == 0
-            c.update_position_leverage(contract=payload.contract, leverage=settings.leverage, cross_margin=cross_margin)
-            result = trading_service(c).place_order(contract=payload.contract, size=payload.size, price=payload.price, tif=payload.tif, client_id=payload.client_id, reduce_only=payload.reduce_only, close=payload.close, risk=risk)
+                result = {"reconciled": True, "orders": found}
     except PermissionError as exc:
         raise HTTPException(403, str(exc)) from exc
     except Exception as exc:
@@ -800,7 +809,72 @@ def gate_admin_runtime(x_gate_session: str | None = Header(default=None, alias="
     tunnel_payload = {**tunnel.__dict__, "running": bool(tunnel.running or shared_tunnel_ready), "pid": tunnel.pid or None}
     profile = get_risk_profile(s.risk_profile)
     snapshot = profile.snapshot(leverage=s.leverage, environment=s.environment)
-    return {"exchange": "gate", "environment": s.environment, "ready": bool(s.api_key and s.api_secret), "base_url": s.base_url, "public_market_environment": s.public_market_environment, "proxy_configured": bool(s.proxy_url), "proxy_url": s.proxy_url or "", "proxy_required": s.require_proxy, "tunnel": tunnel_payload, "testnet_execute_trades": bool(s.testnet_execute_trades), "live_trading_enabled": bool(s.environment == "live" and s.live_trading_enabled), "credentials": {"testnet_configured": bool(_stored_gate_credential("GATE_TESTNET_API_KEY") and _stored_gate_credential("GATE_TESTNET_API_SECRET")), "live_configured": bool(_stored_gate_credential("GATE_LIVE_API_KEY") and _stored_gate_credential("GATE_LIVE_API_SECRET"))}, "risk_profiles": profile_catalog(), "risk_snapshot": snapshot, "risk": {"risk_profile": s.risk_profile, "max_entries_per_cycle": s.max_entries_per_cycle, "leverage": s.leverage, "max_position_notional_usd": s.max_position_notional_usd, "max_total_margin_usd": s.max_total_margin_usd, "max_order_margin_usd": s.max_order_margin_usd, "entry_intent_enabled": s.entry_intent_enabled, "max_entry_slippage_pct": s.max_entry_slippage_pct, "breakout_expiration_seconds": s.breakout_expiration_seconds}}
+    return {"exchange": "gate", "environment": s.environment, "ready": bool(s.api_key and s.api_secret), "base_url": s.base_url, "public_market_environment": s.public_market_environment, "proxy_configured": bool(s.proxy_url), "proxy_url": s.proxy_url or "", "proxy_required": s.require_proxy, "tunnel": tunnel_payload, "testnet_execute_trades": bool(s.testnet_execute_trades), "live_trading_enabled": bool(s.environment == "live" and s.live_trading_enabled), "safety_status": _safety_status(), "credentials": {"testnet_configured": bool(_stored_gate_credential("GATE_TESTNET_API_KEY") and _stored_gate_credential("GATE_TESTNET_API_SECRET")), "live_configured": bool(_stored_gate_credential("GATE_LIVE_API_KEY") and _stored_gate_credential("GATE_LIVE_API_SECRET"))}, "risk_profiles": profile_catalog(), "risk_snapshot": snapshot, "risk": {"risk_profile": s.risk_profile, "max_entries_per_cycle": s.max_entries_per_cycle, "leverage": s.leverage, "max_position_notional_usd": s.max_position_notional_usd, "max_total_margin_usd": s.max_total_margin_usd, "max_order_margin_usd": s.max_order_margin_usd, "entry_intent_enabled": s.entry_intent_enabled, "max_entry_slippage_pct": s.max_entry_slippage_pct, "breakout_expiration_seconds": s.breakout_expiration_seconds}}
+
+
+@app.post("/api/v1/admin/gate/daily-loss/reset")
+def reset_gate_daily_loss(payload: GateDailyLossResetRequest, x_gate_session: str | None = Header(default=None, alias="X-R20-Session")):
+    actor = _require_control_admin(x_gate_session)
+    if payload.confirmation.strip().upper() != "RESET GATE DAILY LOSS":
+        raise HTTPException(400, "确认短语必须精确为：RESET GATE DAILY LOSS")
+    with gate_write_lock():
+        settings = load_settings()
+        if settings.environment == "live" and not settings.live_trading_enabled:
+            raise HTTPException(409, "Gate Live 自动交易尚未启用，拒绝重置实盘日亏损基线")
+        now = time.time()
+        local_day = dt.datetime.fromtimestamp(now).strftime("%Y-%m-%d")
+        existing = _read_json_file("gate_daily_loss_reset.json", {})
+        if existing.get("environment") == settings.environment and existing.get("local_day") == local_day:
+            raise HTTPException(409, "当前环境今日已经人工重置过日亏损基线，不能重复重置")
+        c = GateFuturesClient(settings)
+        try:
+            account = c.account() or {}
+            positions_raw = c.positions() or []
+            orders_raw = c.open_orders() or []
+            triggers_raw = c.trigger_entry_orders() or []
+            protections_raw = c.protection_orders() or []
+        except Exception as exc:
+            raise HTTPException(502, f"重置前 Gate 私有账户只读核对失败：{exc}") from exc
+        positions = positions_raw if isinstance(positions_raw, list) else [positions_raw]
+        orders = orders_raw if isinstance(orders_raw, list) else []
+        triggers = triggers_raw if isinstance(triggers_raw, list) else []
+        protections = protections_raw if isinstance(protections_raw, list) else []
+        active_positions = [row for row in positions if isinstance(row, dict) and float(row.get("size") or 0) != 0]
+        entry_orders = [row for row in orders if isinstance(row, dict) and not bool(row.get("reduce_only") or row.get("is_reduce_only") or row.get("close") or row.get("is_close"))]
+        active_journal = ExecutionJournal(EXECUTION_JOURNAL).active(settings.environment)
+        if active_positions or entry_orders or triggers or protections or active_journal:
+            raise HTTPException(409, "仅允许在无持仓、无挂单、无保护单且无待对账执行时重置日亏损基线")
+        equity = float(account.get("total") or 0)
+        before = daily_loss_state(
+            TRADING_LEDGER, max_loss_usd=settings.max_daily_loss_usd,
+            max_loss_ratio=settings.max_daily_loss_ratio, equity=equity,
+            reset_path=DAILY_LOSS_RESET, environment=settings.environment, now=now,
+        )
+        marker = {
+            "environment": settings.environment, "local_day": local_day,
+            "reset_at_ms": int(now * 1000),
+            "reset_at_local": dt.datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S"),
+            "actor": actor.get("username") or "admin",
+            "loss_usd_before_reset": before.get("loss_usd", 0),
+            "limit_usd": before.get("limit_usd", 0),
+        }
+        atomic_json(DAILY_LOSS_RESET, marker)
+        after = daily_loss_state(
+            TRADING_LEDGER, max_loss_usd=settings.max_daily_loss_usd,
+            max_loss_ratio=settings.max_daily_loss_ratio, equity=equity,
+            reset_path=DAILY_LOSS_RESET, environment=settings.environment, now=now,
+        )
+        reconciliation = reconcile_exchange_state([], [], [], max_pending_age_seconds=settings.max_pending_order_age_seconds, now=now)
+        current = _read_json_file("gate_safety_status.json", {})
+        safety = {
+            **current, "environment": settings.environment, "checked_at_ms": int(now * 1000),
+            "reconciliation": reconciliation, "daily_loss": after, "private_errors": [],
+            "safe_for_new_risk": bool(reconciliation["safe_for_new_risk"] and not after["tripped"]),
+            "lifecycle_actions": [],
+        }
+        atomic_json(DATA_DIR / "gate_safety_status.json", safety)
+        store.add("gate.daily_loss.reset", {**marker, "safe_for_new_risk": safety["safe_for_new_risk"]}, level="WARNING")
+        return {"reset": True, "marker": marker, "daily_loss": after, "safe_for_new_risk": safety["safe_for_new_risk"]}
 
 
 @app.get("/api/v1/admin/runtime")

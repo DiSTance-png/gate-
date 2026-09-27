@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import time
 import re
 import requests
@@ -20,6 +21,10 @@ from .service import GateTradingService, protection_coverage_status
 from .risk_profiles import get_risk_profile
 from .safety import atomic_json, classify_error, cooldown_state, daily_loss_state, position_age_stage, reconcile_exchange_state
 from .protection_lifecycle import actionable_recovery_plans, is_system_protection, load_protection_intents, record_protection_intent, recovery_plans
+from .entry_confirmation import evaluate_retracement_confirmation
+from .exchange_write_lock import gate_write_lock
+from .portfolio_risk import correlated_exposure_gate
+from .regime import classify_market_regime, normalize_direction_bias
 
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env", override=True)
@@ -29,11 +34,13 @@ DECISIONS = DATA / "ai_brain_decisions.json"
 DECISION_HISTORY = DATA / "ai_decision_history.json"
 DECISION_AUDIT = DATA / "ai_decision_audit.jsonl"
 SAFETY_STATUS = DATA / "gate_safety_status.json"
+DAILY_LOSS_RESET = DATA / "gate_daily_loss_reset.json"
 RUNTIME_HEARTBEAT = DATA / "gate_trader_heartbeat.json"
 LEDGER = DATA / "trading_ledger.json"
 PROTECTION_INTENTS = DATA / "protection_intents.json"
 PENDING_REQUOTES = DATA / "pending_requotes.json"
 PENDING_REQUOTE_TTL_SECONDS = 20 * 60
+UNFILLED_REENTRY_COOLDOWN_SECONDS = 15 * 60
 
 TRADE_STATUS_LABELS = {
     "blocked_pending_reconfirmation": "等待下一轮确认",
@@ -45,6 +52,12 @@ TRADE_STATUS_LABELS = {
     "blocked_entry_intent_mismatch": "入场意图与盘口矛盾，未下单",
     "blocked_invalid_trigger_size": "突破计划张数无效，未下单",
     "blocked_invalid_protection_geometry": "止盈止损方向无效，未下单",
+    "blocked_add_not_profitable": "现有持仓未浮盈，禁止加仓",
+    "blocked_add_stop_not_breakeven": "止损未到保本位，禁止加仓",
+    "blocked_add_cycle_unobservable": "持仓周期不可确认，禁止加仓",
+    "blocked_add_limit": "本持仓周期已加仓一次",
+    "blocked_unfilled_cooldown": "未成交订单冷却中",
+    "blocked_correlated_exposure": "相关同向敞口已满，禁止开仓",
     "existing_breakout_plan_kept": "保留现有突破计划单",
     "breakout_cancelled_by_new_signal": "新信号已撤销突破计划单",
     "breakout_triggered_reconciliation_pending": "突破已触发，等待成交保护对账",
@@ -74,6 +87,8 @@ def _save_decision_payload(payload: dict, decisions_payload: dict, trade: dict, 
             symbol: {
                 "action": envelope["decision"].get("action", "WAIT"),
                 "raw_action": envelope["decision"].get("raw_action", envelope["decision"].get("action", "WAIT")),
+                "direction_bias": envelope["decision"].get("direction_bias", "NEUTRAL"),
+                "market_regime": envelope["decision"].get("market_regime", "TRANSITION"),
                 "confidence": envelope["decision"].get("confidence", 0),
                 "entry_intent": envelope["decision"].get("entry_intent", ""),
                 "entry_price": envelope["decision"].get("entry_price", 0),
@@ -174,6 +189,7 @@ def _console_summary(result: dict) -> str:
 SYMBOLS = ("BTC_USDT", "ETH_USDT", "SOL_USDT", "DOGE_USDT", "SUI_USDT", "XRP_USDT")
 
 GATE_LIMIT_PRICE_DEVIATION = 0.02
+GATE_MARKET_DATA_MAX_DIVERGENCE = 0.03
 # A stale AI quote may be repaired, but an extreme move is still rejected
 # rather than chased.  This is deliberately wider than the normal execution
 # band and can be tightened in a future risk profile.
@@ -304,28 +320,73 @@ def _save_pending_requotes(rows: dict[str, dict]) -> None:
 
 
 def _confirm_pending_requotes(rows: dict[str, dict], decisions_payload: dict,
-                              *, min_confidence: float, now_ms: int) -> set[str]:
-    """Confirm deferred signals only when the next AI cycle agrees in direction."""
-    confirmed: set[str] = set()
+                              *, min_confidence: float, now_ms: int) -> dict[str, dict]:
+    """Confirm deferred signals on a newer bar; retracements must touch and reclaim."""
+    confirmed: dict[str, dict] = {}
     for symbol, row in list(rows.items()):
         current = (decisions_payload.get(symbol) or {}).get("decision") or {}
         action = str(current.get("action") or "WAIT")
-        same_direction = action == str(row.get("action") or "")
+        expected_action = str(row.get("action") or "")
+        expected_bias = "LONG" if expected_action == "BUY_LONG" else "SHORT" if expected_action == "SELL_SHORT" else "NEUTRAL"
+        current_bias = normalize_direction_bias(current.get("direction_bias"), action)
+        same_direction = action == expected_action or (action == "WAIT" and current_bias == expected_bias)
         confidence_ok = float(current.get("confidence") or 0) >= min_confidence
-        if same_direction and confidence_ok:
-            row["confirmed_at_ms"] = now_ms
-            row["second_decision"] = dict(current)
-            confirmed.add(symbol)
-        else:
-            # A contrary/WAIT/low-confidence second decision invalidates the
-            # deferred entry signal instead of carrying it into later cycles.
+        previous_bar = int(row.get("signal_closed_15m_at_ms") or 0)
+        indicators = (decisions_payload.get(symbol) or {}).get("indicators") or {}
+        current_bar = int(indicators.get("latest_closed_15m_at_ms") or 0)
+        newer_closed_bar = previous_bar > 0 and current_bar > previous_bar
+        if not same_direction or not confidence_ok:
+            # A neutral/contrary/low-confidence decision withdraws the plan.
+            # WAIT with an explicit matching bias is the required pre-entry
+            # protocol and therefore keeps the original plan alive.
             rows.pop(symbol, None)
+            continue
+        if not newer_closed_bar:
+            continue
+        if str(row.get("reason") or "") == "retracement_requires_touch_and_reclaim":
+            state = evaluate_retracement_confirmation(row, indicators, now_ms=now_ms)
+            row["confirmation_state"] = state["state"]
+            row["confirmation_signals"] = state["signals"]
+            row["last_evaluated_bar_ms"] = current_bar
+            if state["invalidated"]:
+                rows.pop(symbol, None)
+                continue
+            if not state["confirmed"]:
+                continue
+        row["confirmed_at_ms"] = now_ms
+        row["second_decision"] = dict(current)
+        confirmed[symbol] = dict(row)
+        rows.pop(symbol, None)
     _save_pending_requotes(rows)
     return confirmed
 
 
+def _confirmed_requote_candidates(confirmed: dict[str, dict], decisions_payload: dict) -> list[dict]:
+    """Rebuild confirmed entries from the immutable first-cycle plan."""
+    candidates: list[dict] = []
+    decision_fields = (
+        "action", "confidence", "entry_price", "take_profit_price", "stop_loss_price",
+        "margin_usdt", "margin_usd", "entry_intent", "direction_bias", "market_regime",
+        "summary_reason",
+    )
+    for symbol, pending in confirmed.items():
+        current = decisions_payload.get(symbol)
+        if not isinstance(current, dict):
+            continue
+        saved = pending.get("decision")
+        if not isinstance(saved, dict):
+            saved = {field: pending.get(field) for field in decision_fields if field in pending}
+        if str(saved.get("action") or "") not in {"BUY_LONG", "SELL_SHORT"}:
+            continue
+        envelope = dict(current)
+        envelope["decision"] = dict(saved)
+        envelope["pending_confirmation"] = dict(pending)
+        candidates.append(envelope)
+    return candidates
+
+
 def _preflight_candidate_quotes(client, candidates: list[dict], pending_requotes: dict[str, dict],
-                                confirmed_requotes: set[str], *, now_ms: int,
+                                confirmed_requotes: dict[str, dict] | set[str], *, now_ms: int,
                                 entry_intent_enabled: bool = False) -> tuple[list[dict], list[dict]]:
     """Screen every candidate so one deferred quote cannot hide later signals."""
     eligible: list[dict] = []
@@ -338,7 +399,66 @@ def _preflight_candidate_quotes(client, candidates: list[dict], pending_requotes
         quote = quote_rows[0] if isinstance(quote_rows, list) and quote_rows else (quote_rows if isinstance(quote_rows, dict) else {})
         reference = float(quote.get("mark_price") or quote.get("last") or envelope["indicators"].get("last") or 0)
         original = dict(item)
-        if entry_intent_enabled and str(item.get("entry_intent") or "").lower() in ENTRY_INTENTS:
+        intent = str(item.get("entry_intent") or "").lower()
+        entry = float(item.get("entry_price") or 0)
+        action = str(item.get("action") or "")
+        is_retracement = (
+            intent == "retracement" if entry_intent_enabled
+            else (action == "BUY_LONG" and 0 < entry < reference) or (action == "SELL_SHORT" and entry > reference > 0)
+        )
+        if is_retracement and symbol in confirmed_requotes:
+            confirmed_decision, confirmed_quote = _requote_decision(
+                item, reference, limit=0.0, max_requote=GATE_LIMIT_PRICE_DEVIATION
+            )
+            if confirmed_quote["requote_status"] == "blocked_extreme_deviation":
+                reason = "回踩确认后价格已偏离原计划超过 2%，禁止追价"
+                item.update({"action": "WAIT", "entry_price": 0.0, "take_profit_price": 0.0,
+                             "stop_loss_price": 0.0, "rejection_reason": reason})
+                blocked.append({"status": "blocked_price_deviation", "contract": symbol,
+                                "reason": reason, "requote": confirmed_quote})
+                continue
+            item.update(confirmed_decision)
+            if entry_intent_enabled:
+                item["entry_intent"] = "immediate"
+            envelope["quote_preflight"] = {
+                **confirmed_quote,
+                "requote_status": "confirmed_touch_reclaim",
+                "confirmation_state": "CONFIRMED",
+            }
+            eligible.append(envelope)
+            continue
+        if is_retracement and symbol not in confirmed_requotes:
+            signal_bar = int(envelope["indicators"].get("latest_closed_15m_at_ms") or 0)
+            existing = pending_requotes.get(symbol) or {}
+            same_pending_retracement = (
+                str(existing.get("action") or "") == action
+                and str(existing.get("reason") or "") == "retracement_requires_touch_and_reclaim"
+            )
+            if not same_pending_retracement:
+                pending_requotes[symbol] = {
+                    "contract": symbol, "action": action,
+                    "confidence": float(original.get("confidence") or 0),
+                    "entry_price": entry,
+                    "take_profit_price": original.get("take_profit_price"),
+                    "stop_loss_price": original.get("stop_loss_price"),
+                    "decision": dict(original),
+                    "signal_closed_15m_at_ms": signal_bar,
+                    "created_at_ms": now_ms,
+                    "confirmation_state": "WAITING_TOUCH",
+                    "reason": "retracement_requires_touch_and_reclaim",
+                }
+            else:
+                existing["last_seen_at_ms"] = now_ms
+                existing["latest_confidence"] = float(original.get("confidence") or 0)
+            state = str((pending_requotes.get(symbol) or {}).get("confirmation_state") or "WAITING_TOUCH")
+            reason = "回调做多/反弹做空必须先触及计划区，再由已收盘 15M K 线收回确认"
+            item.update({"action": "WAIT", "entry_price": 0.0, "take_profit_price": 0.0,
+                         "stop_loss_price": 0.0, "rejection_reason": reason})
+            blocked.append({"status": "blocked_pending_reconfirmation", "contract": symbol,
+                            "reason": reason, "requested_entry": entry,
+                            "reference_price": reference, "confirmation_state": state})
+            continue
+        if entry_intent_enabled and intent in ENTRY_INTENTS:
             envelope["quote_preflight"] = {
                 "requote_status": "explicit_entry_intent",
                 "original_entry_price": float(item.get("entry_price") or 0),
@@ -358,6 +478,8 @@ def _preflight_candidate_quotes(client, candidates: list[dict], pending_requotes
                 "entry_price": requote["original_entry_price"],
                 "take_profit_price": original.get("take_profit_price"),
                 "stop_loss_price": original.get("stop_loss_price"),
+                "decision": dict(original),
+                "signal_closed_15m_at_ms": int(envelope["indicators"].get("latest_closed_15m_at_ms") or 0),
                 "created_at_ms": now_ms,
                 "reason": "price_deviation_requires_next_cycle_confirmation",
             }
@@ -388,6 +510,21 @@ def _account_committed_margin(account: dict) -> float:
     if any(field in account for field in detailed_fields):
         return sum(float(account.get(field) or 0) for field in detailed_fields)
     return float(account.get("position_margin") or 0) + float(account.get("order_margin") or 0)
+
+
+def _active_position_context(positions: list[dict]) -> tuple[set[str], dict[str, str]]:
+    """Return active contracts and fail-closed side labels for hedge-mode rows."""
+    grouped: dict[str, set[str]] = {}
+    for position in positions:
+        size = float(position.get("size") or 0)
+        if size == 0:
+            continue
+        contract = str(position.get("contract") or "").upper()
+        grouped.setdefault(contract, set()).add("long" if size > 0 else "short")
+    return set(grouped), {
+        contract: next(iter(sides)) if len(sides) == 1 else "both"
+        for contract, sides in grouped.items()
+    }
 
 
 def _portfolio_position_notional(client: GateFuturesClient, positions: list[dict]) -> float:
@@ -433,9 +570,74 @@ def _untracked_trigger_entries(trigger_entries: list[dict], execution_intents: l
     return untracked
 
 
-def _execute_entry_candidate(client: GateFuturesClient, envelope: dict, *, settings, risk_profile,
-                             risk_snapshot: dict, policy_snapshot: dict, confirmed_requotes: set[str],
-                             now_ms: int, sequence: int, risk_state: dict[str, float]) -> dict:
+def _position_cycle_started_at_ms(position: dict) -> int:
+    for key in ("create_time_ms", "open_time_ms", "create_time", "open_time"):
+        try:
+            value = float(position.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return int(value if value > 10_000_000_000 else value * 1000)
+    return 0
+
+
+def _stop_is_at_breakeven(protections: list[dict], position: dict) -> bool:
+    size = Decimal(str(position.get("size") or 0))
+    entry_price = Decimal(str(position.get("entry_price") or 0))
+    if size == 0 or entry_price <= 0:
+        return False
+    stop_rule = 2 if size > 0 else 1
+    eligible = []
+    for row in protections or []:
+        trigger = row.get("trigger") or {}
+        try:
+            rule = int(trigger.get("rule") or 0)
+            trigger_price = Decimal(str(trigger.get("price") or 0))
+        except (TypeError, ValueError):
+            continue
+        if rule != stop_rule or trigger_price <= 0:
+            continue
+        if (size > 0 and trigger_price >= entry_price) or (size < 0 and trigger_price <= entry_price):
+            eligible.append(row)
+    return protection_coverage_status(eligible, size)["stop_loss"] >= abs(size)
+
+
+def _add_on_rejection(position: dict, protections: list[dict], journal: ExecutionJournal,
+                      *, environment: str, contract: str) -> dict | None:
+    size = Decimal(str(position.get("size") or 0))
+    coverage = protection_coverage_status(protections, size)
+    if not coverage["fully_protected"]:
+        return {
+            "status": "blocked_add_unprotected_existing_position", "contract": contract,
+            "reason": "Existing Gate position is not fully covered by both native take-profit and stop-loss orders; add-on blocked fail-closed",
+            "required_size": GateFuturesClient._api_size(abs(size)),
+            "take_profit_covered_size": GateFuturesClient._api_size(coverage["take_profit"]),
+            "stop_loss_covered_size": GateFuturesClient._api_size(coverage["stop_loss"]),
+        }
+    try:
+        unrealised_pnl = float(position.get("unrealised_pnl"))
+    except (TypeError, ValueError):
+        unrealised_pnl = 0.0
+    if unrealised_pnl <= 0:
+        return {"status": "blocked_add_not_profitable", "contract": contract,
+                "reason": "Existing position must have positive unrealised PnL before one add-on is allowed"}
+    if not _stop_is_at_breakeven(protections, position):
+        return {"status": "blocked_add_stop_not_breakeven", "contract": contract,
+                "reason": "Existing position stop-loss is not confirmed at breakeven or better"}
+    try:
+        prior_add_ons = journal.add_on_count(environment, contract, _position_cycle_started_at_ms(position))
+    except (ValueError, sqlite3.Error) as exc:
+        return {"status": "blocked_add_cycle_unobservable", "contract": contract,
+                "reason": f"Cannot establish current position-cycle add-on count: {exc}"}
+    if prior_add_ons >= 1:
+        return {"status": "blocked_add_limit", "contract": contract,
+                "reason": "Current position cycle already used its single permitted add-on"}
+    return None
+
+
+def _execute_entry_candidate_locked(client: GateFuturesClient, envelope: dict, *, settings, risk_profile,
+                             risk_snapshot: dict, policy_snapshot: dict, confirmed_requotes: dict[str, dict] | set[str],
+                             now_ms: int, sequence: int, risk_state: dict[str, Any]) -> dict:
     """Execute one candidate serially and return an isolated outcome.
 
     Candidate-level rejections do not stop later symbols. An ambiguous order or
@@ -447,11 +649,26 @@ def _execute_entry_candidate(client: GateFuturesClient, envelope: dict, *, setti
     trade_feature = envelope["indicators"]
     action = str(decision.get("action") or "WAIT")
     confidence = float(decision.get("confidence") or 0)
+    journal = ExecutionJournal(EXECUTION_JOURNAL)
     cooldown = cooldown_state(LEDGER, cooldown_seconds=settings.stop_cooldown_seconds, contract=trade_symbol)
     if cooldown["active"]:
         return {"trade": {"status": "blocked_symbol_cooldown", "contract": trade_symbol,
                           "reason": f"{trade_symbol} is in post-stop cooldown; other contracts remain eligible",
-                          "cooldown": cooldown}, "submitted": False, "stop_cycle": False}
+                "cooldown": cooldown}, "submitted": False, "stop_cycle": False}
+    recent_unfilled = journal.latest_terminal(
+        settings.environment, trade_symbol,
+        ("unfilled", "no_fill", "trigger_expired", "trigger_cancelled"),
+    )
+    if recent_unfilled:
+        remaining = int(
+            (int(recent_unfilled.get("updated_at_ms") or 0) + UNFILLED_REENTRY_COOLDOWN_SECONDS * 1000 - now_ms)
+            / 1000
+        )
+        if remaining > 0:
+            return {"trade": {"status": "blocked_unfilled_cooldown", "contract": trade_symbol,
+                              "reason": f"同合约未成交订单结束后冷却一轮，剩余 {remaining} 秒",
+                              "remaining_seconds": remaining},
+                    "submitted": False, "stop_cycle": False}
 
     limits = RiskLimits(settings.max_position_notional_usd, settings.max_total_margin_usd, settings.max_order_margin_usd)
     contract = client.contracts(trade_symbol)
@@ -500,8 +717,43 @@ def _execute_entry_candidate(client: GateFuturesClient, envelope: dict, *, setti
                               "deviation_pct": requote["original_deviation_pct"], "requote": requote},
                     "submitted": False, "stop_cycle": False}
 
+    # Refresh exposure before sizing. Same-direction crypto contracts are one
+    # beta risk unit, including reservations from earlier submissions this cycle.
+    account = client.account() or {}
+    positions = client.positions() or []
+    if isinstance(positions, dict):
+        positions = [positions] if positions else []
+    matching_positions = [
+        p for p in positions
+        if str(p.get("contract") or "").upper() == trade_symbol and float(p.get("size") or 0) != 0
+    ]
+    if len(matching_positions) > 1:
+        return {"trade": {"status": "blocked_ambiguous_hedge_position", "contract": trade_symbol,
+                          "reason": "Gate 同合约存在多个活动方向，自动加仓无法唯一绑定持仓，已安全拒绝"},
+                "submitted": False, "stop_cycle": False}
+    existing_position = matching_positions[0] if matching_positions else None
+    existing_size = Decimal(str((existing_position or {}).get("size") or 0))
+    is_add_on = existing_size != 0
+    if is_add_on and ((existing_size > 0) != (action == "BUY_LONG")):
+        return {"trade": {"status": "blocked_opposite_position", "contract": trade_symbol,
+                          "reason": "Existing Gate position direction conflicts with the proposed add-on"},
+                "submitted": False, "stop_cycle": False}
+    portfolio_gate = correlated_exposure_gate(
+        positions,
+        risk_state.setdefault("directional_reservations", []),
+        contract=trade_symbol,
+        action=action,
+    )
+    if not portfolio_gate["allowed"]:
+        return {"trade": {"status": "blocked_correlated_exposure", "contract": trade_symbol,
+                          "reason": portfolio_gate["reason"], "portfolio_risk": portfolio_gate},
+                "submitted": False, "stop_cycle": False}
+
     entry_price = float(decision.get("entry_price") or 0)
     planned_margin = float(decision.get("margin_usdt") or decision.get("margin_usd") or 0)
+    planned_margin *= float(portfolio_gate["margin_scale"])
+    decision["portfolio_risk"] = portfolio_gate
+    decision["effective_margin_usdt"] = planned_margin
     leverage = settings.leverage
     if planned_margin <= 0:
         return {"trade": {"status": "blocked_invalid_margin", "contract": trade_symbol,
@@ -534,28 +786,17 @@ def _execute_entry_candidate(client: GateFuturesClient, envelope: dict, *, setti
     order_notional = float(abs(size) * Decimal(str(multiplier)) * Decimal(str(risk_price)))
     estimated_margin = order_notional / leverage
 
-    # Refresh exchange state for every candidate. The local reservation ensures
-    # the previous order is counted even if Gate account fields lag briefly.
-    account = client.account() or {}
-    positions = client.positions() or []
-    if isinstance(positions, dict):
-        positions = [positions] if positions else []
-    existing_position = next((p for p in positions if str(p.get("contract") or "").upper() == trade_symbol and float(p.get("size") or 0) != 0), None)
-    existing_size = Decimal(str((existing_position or {}).get("size") or 0))
-    is_add_on = existing_size != 0
-    if is_add_on and ((existing_size > 0) != (size > 0)):
-        return {"trade": {"status": "blocked_opposite_position", "contract": trade_symbol,
-                          "reason": "Existing Gate position direction conflicts with the proposed add-on"},
-                "submitted": False, "stop_cycle": False}
+    # The local reservation still covers a previous order if Gate account
+    # fields lag briefly after the serial submission.
+    position_cycle_started_at_ms = _position_cycle_started_at_ms(existing_position or {})
     if is_add_on:
-        coverage = protection_coverage_status(client.protection_orders(trade_symbol) or [], existing_size)
-        if not coverage["fully_protected"]:
-            return {"trade": {"status": "blocked_add_unprotected_existing_position", "contract": trade_symbol,
-                              "reason": "Existing Gate position is not fully covered by both native take-profit and stop-loss orders; add-on blocked fail-closed",
-                              "required_size": GateFuturesClient._api_size(abs(existing_size)),
-                              "take_profit_covered_size": GateFuturesClient._api_size(coverage["take_profit"]),
-                              "stop_loss_covered_size": GateFuturesClient._api_size(coverage["stop_loss"])},
-                    "submitted": False, "stop_cycle": False}
+        protections = client.protection_orders(trade_symbol) or []
+        rejection = _add_on_rejection(
+            existing_position or {}, protections, journal,
+            environment=settings.environment, contract=trade_symbol,
+        )
+        if rejection:
+            return {"trade": rejection, "submitted": False, "stop_cycle": False}
 
     current_margin = max(_account_committed_margin(account), risk_state["baseline_margin"] + risk_state["reserved_margin"])
     current_notional = max(_portfolio_position_notional(client, positions), risk_state["baseline_notional"] + risk_state["reserved_notional"])
@@ -569,10 +810,9 @@ def _execute_entry_candidate(client: GateFuturesClient, envelope: dict, *, setti
                 "submitted": False, "stop_cycle": False}
     try:
         from .strategy_adapter import validate_decision
-        active_positions = {str(p.get("contract")): p for p in positions if float(p.get("size") or 0) != 0}
-        active_sides = {symbol: "long" if float(position.get("size") or 0) > 0 else "short" for symbol, position in active_positions.items()}
+        active_inst_ids, active_sides = _active_position_context(positions)
         package = {**trade_feature, "instId": trade_symbol, "data_quality": "valid", "macro_4h": trade_feature.get("macro_4h", "RANGE")}
-        gated_action, gate_reason, rr = validate_decision(package, decision, active_inst_ids=set(active_positions), active_position_sides=active_sides, risk_snapshot=risk_snapshot)
+        gated_action, gate_reason, rr = validate_decision(package, decision, active_inst_ids=active_inst_ids, active_position_sides=active_sides, risk_snapshot=risk_snapshot)
         if gated_action != action:
             return {"trade": {"status": "blocked_by_strategy_interceptor", "contract": trade_symbol,
                               "reason": gate_reason or "Gate strategy interceptor rejected decision", "risk_reward": rr},
@@ -585,7 +825,15 @@ def _execute_entry_candidate(client: GateFuturesClient, envelope: dict, *, setti
     try:
         position_response = client.positions(trade_symbol) or {}
         if isinstance(position_response, list):
-            position = next((row for row in position_response if isinstance(row, dict) and float(row.get("size") or 0) != 0), {})
+            live_positions = [
+                row for row in position_response
+                if isinstance(row, dict) and float(row.get("size") or 0) != 0
+            ]
+            if len(live_positions) > 1:
+                return {"trade": {"status": "blocked_ambiguous_hedge_position", "contract": trade_symbol,
+                                  "reason": "下单前复核发现同合约多个活动方向，已安全拒绝"},
+                        "submitted": False, "stop_cycle": False}
+            position = live_positions[0] if live_positions else {}
         else:
             position = position_response if isinstance(position_response, dict) else {}
     except RuntimeError as exc:
@@ -605,7 +853,15 @@ def _execute_entry_candidate(client: GateFuturesClient, envelope: dict, *, setti
         return {"trade": {"status": "blocked_invalid_protection_geometry", "contract": trade_symbol,
                           "reason": "AI 止盈止损与入场方向不一致，未提交订单"},
                 "submitted": False, "stop_cycle": False}
-    journal = ExecutionJournal(EXECUTION_JOURNAL)
+    entry_snapshot = {
+        "captured_at_ms": now_ms,
+        "feature": trade_feature,
+        "strategy_package": _strategy_package(trade_feature, quote),
+        "decision": decision,
+        "risk_snapshot": risk_snapshot,
+        "policy_version": policy_snapshot["policy_version"],
+        "policy_hash": policy_snapshot["policy_hash"],
+    }
     intent = journal.prepare({"client_id": client_id, "environment": settings.environment, "contract": trade_symbol,
                               "requested_size": str(size), "baseline_position_size": str(existing_size),
                               "entry_price": limit_price, "take_profit_price": rounded_tp, "stop_loss_price": rounded_sl,
@@ -615,6 +871,9 @@ def _execute_entry_candidate(client: GateFuturesClient, envelope: dict, *, setti
                               "expiration_seconds": str(entry_plan.get("expiration_seconds") or settings.breakout_expiration_seconds),
                               "order_notional_usdt": str(order_notional), "estimated_margin_usdt": str(estimated_margin),
                               "price_tick": str(tick),
+                              "is_add_on": is_add_on,
+                              "position_cycle_started_at_ms": position_cycle_started_at_ms,
+                              "entry_snapshot": entry_snapshot,
                               "requote": requote, "created_at_ms": now_ms,
                               "policy_version": policy_snapshot["policy_version"], "policy_hash": policy_snapshot["policy_hash"]})
     try:
@@ -665,6 +924,10 @@ def _execute_entry_candidate(client: GateFuturesClient, envelope: dict, *, setti
         lifecycle = {"status": "reconciliation_pending", "last_error": str(exc)}
     risk_state["reserved_margin"] += estimated_margin
     risk_state["reserved_notional"] += order_notional
+    risk_state["directional_reservations"].append({
+        "contract": trade_symbol,
+        "side": "long" if size > 0 else "short",
+    })
     lifecycle_status = str(lifecycle.get("status") or "")
     protected_now = lifecycle_status in {"filled_protected", "partially_filled"}
     terminal_failure = lifecycle_status in {
@@ -684,6 +947,19 @@ def _execute_entry_candidate(client: GateFuturesClient, envelope: dict, *, setti
              "stop_loss_covered": protected_now or lifecycle_status == "stop_protected_tp_pending"}
     return {"trade": trade, "submitted": True,
             "stop_cycle": terminal_failure or lifecycle_status == "reconciliation_pending"}
+
+
+def _execute_entry_candidate(client: GateFuturesClient, envelope: dict, *, settings, risk_profile,
+                             risk_snapshot: dict, policy_snapshot: dict, confirmed_requotes: dict[str, dict] | set[str],
+                             now_ms: int, sequence: int, risk_state: dict[str, Any]) -> dict:
+    """Serialize the complete entry transaction against every other Gate writer."""
+    with gate_write_lock():
+        return _execute_entry_candidate_locked(
+            client, envelope, settings=settings, risk_profile=risk_profile,
+            risk_snapshot=risk_snapshot, policy_snapshot=policy_snapshot,
+            confirmed_requotes=confirmed_requotes, now_ms=now_ms, sequence=sequence,
+            risk_state=risk_state,
+        )
 
 
 def _run_serial_candidates(candidates: list[dict], max_entries: int, executor) -> tuple[list[dict], list[dict]]:
@@ -784,9 +1060,9 @@ def _atr(highs, lows, closes, period=14):
     return sum(true_ranges[-period:]) / period
 
 
-def _adx(highs, lows, closes, period=14):
+def _dmi(highs, lows, closes, period=14):
     if len(closes) <= period * 2:
-        return 0.0
+        return 0.0, 0.0, 0.0
     trs, plus_dm, minus_dm = [], [], []
     for i in range(1, len(closes)):
         trs.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
@@ -794,19 +1070,97 @@ def _adx(highs, lows, closes, period=14):
         plus_dm.append(up if up > down and up > 0 else 0.0)
         minus_dm.append(down if down > up and down > 0 else 0.0)
     dx = []
+    latest_plus = latest_minus = 0.0
     for i in range(period, len(trs)):
         tr = sum(trs[i - period + 1:i + 1])
         if tr <= 0:
             continue
         plus = 100 * sum(plus_dm[i - period + 1:i + 1]) / tr
         minus = 100 * sum(minus_dm[i - period + 1:i + 1]) / tr
+        latest_plus, latest_minus = plus, minus
         dx.append(100 * abs(plus - minus) / (plus + minus) if plus + minus else 0.0)
-    return sum(dx[-period:]) / min(period, len(dx)) if dx else 0.0
+    adx = sum(dx[-period:]) / min(period, len(dx)) if dx else 0.0
+    return adx, latest_plus, latest_minus
+
+
+def _adx(highs, lows, closes, period=14):
+    return _dmi(highs, lows, closes, period)[0]
+
+
+def _chronological_candles(raw, *, contract: str, interval_seconds: int, now: float | None = None) -> list[dict]:
+    """Validate Gate candles and return closed bars in oldest-to-newest order."""
+    source = list(raw or [])
+    if any(not isinstance(row, dict) for row in source):
+        raise RuntimeError(f"invalid Gate candle row for {contract}")
+    rows = source
+    try:
+        rows.sort(key=lambda row: float(row.get("t")))
+        timestamps = [float(row.get("t")) for row in rows]
+    except (TypeError, ValueError):
+        raise RuntimeError(f"invalid Gate candle timestamp for {contract}")
+    if len(timestamps) != len(set(timestamps)):
+        raise RuntimeError(f"duplicate Gate candle timestamp for {contract}")
+    if any(right <= left for left, right in zip(timestamps, timestamps[1:])):
+        raise RuntimeError(f"non-monotonic Gate candles for {contract}")
+    current_seconds = time.time() if now is None else float(now)
+    if timestamps:
+        newest_source_seconds = timestamps[-1] / 1000 if timestamps[-1] > 10_000_000_000 else timestamps[-1]
+        if newest_source_seconds > current_seconds + interval_seconds:
+            raise RuntimeError(f"future Gate candle timestamp for {contract}")
+    rows = [
+        row for row in rows
+        if (float(row.get("t")) / 1000 if float(row.get("t")) > 10_000_000_000 else float(row.get("t"))) + interval_seconds <= current_seconds
+    ]
+    if not rows:
+        raise RuntimeError(f"no closed Gate candles for {contract}")
+    newest_seconds = float(rows[-1].get("t"))
+    if newest_seconds > 10_000_000_000:
+        newest_seconds /= 1000
+    if current_seconds - (newest_seconds + interval_seconds) > interval_seconds * 3:
+        raise RuntimeError(f"stale Gate candles for {contract}")
+    return rows
+
+
+def _calculus_metrics(closes: list[float], volumes: list[float]) -> dict:
+    returns = [(closes[i] / closes[i - 1] - 1.0) for i in range(1, len(closes)) if closes[i - 1] > 0]
+    mean_return = sum(returns) / len(returns) if returns else 0.0
+    centered = [value - mean_return for value in returns]
+    variance = sum(value * value for value in centered) / len(centered) if centered else 0.0
+    stddev = variance ** 0.5
+    sorted_returns = sorted(returns)
+    tail_count = max(1, int(len(sorted_returns) * 0.05)) if sorted_returns else 1
+    impulse = sum(returns[-8:]) if returns else 0.0
+    jerk = returns[-1] - 2 * returns[-2] + returns[-3] if len(returns) >= 3 else 0.0
+    return {
+        "valid": bool(returns),
+        "regime": "POSITIVE_MOMENTUM" if impulse > 0 else "NEGATIVE_MOMENTUM" if impulse < 0 else "RANGE_LOW_VELOCITY",
+        "quality": 1.0 if returns else 0.0,
+        "velocity": mean_return,
+        "acceleration": jerk,
+        "impulse": impulse,
+        "max_abs_jerk": abs(jerk),
+        "definite_integrals": {
+            "energy_integral": sum(value * value for value in returns[-24:]),
+            "deviation_area_integral": sum(abs(value - mean_return) for value in returns[-24:]),
+            "volume_action_integral": sum(
+                (1 if closes[i] >= closes[i - 1] else -1) * volumes[i]
+                for i in range(1, len(closes))[-24:]
+            ),
+        },
+        "probability_theory": {
+            "skewness": sum(value ** 3 for value in centered) / len(centered) / (stddev ** 3) if stddev else 0.0,
+            "kurtosis": sum(value ** 4 for value in centered) / len(centered) / (stddev ** 4) - 3.0 if stddev else 0.0,
+            "continuation_prob_pct": round(sum(value > 0 for value in returns[-20:]) / min(20, len(returns)) * 100, 2) if returns else 50.0,
+            "breakdown_prob_pct": round(sum(value < 0 for value in returns[-20:]) / min(20, len(returns)) * 100, 2) if returns else 50.0,
+            "var_95_pct": abs(sorted_returns[tail_count - 1]) * 100 if sorted_returns else 0.0,
+            "cvar_95_pct": abs(sum(sorted_returns[:tail_count]) / tail_count) * 100 if sorted_returns else 0.0,
+        },
+    }
 
 
 def _features(client, contract, ticker=None):
     raw = client.candlesticks(contract, "15m", 160)
-    rows = list(reversed(raw or []))
+    rows = _chronological_candles(raw, contract=contract, interval_seconds=15 * 60)
     closes = [float(x.get("c") or 0) for x in rows]
     highs = [float(x.get("h") or 0) for x in rows]
     lows = [float(x.get("l") or 0) for x in rows]
@@ -817,46 +1171,50 @@ def _features(client, contract, ticker=None):
     vwap = sum(price * volume for price, volume in zip(closes, volumes)) / vwap_denominator if vwap_denominator else closes[-1]
     volume_baseline = sum(volumes[-6:-1]) / 5 if len(volumes) >= 6 else 0
     obv = sum((volumes[i] if closes[i] > closes[i - 1] else -volumes[i] if closes[i] < closes[i - 1] else 0) for i in range(1, len(closes)))
-    returns_15m = [(closes[i] / closes[i - 1] - 1.0) for i in range(1, len(closes)) if closes[i - 1] > 0]
-    mean_return = sum(returns_15m) / len(returns_15m) if returns_15m else 0.0
-    centered = [value - mean_return for value in returns_15m]
-    variance = sum(value * value for value in centered) / len(centered) if centered else 0.0
-    stddev = variance ** 0.5
-    skewness = sum(value ** 3 for value in centered) / len(centered) / (stddev ** 3) if stddev else 0.0
-    kurtosis = sum(value ** 4 for value in centered) / len(centered) / (stddev ** 4) - 3.0 if stddev else 0.0
-    sorted_returns = sorted(returns_15m)
-    tail_count = max(1, int(len(sorted_returns) * 0.05)) if sorted_returns else 1
-    var_95 = abs(sorted_returns[tail_count - 1]) * 100 if sorted_returns else 0.0
-    cvar_95 = abs(sum(sorted_returns[:tail_count]) / tail_count) * 100 if sorted_returns else 0.0
-    impulse = sum(returns_15m[-8:]) if returns_15m else 0.0
-    jerk = (returns_15m[-1] - 2 * returns_15m[-2] + returns_15m[-3]) if len(returns_15m) >= 3 else 0.0
-    energy_integral = sum(value * value for value in returns_15m[-24:])
-    deviation_area = sum(abs(value - mean_return) for value in returns_15m[-24:])
-    volume_action = sum((1 if closes[i] >= closes[i - 1] else -1) * volumes[i] for i in range(1, len(closes))[-24:])
+    calculus_15m = _calculus_metrics(closes, volumes)
 
     higher = {}
     for interval, limit in (("1h", 100), ("4h", 60)):
         higher_raw = client.candlesticks(contract, interval, limit)
-        higher_rows = list(reversed(higher_raw or []))
+        higher_rows = _chronological_candles(
+            higher_raw, contract=contract, interval_seconds=3600 if interval == "1h" else 4 * 3600
+        )
         h_closes = [float(x.get("c") or 0) for x in higher_rows]
         h_highs = [float(x.get("h") or 0) for x in higher_rows]
         h_lows = [float(x.get("l") or 0) for x in higher_rows]
+        h_volumes = [float(x.get("v") or 0) for x in higher_rows]
         if len(h_closes) < 20:
             continue
         if interval == "1h":
             sma7 = sum(h_closes[-7:]) / 7
             sma20 = sum(h_closes[-20:]) / 20
             returns = [(h_closes[i] / h_closes[i - 1] - 1) for i in range(1, len(h_closes)) if h_closes[i - 1] > 0]
+            calculus_1h = _calculus_metrics(h_closes, h_volumes)
+            adx_1h, plus_di_1h, minus_di_1h = _dmi(h_highs, h_lows, h_closes)
+            ema20_now = _ema(h_closes[-40:], 20)
+            ema20_previous = _ema(h_closes[-41:-1], 20)
+            ema50_now = _ema(h_closes[-80:], 50)
+            ema50_previous = _ema(h_closes[-81:-1], 50)
+            efficiency_denominator = sum(abs(h_closes[i] - h_closes[i - 1]) for i in range(max(1, len(h_closes) - 20), len(h_closes)))
+            efficiency_ratio = abs(h_closes[-1] - h_closes[max(0, len(h_closes) - 21)]) / efficiency_denominator if efficiency_denominator else 0.0
             velocity = sum(returns[-5:]) / min(5, len(returns)) if returns else 0.0
             acceleration = (sum(returns[-3:]) / min(3, len(returns)) - sum(returns[-8:-3]) / min(5, max(1, len(returns[-8:-3])))) if len(returns) >= 3 else 0.0
-            higher.update({"atr_1h": round(_atr(h_highs, h_lows, h_closes), 6), "rsi_1h": round(_rsi(h_closes), 2), "adx_1h": round(_adx(h_highs, h_lows, h_closes), 2), "velocity_1h": round(velocity, 8), "acceleration_1h": round(acceleration, 8), "continuation_prob_pct": round(sum(value > 0 for value in returns[-20:]) / min(20, len(returns)) * 100, 2) if returns else 0.0, "breakdown_prob_pct": round(sum(value < 0 for value in returns[-20:]) / min(20, len(returns)) * 100, 2) if returns else 0.0, "recent_1h": [[float(x.get("o") or 0), float(x.get("h") or 0), float(x.get("l") or 0), float(x.get("c") or 0), float(x.get("v") or 0)] for x in reversed(higher_rows[-12:])], "sma7_1h": round(sma7, 8), "sma20_1h": round(sma20, 8), "structure_1h": "BULL" if h_closes[-1] > sma7 > sma20 else "BEAR" if h_closes[-1] < sma7 < sma20 else "CHOP"})
+            higher.update({"atr_1h": round(_atr(h_highs, h_lows, h_closes), 6), "rsi_1h": round(_rsi(h_closes), 2), "adx_1h": round(adx_1h, 2), "plus_di_1h": round(plus_di_1h, 2), "minus_di_1h": round(minus_di_1h, 2), "ema20_slope_1h_pct": round((ema20_now / ema20_previous - 1) * 100, 6) if ema20_previous else 0.0, "ema50_slope_1h_pct": round((ema50_now / ema50_previous - 1) * 100, 6) if ema50_previous else 0.0, "efficiency_ratio_1h": round(efficiency_ratio, 4), "velocity_1h": round(velocity, 8), "acceleration_1h": round(acceleration, 8), "calculus_1h": calculus_1h, "continuation_prob_pct": calculus_1h["probability_theory"]["continuation_prob_pct"], "breakdown_prob_pct": calculus_1h["probability_theory"]["breakdown_prob_pct"], "recent_1h": [[float(x.get("o") or 0), float(x.get("h") or 0), float(x.get("l") or 0), float(x.get("c") or 0), float(x.get("v") or 0)] for x in reversed(higher_rows[-12:])], "sma7_1h": round(sma7, 8), "sma20_1h": round(sma20, 8), "structure_1h": "BULL" if h_closes[-1] > sma7 > sma20 else "BEAR" if h_closes[-1] < sma7 < sma20 else "CHOP"})
         else:
             sma5 = sum(h_closes[-5:]) / 5
             sma12 = sum(h_closes[-12:]) / 12
-            higher.update({"macro_4h": "BULL" if h_closes[-1] > sma5 > sma12 else "BEAR" if h_closes[-1] < sma5 < sma12 else "RANGE", "recent_4h": [[float(x.get("o") or 0), float(x.get("h") or 0), float(x.get("l") or 0), float(x.get("c") or 0), float(x.get("v") or 0)] for x in reversed(higher_rows[-8:])], "sma5_4h": round(sma5, 8), "sma12_4h": round(sma12, 8)})
+            higher.update({"macro_4h": "4H_MACRO_BULL" if h_closes[-1] > sma5 > sma12 else "4H_MACRO_BEAR" if h_closes[-1] < sma5 < sma12 else "4H_MACRO_RANGE", "recent_4h": [[float(x.get("o") or 0), float(x.get("h") or 0), float(x.get("l") or 0), float(x.get("c") or 0), float(x.get("v") or 0)] for x in reversed(higher_rows[-8:])], "sma5_4h": round(sma5, 8), "sma12_4h": round(sma12, 8)})
 
     ticker = ticker or {}
-    return {"contract": contract, "last": closes[-1], "ema20": _ema(closes[-80:], 20), "ema50": _ema(closes[-120:], 50), "rsi14": round(_rsi(closes), 2), "atr14": round(atr_15m, 6), "atr_15m": round(atr_15m, 6), "change_24h_pct": round((closes[-1] / closes[max(0, len(closes)-96)] - 1) * 100, 4), "vwap_bias_pct": round((closes[-1] - vwap) / vwap * 100, 4) if vwap else 0.0, "volume_ratio": round(volumes[-1] / volume_baseline, 4) if volume_baseline else 1.0, "obv_flow": "BULL_FLOW" if obv > 0 else "BEAR_FLOW" if obv < 0 else "NEUTRAL", "funding_rate": float(ticker.get("funding_rate") or ticker.get("funding_rate_indicative") or 0), "open_interest_contracts": float(ticker.get("total_size") or 0), "calculus": {"valid": True, "regime": "POSITIVE_MOMENTUM" if impulse > 0 else "NEGATIVE_MOMENTUM" if impulse < 0 else "RANGE_LOW_VELOCITY", "quality": 1.0, "velocity": mean_return, "acceleration": jerk, "impulse": impulse, "max_abs_jerk": abs(jerk), "definite_integrals": {"energy_integral": energy_integral, "deviation_area_integral": deviation_area, "volume_action_integral": volume_action}, "probability_theory": {"skewness": skewness, "kurtosis": kurtosis, "continuation_prob_pct": round(sum(value > 0 for value in returns_15m[-20:]) / min(20, len(returns_15m)) * 100, 2) if returns_15m else 50.0, "breakdown_prob_pct": round(sum(value < 0 for value in returns_15m[-20:]) / min(20, len(returns_15m)) * 100, 2) if returns_15m else 50.0, "var_95_pct": var_95, "cvar_95_pct": cvar_95}}, "recent_15m": [[float(x.get("o") or 0), float(x.get("h") or 0), float(x.get("l") or 0), float(x.get("c") or 0), float(x.get("v") or 0)] for x in reversed(rows[-12:])], **higher}
+    quote_price = float(ticker.get("mark_price") or ticker.get("last") or ticker.get("highest_bid") or ticker.get("lowest_ask") or 0)
+    if quote_price > 0 and abs(closes[-1] - quote_price) / quote_price > GATE_MARKET_DATA_MAX_DIVERGENCE:
+        raise RuntimeError(f"Gate candle/ticker divergence exceeds {GATE_MARKET_DATA_MAX_DIVERGENCE:.1%} for {contract}")
+    latest_15m_start = float(rows[-1].get("t"))
+    if latest_15m_start > 10_000_000_000:
+        latest_15m_start /= 1000
+    feature = {"contract": contract, "last": closes[-1], "ema20": _ema(closes[-80:], 20), "ema50": _ema(closes[-120:], 50), "rsi14": round(_rsi(closes), 2), "atr14": round(atr_15m, 6), "atr_15m": round(atr_15m, 6), "change_24h_pct": round((closes[-1] / closes[max(0, len(closes)-96)] - 1) * 100, 4), "vwap_bias_pct": round((closes[-1] - vwap) / vwap * 100, 4) if vwap else 0.0, "volume_ratio": round(volumes[-1] / volume_baseline, 4) if volume_baseline else 1.0, "obv_flow": "BULL_FLOW" if obv > 0 else "BEAR_FLOW" if obv < 0 else "NEUTRAL", "funding_rate": float(ticker.get("funding_rate") or ticker.get("funding_rate_indicative") or 0), "open_interest_contracts": float(ticker.get("total_size") or 0), "calculus": calculus_15m, "latest_closed_15m_at_ms": int((latest_15m_start + 15 * 60) * 1000), "recent_15m": [[float(x.get("o") or 0), float(x.get("h") or 0), float(x.get("l") or 0), float(x.get("c") or 0), float(x.get("v") or 0)] for x in reversed(rows[-12:])], **higher}
+    feature["market_regime"] = classify_market_regime(feature)
+    return feature
 
 
 def _strategy_package(feature: dict, ticker: dict | None = None) -> dict:
@@ -864,16 +1222,18 @@ def _strategy_package(feature: dict, ticker: dict | None = None) -> dict:
     ticker = ticker or {}
     inst = feature["contract"].replace("_USDT", "-USDT-SWAP")
     calculus = feature.get("calculus") or {}
-    calc_1h = {"velocity": feature.get("velocity_1h", 0), "acceleration": feature.get("acceleration_1h", 0), "impulse": calculus.get("impulse", 0), "jerk": calculus.get("max_abs_jerk", 0), "regime": calculus.get("regime", "GATE_NATIVE"), "definite_integrals": calculus.get("definite_integrals", {}), "probability_theory": calculus.get("probability_theory", {})}
+    raw_calc_1h = feature.get("calculus_1h") or {}
+    calc_1h = {**raw_calc_1h, "velocity": feature.get("velocity_1h", raw_calc_1h.get("velocity", 0)), "acceleration": feature.get("acceleration_1h", raw_calc_1h.get("acceleration", 0)), "jerk": raw_calc_1h.get("max_abs_jerk", 0)}
+    primary_calculus = calc_1h if calc_1h.get("valid") else calculus
     return {
         "instId": inst, "name": feature["contract"], "type": "crypto", "precision": ticker.get("order_price_round", ""),
         "price": feature["last"], "chg24h": feature["change_24h_pct"], "bidPx": float(ticker.get("highest_bid") or feature["last"]), "askPx": float(ticker.get("lowest_ask") or feature["last"]),
         "fundingRate": feature.get("funding_rate", 0), "oiUsd": feature.get("open_interest_contracts", 0), "lsRatio": "N/A", "takerNetUsd": "N/A",
         "atr": feature.get("atr_1h", feature.get("atr14", 0)), "atr_15m": feature.get("atr_15m", 0), "atr_1h": feature.get("atr_1h", 0),
         "rsi": feature.get("rsi14", 50), "rsi_15m": feature.get("rsi14", 50), "rsi_1h": feature.get("rsi_1h", 50), "vwap_bias": feature.get("vwap_bias_pct", 0),
-        "vol_ratio": feature.get("volume_ratio", 1), "obv_flow": feature.get("obv_flow", "NEUTRAL"), "adx_1h": feature.get("adx_1h", 0), "structure_1h": feature.get("structure_1h", "CHOP"), "macro_4h": feature.get("macro_4h", "RANGE"),
+        "vol_ratio": feature.get("volume_ratio", 1), "obv_flow": feature.get("obv_flow", "NEUTRAL"), "adx_1h": feature.get("adx_1h", 0), "plus_di_1h": feature.get("plus_di_1h", 0), "minus_di_1h": feature.get("minus_di_1h", 0), "ema20_slope_1h_pct": feature.get("ema20_slope_1h_pct", 0), "ema50_slope_1h_pct": feature.get("ema50_slope_1h_pct", 0), "efficiency_ratio_1h": feature.get("efficiency_ratio_1h", 0), "structure_1h": feature.get("structure_1h", "CHOP"), "macro_4h": feature.get("macro_4h", "4H_MACRO_RANGE"), "market_regime": feature.get("market_regime") or classify_market_regime(feature),
         "smart_money": {"weighted_long_pct": 50.0, "net_flow_usdt": "N/A", "avg_long_entry": "--", "avg_short_entry": "--", "top_win_rate": "N/A"},
-        "calculus": {**calculus, "valid": True, "regime": calculus.get("regime", "GATE_NATIVE"), "quality": calculus.get("quality", 1.0), "velocity": feature.get("velocity_1h", 0), "acceleration": feature.get("acceleration_1h", 0), "probability_theory": {**calculus.get("probability_theory", {}), "continuation_prob_pct": feature.get("continuation_prob_pct", 0), "breakdown_prob_pct": feature.get("breakdown_prob_pct", 0)}, "timeframes": {"1H": calc_1h}}, "data_quality": "valid",
+        "calculus": {**primary_calculus, "valid": bool(primary_calculus.get("valid")), "timeframes": {"15M": calculus, "1H": calc_1h}}, "data_quality": "valid",
         "recent_15m": feature.get("recent_15m", []), "recent_1h": feature.get("recent_1h", []), "recent_4h": feature.get("recent_4h", []),
     }
 
@@ -1111,7 +1471,11 @@ def run_cycle() -> dict:
         })
         reconciliation["safe_for_new_risk"] = False
     equity = float(private_context["account"].get("total") or private_context["account"].get("available") or 0)
-    daily_loss = daily_loss_state(LEDGER, max_loss_usd=settings.max_daily_loss_usd, max_loss_ratio=settings.max_daily_loss_ratio, equity=equity)
+    daily_loss = daily_loss_state(
+        LEDGER, max_loss_usd=settings.max_daily_loss_usd,
+        max_loss_ratio=settings.max_daily_loss_ratio, equity=equity,
+        reset_path=DAILY_LOSS_RESET, environment=settings.environment,
+    )
     cooldowns = {symbol: cooldown_state(LEDGER, cooldown_seconds=settings.stop_cooldown_seconds, contract=symbol) for symbol in SYMBOLS}
     cooldown = {"active": False, "remaining_seconds": 0, "reason": "per_contract", "contracts": cooldowns}
     safety_status = {
@@ -1286,7 +1650,7 @@ def run_cycle() -> dict:
                        "每个合约应独立判断；某个合约等待二次报价确认或被风控拒绝，不代表其他合格合约必须观望。")
         except Exception:
             prompt = ('Output ONLY one compact final JSON object with top-level keys decisions, position_management, pending_orders_management. '
-                      f'The decisions object must contain all six contracts and each item must include action BUY_LONG|SELL_SHORT|WAIT, confidence 0-100, entry_price, take_profit_price, stop_loss_price, leverage={settings.leverage:g}, margin_usdt (positive and <= {settings.max_order_margin_usd:.2f}), summary_reason'
+                      f'The decisions object must contain all six contracts and each item must include direction_bias LONG|SHORT|NEUTRAL, action BUY_LONG|SELL_SHORT|WAIT, confidence 0-100, entry_price, take_profit_price, stop_loss_price, leverage={settings.leverage:g}, margin_usdt (positive and <= {settings.max_order_margin_usd:.2f}), summary_reason'
                       + (', and entry_intent immediate|retracement|breakout. ' if settings.entry_intent_enabled else '. ')
                       + f'Active Gate risk profile={risk_profile.label}: confidence>={risk_profile.min_confidence:g}%, DOGE>={risk_profile.doge_min_confidence:g}%, ADX>={risk_profile.min_adx:g}, R:R>={risk_profile.min_rr:g}, target R:R>={risk_profile.target_rr:g}, effective per-order margin cap={settings.max_order_margin_usd * risk_profile.margin_ratio:.2f} USDT, total margin cap={settings.max_total_margin_usd:.2f} USDT, max actual entries this cycle={settings.max_entries_per_cycle}. Different Gate contracts may be held concurrently and an active contract may be added to only in the same direction, subject to aggregate limits and complete TP/SL coverage. A deferred or rejected symbol must not force unrelated qualified symbols to WAIT. '
                       'position_management actions are HOLD|CLOSE_MARKET|UPDATE_SL; pending_orders_management actions are KEEP|CANCEL. '
@@ -1339,7 +1703,8 @@ def run_cycle() -> dict:
             accepted_margin = max(0.0, min(raw_margin, effective_margin_cap, available))
             entry_intent = str(item.get("entry_intent") or "").lower()
             intent_valid = candidate == "WAIT" or not settings.entry_intent_enabled or entry_intent in ENTRY_INTENTS
-            decisions[feature["contract"]] = {"action": candidate if intent_valid else "WAIT", "raw_action": candidate, "confidence": max(0.0, min(100.0, float(item.get("confidence") or 0))), "entry_intent": entry_intent if candidate != "WAIT" else "", "entry_price": float(item.get("entry_price") or feature["last"]) if candidate != "WAIT" and intent_valid else 0.0, "take_profit_price": float(item.get("take_profit_price") or 0) if intent_valid else 0.0, "stop_loss_price": float(item.get("stop_loss_price") or 0) if intent_valid else 0.0, "leverage": settings.leverage, "margin_usdt": accepted_margin, "margin_usd": accepted_margin, "summary_reason": str(item.get("summary_reason") or "LLM decision"), **({"rejection_reason": "AI 未返回合法 entry_intent，已安全转为观望"} if not intent_valid else {})}
+            regime = feature.get("market_regime") or classify_market_regime(feature)
+            decisions[feature["contract"]] = {"direction_bias": normalize_direction_bias(item.get("direction_bias"), candidate), "market_regime": str(regime.get("name") or "TRANSITION"), "action": candidate if intent_valid else "WAIT", "raw_action": candidate, "confidence": max(0.0, min(100.0, float(item.get("confidence") or 0))), "entry_intent": entry_intent if candidate != "WAIT" else "", "entry_price": float(item.get("entry_price") or feature["last"]) if candidate != "WAIT" and intent_valid else 0.0, "take_profit_price": float(item.get("take_profit_price") or 0) if intent_valid else 0.0, "stop_loss_price": float(item.get("stop_loss_price") or 0) if intent_valid else 0.0, "leverage": settings.leverage, "margin_usdt": accepted_margin, "margin_usd": accepted_margin, "summary_reason": str(item.get("summary_reason") or "LLM decision"), **({"rejection_reason": "AI 未返回合法 entry_intent，已安全转为观望"} if not intent_valid else {})}
         llm_source = "gate-multifactor-llm"
         if model_telemetry:
             model_telemetry.finish("success", response.json(), output_chars=len(content or reasoning))
@@ -1357,8 +1722,7 @@ def run_cycle() -> dict:
     # Apply the inherited deterministic quote gate before selecting a candidate.
     try:
         from .strategy_adapter import validate_decision
-        active_positions = {str(p.get("contract")): p for p in private_context["positions"] if float(p.get("size") or 0) != 0}
-        active_sides = {symbol: "long" if float(position.get("size") or 0) > 0 else "short" for symbol, position in active_positions.items()}
+        active_inst_ids, active_sides = _active_position_context(private_context["positions"])
         for symbol, envelope in decisions_payload.items():
             item = envelope["decision"]
             if item.get("action") == "WAIT":
@@ -1368,7 +1732,7 @@ def run_cycle() -> dict:
             item["stop_loss_price"] = float(item.get("stop_loss_price") or item.get("stop_loss") or 0)
             item["entry_price"] = float(item.get("entry_price") or 0)
             package = {**envelope["indicators"], "instId": symbol, "data_quality": "valid", "macro_4h": envelope["indicators"].get("macro_4h", "RANGE")}
-            gated, reason, rr = validate_decision(package, item, active_inst_ids=set(active_positions), active_position_sides=active_sides, risk_snapshot=risk_snapshot)
+            gated, reason, rr = validate_decision(package, item, active_inst_ids=active_inst_ids, active_position_sides=active_sides, risk_snapshot=risk_snapshot)
             item["risk_reward_ratio"] = rr
             if gated == "WAIT":
                 item["rejection_reason"] = reason
@@ -1390,8 +1754,15 @@ def run_cycle() -> dict:
             settings,
         )
     result: dict = {"trade": {"status": "not_submitted", "reason": f"Gate {settings.environment.title()} automatic execution is disabled" if not execution_enabled else f"No qualifying {settings.environment.title()} signal"}}
-    executable = [d for d in decisions_payload.values() if d["decision"].get("action") in {"BUY_LONG", "SELL_SHORT"} and float(d["decision"].get("confidence") or 0) >= risk_profile.min_confidence]
     confirmed_requotes = _confirm_pending_requotes(pending_requotes, decisions_payload, min_confidence=risk_profile.min_confidence, now_ms=now)
+    executable_by_symbol = {
+        str(d["instId"]): d for d in decisions_payload.values()
+        if d["decision"].get("action") in {"BUY_LONG", "SELL_SHORT"}
+        and float(d["decision"].get("confidence") or 0) >= risk_profile.min_confidence
+    }
+    for confirmed_candidate in _confirmed_requote_candidates(confirmed_requotes, decisions_payload):
+        executable_by_symbol[str(confirmed_candidate["instId"])] = confirmed_candidate
+    executable = list(executable_by_symbol.values())
     executable, quote_blocks = _preflight_candidate_quotes(client, executable, pending_requotes, confirmed_requotes, now_ms=now, entry_intent_enabled=settings.entry_intent_enabled)
     if breakout_kept_contracts:
         executable = [row for row in executable if str(row.get("instId") or "") not in breakout_kept_contracts]
@@ -1414,10 +1785,17 @@ def run_cycle() -> dict:
             if not isinstance(instruction, dict):
                 continue
             contract_name = str(instruction.get("contract") or instruction.get("instId") or "").upper().replace("-USDT-SWAP", "_USDT").replace("-", "_")
-            current = next((p for p in private_context["positions"] if str(p.get("contract") or "").upper() == contract_name and float(p.get("size") or 0) != 0), None)
-            if not current:
+            matching = [p for p in private_context["positions"] if str(p.get("contract") or "").upper() == contract_name and float(p.get("size") or 0) != 0]
+            if not matching:
                 continue
             mgmt_action = str(instruction.get("action") or "HOLD").upper()
+            if len(matching) != 1:
+                management_result["positions"].append({
+                    "contract": contract_name, "action": mgmt_action,
+                    "error": "同合约存在多个活动方向，管理指令未指定唯一持仓，已安全忽略",
+                })
+                continue
+            current = matching[0]
             try:
                 if mgmt_action == "CLOSE_MARKET":
                     management_result["positions"].append({"contract": contract_name, "action": mgmt_action, "result": GateTradingService(client, RiskLimits(settings.max_position_notional_usd, settings.max_total_margin_usd, settings.max_order_margin_usd)).close_position_safely(contract=contract_name, client_id=f"t-gate-close-{now}", position_mode=str(current.get("mode") or ""))})
@@ -1478,6 +1856,18 @@ def run_cycle() -> dict:
             "baseline_notional": _portfolio_position_notional(client, fresh_positions),
             "reserved_margin": sum(float(row.get("estimated_margin_usdt") or 0) for row in pending_executions if str(row.get("status") or "") == "awaiting_trigger" and str(row.get("contract") or "") in breakout_kept_contracts),
             "reserved_notional": sum(float(row.get("order_notional_usdt") or 0) for row in pending_executions if str(row.get("status") or "") == "awaiting_trigger" and str(row.get("contract") or "") in breakout_kept_contracts),
+            "directional_reservations": [
+                {"contract": str(row.get("contract") or ""),
+                 "side": "long" if str(row.get("entry_action") or "") == "BUY_LONG" else "short"}
+                for row in pending_executions
+                if str(row.get("status") or "") == "awaiting_trigger"
+                and str(row.get("contract") or "") in breakout_kept_contracts
+            ] + [
+                {"contract": str(row.get("contract") or ""),
+                 "side": "long" if float(row.get("size") or 0) > 0 else "short"}
+                for row in private_context["pending_orders"]
+                if isinstance(row, dict) and float(row.get("size") or 0) != 0
+            ],
         }
         def execute_candidate(candidate, sequence):
             return _execute_entry_candidate(
