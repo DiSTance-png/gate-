@@ -303,6 +303,76 @@ def test_enabling_live_requires_confirmation_and_read_only_probe(monkeypatch):
     assert persisted["GATE_TESTNET_EXECUTE_TRADES"] == "false"
 
 
+def test_updating_risk_profile_and_leverage_while_live_stays_on_does_not_require_confirmation(monkeypatch):
+    import gate_quant.web as web
+
+    persisted = {}
+    monkeypatch.setattr(web, "_require_control_admin", lambda token: {"username": "tester"})
+    monkeypatch.setattr(web, "_update_env", lambda values: persisted.update(values))
+    monkeypatch.setattr(web, "_save_gate_secrets", lambda values: None)
+    monkeypatch.setattr(web, "_stored_gate_credential", lambda name: "live-key" if name.endswith("KEY") else "live-secret")
+    monkeypatch.setattr(web.store, "add", lambda *args, **kwargs: None)
+    monkeypatch.setattr(web, "load_settings", lambda: configured_settings(
+        environment="live",
+        public_market_environment="live",
+        live_trading_enabled=True,
+        api_key="live-key",
+        api_secret="live-secret",
+        risk_profile="standard",
+        leverage=3,
+    ))
+    monkeypatch.setattr(web, "GateFuturesClient", lambda settings: (_ for _ in ()).throw(AssertionError("already-live risk save must not probe the private account")))
+    payload = web.GateAdminConfig(
+        environment="live",
+        live_trading_enabled=True,
+        risk_profile="aggressive",
+        leverage=10,
+        max_entries_per_cycle=2,
+        max_position_notional_usd=1000,
+        max_total_margin_usd=100,
+        max_order_margin_usd=25,
+    )
+    result = web.gate_admin_config(payload, None)
+    assert result["updated"] is True
+    assert persisted["GATE_RISK_PROFILE"] == "aggressive"
+    assert persisted["GATE_LEVERAGE"] == "10.0"
+    assert persisted["GATE_LIVE_TRADING_ENABLED"] == "true"
+    assert persisted["GATE_MAX_ENTRIES_PER_CYCLE"] == "2"
+
+
+def test_live_off_risk_save_does_not_enable_live_or_require_confirmation(monkeypatch):
+    import gate_quant.web as web
+
+    persisted = {}
+    monkeypatch.setattr(web, "_require_control_admin", lambda token: {"username": "tester"})
+    monkeypatch.setattr(web, "_update_env", lambda values: persisted.update(values))
+    monkeypatch.setattr(web, "_save_gate_secrets", lambda values: None)
+    monkeypatch.setattr(web.store, "add", lambda *args, **kwargs: None)
+    monkeypatch.setattr(web, "load_settings", lambda: configured_settings(
+        environment="live",
+        public_market_environment="live",
+        live_trading_enabled=False,
+        api_key="live-key",
+        api_secret="live-secret",
+        risk_profile="aggressive",
+        leverage=10,
+    ))
+    payload = web.GateAdminConfig(
+        environment="live",
+        live_trading_enabled=False,
+        risk_profile="aggressive",
+        leverage=8,
+        max_entries_per_cycle=1,
+        max_position_notional_usd=1000,
+        max_total_margin_usd=100,
+        max_order_margin_usd=25,
+    )
+    web.gate_admin_config(payload, None)
+    assert persisted["GATE_RISK_PROFILE"] == "aggressive"
+    assert persisted["GATE_LEVERAGE"] == "8.0"
+    assert persisted["GATE_LIVE_TRADING_ENABLED"] == "false"
+
+
 def test_environment_switch_is_blocked_when_current_environment_has_risk(monkeypatch):
     import gate_quant.web as web
 

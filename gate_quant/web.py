@@ -1024,7 +1024,10 @@ def gate_admin_config(payload: GateAdminConfig, x_gate_session: str | None = Hea
         raise HTTPException(400, "Testnet 环境不能同时启用 Live 交易")
     if payload.environment == "live" and payload.testnet_execute_trades:
         raise HTTPException(400, "Live 环境不能同时启用 Testnet 自动交易")
-    if payload.live_trading_enabled and (payload.live_confirmation or "").strip().upper() != "ENABLE GATE LIVE":
+    current_settings = load_settings()
+    currently_live = bool(current_settings.environment == "live" and current_settings.live_trading_enabled)
+    enabling_live = bool(payload.live_trading_enabled and not currently_live)
+    if enabling_live and (payload.live_confirmation or "").strip().upper() != "ENABLE GATE LIVE":
         raise HTTPException(400, "开启 Gate Live 必须输入确认短语：ENABLE GATE LIVE")
     testnet_key = (payload.testnet_api_key or _stored_gate_credential("GATE_TESTNET_API_KEY")).strip()
     testnet_secret = (payload.testnet_api_secret or _stored_gate_credential("GATE_TESTNET_API_SECRET")).strip()
@@ -1034,7 +1037,6 @@ def gate_admin_config(payload: GateAdminConfig, x_gate_session: str | None = Hea
         raise HTTPException(400, "启用 Gate Testnet 自动交易前必须配置完整 Testnet Key/Secret")
     if payload.environment == "live" and payload.live_trading_enabled and not (live_key and live_secret):
         raise HTTPException(400, "启用 Gate Live 实盘前必须配置完整 Live Key/Secret")
-    current_settings = load_settings()
     if payload.environment != current_settings.environment:
         try:
             if _environment_risk_present(current_settings.environment):
@@ -1077,7 +1079,7 @@ def gate_admin_config(payload: GateAdminConfig, x_gate_session: str | None = Hea
         candidate.validate()
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    if payload.live_trading_enabled:
+    if enabling_live:
         try:
             account = GateFuturesClient(candidate).account() or {}
             if not isinstance(account, dict):
