@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useApi } from '../../composables/useApi'
 import { RefreshCw, Save, ShieldCheck, Wallet, OctagonAlert } from 'lucide-vue-next'
 const { api } = useApi()
@@ -7,6 +7,8 @@ const runtime = ref<any>({ risk: {}, credentials: {} }); const snapshot = ref<an
 const universe = ref<any>({ contracts: [], catalog: [], limits: { minimum: 1, maximum: 6 } })
 const selectedContracts = ref<string[]>([])
 const universeSearch = ref('')
+const universePage = ref(1)
+const universePageSize = 60
 const universePreview = ref<any>(null)
 const universeConfirmation = ref('')
 const form = reactive({ environment: 'testnet', testnet_api_key: '', testnet_api_secret: '', live_api_key: '', live_api_secret: '', testnet_execute_trades: false, live_trading_enabled: false, live_confirmation: '', proxy_url: '', risk_profile: 'standard', max_entries_per_cycle: 1, leverage: 3, max_position_notional_usd: 1000, max_total_margin_usd: 100, max_order_margin_usd: 25, entry_intent_enabled: false, max_entry_slippage_pct: 0.003, breakout_expiration_seconds: 840 })
@@ -17,8 +19,16 @@ function onEnvironmentChange(){ verifiedEnvironment.value=''; universePreview.va
 const filteredUniverseCatalog = computed(() => {
   const query = universeSearch.value.trim().toUpperCase()
   const rows = universe.value.catalog || []
-  return rows.filter((item:any) => !query || String(item.contract || '').includes(query)).slice(0, 80)
+  return rows.filter((item:any) => !query || String(item.contract || '').includes(query))
 })
+const universePageCount = computed(() => Math.max(1, Math.ceil(filteredUniverseCatalog.value.length / universePageSize)))
+const pagedUniverseCatalog = computed(() => {
+  const page = Math.min(universePage.value, universePageCount.value)
+  const start = (page - 1) * universePageSize
+  return filteredUniverseCatalog.value.slice(start, start + universePageSize)
+})
+watch(universeSearch, () => { universePage.value = 1 })
+watch(universePageCount, (count) => { if (universePage.value > count) universePage.value = count })
 const universeDirty = computed(() => {
   const current = [...(universe.value.contracts || [])].sort().join(',')
   return [...selectedContracts.value].sort().join(',') !== current
@@ -34,6 +44,7 @@ async function loadUniverse(){
   try {
     universe.value = await api('/api/v1/admin/gate/instruments')
     selectedContracts.value = [...(universe.value.contracts || [])]
+    universePage.value = 1
     universePreview.value = null; universeConfirmation.value = ''
   } catch (e:any) {
     message.value = `自选交易对目录加载失败：${e.message}`
@@ -165,9 +176,10 @@ onMounted(async()=>{await Promise.all([loadRuntime(),loadUniverse()])})
   <section class="panel p-4"><div class="title"><Wallet class="w-4 h-4 text-cyan-400"/><h2>AI 自选交易对（1–6 个）</h2></div>
     <p class="text-xs muted mb-3">当前生效环境：{{String(universe.environment||runtime.environment||'').toUpperCase()}}。修改后会同步 AI 决策合约、提示词标的、因子任务、行情矩阵、K 线选择和主页显示。取消币种前必须确认该币种无持仓、普通挂单、突破计划、保护单及未完成执行意图。</p>
     <div class="flex flex-wrap gap-2 mb-3"><button v-for="contract in selectedContracts" :key="contract" type="button" @click="toggleUniverse(contract)" class="px-2.5 py-1 rounded border text-xs font-mono text-cyan-300" style="border-color:var(--border-subtle)">{{contract.replace('_USDT','/USDT')}} ×</button><span v-if="!selectedContracts.length" class="text-xs text-red-300">至少保留 1 个交易对</span><span class="text-xs muted ml-auto">{{selectedContracts.length}} / 6</span></div>
-    <input v-model="universeSearch" class="input mb-3" placeholder="搜索 Gate USDT 永续合约，例如 XRP、LINK、BNB"/>
+    <input v-model="universeSearch" class="input mb-2" placeholder="搜索全部 Gate USDT 永续合约，例如 XRP、LINK、BNB"/>
+    <div class="flex flex-wrap items-center justify-between gap-2 mb-3 text-xs font-mono"><span class="muted">共 {{filteredUniverseCatalog.length}} 个合约 · 第 {{Math.min(universePage,universePageCount)}} / {{universePageCount}} 页</span><div class="flex gap-2"><button type="button" class="btn secondary" :disabled="universePage<=1" @click="universePage--">上一页</button><button type="button" class="btn secondary" :disabled="universePage>=universePageCount" @click="universePage++">下一页</button></div></div>
     <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 max-h-52 overflow-y-auto pr-1">
-      <button v-for="item in filteredUniverseCatalog" :key="item.contract" type="button" @click="toggleUniverse(item.contract)" class="p-2 rounded border text-left text-xs font-mono" :class="selectedContracts.includes(item.contract)?'text-emerald-300 border-emerald-500':'muted'" style="background:var(--bg-card-subtle)"><b>{{item.symbol}}/USDT</b><span class="block text-[10px] mt-1">最小 {{item.order_size_min}} 张 · {{item.enable_decimal?'支持小数张':'整数张'}}</span></button>
+      <button v-for="item in pagedUniverseCatalog" :key="item.contract" type="button" @click="toggleUniverse(item.contract)" class="p-2 rounded border text-left text-xs font-mono" :class="selectedContracts.includes(item.contract)?'text-emerald-300 border-emerald-500':'muted'" style="background:var(--bg-card-subtle)"><b>{{item.symbol}}/USDT</b><span class="block text-[10px] mt-1">最小 {{item.order_size_min}} 张 · {{item.enable_decimal?'支持小数张':'整数张'}}</span></button>
     </div>
     <div class="flex flex-wrap gap-2 mt-4"><button type="button" @click="previewUniverse" :disabled="loading || !universeEnvironmentReady || !universeDirty || selectedContracts.length<1 || selectedContracts.length>6" class="btn"><ShieldCheck class="w-4 h-4"/>预检并生成确认步骤</button><span v-if="!universeEnvironmentReady" class="text-xs text-amber-300 self-center">页面选择的环境尚未保存，请先保存并检测环境。</span><span v-else-if="!universeDirty" class="text-xs muted self-center">当前选择与运行配置一致</span></div>
     <div v-if="universePreview" class="mt-4 p-3 rounded border space-y-3 text-xs font-mono" style="border-color:var(--border-subtle);background:var(--bg-card-subtle)">
