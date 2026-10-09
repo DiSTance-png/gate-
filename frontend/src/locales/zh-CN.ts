@@ -147,7 +147,7 @@ export const zhCN = {
 
   // Instrument Matrix
   matrix: {
-    radarTitle: '六大主流标的微积分动力学全息雷达',
+    radarTitle: '自选交易对微积分动力学全息雷达',
     subTitle: '15M / 1H 动力学微分方程实时演进',
     velocity: '速度 v',
     acceleration: '加速度 a',

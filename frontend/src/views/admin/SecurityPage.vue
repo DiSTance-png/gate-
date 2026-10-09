@@ -4,11 +4,63 @@ import { useApi } from '../../composables/useApi'
 import { RefreshCw, Save, ShieldCheck, Wallet, OctagonAlert } from 'lucide-vue-next'
 const { api } = useApi()
 const runtime = ref<any>({ risk: {}, credentials: {} }); const snapshot = ref<any>(null); const loading = ref(false); const message = ref(''); const verifiedEnvironment = ref('')
+const universe = ref<any>({ contracts: [], catalog: [], limits: { minimum: 1, maximum: 6 } })
+const selectedContracts = ref<string[]>([])
+const universeSearch = ref('')
+const universePreview = ref<any>(null)
+const universeConfirmation = ref('')
 const form = reactive({ environment: 'testnet', testnet_api_key: '', testnet_api_secret: '', live_api_key: '', live_api_secret: '', testnet_execute_trades: false, live_trading_enabled: false, live_confirmation: '', proxy_url: '', risk_profile: 'standard', max_entries_per_cycle: 1, leverage: 3, max_position_notional_usd: 1000, max_total_margin_usd: 100, max_order_margin_usd: 25, entry_intent_enabled: false, max_entry_slippage_pct: 0.003, breakout_expiration_seconds: 840 })
 const selectedProfile = computed(() => (runtime.value.risk_profiles || []).find((p:any) => p.key === form.risk_profile) || {})
 const effectiveMargin = computed(() => Number(form.max_order_margin_usd || 0) * Number(selectedProfile.value.margin_ratio || 0))
 function onProfileChange(){ const max=Number(selectedProfile.value.max_leverage || 1); if(form.leverage>max) form.leverage=max; const entries=Number(selectedProfile.value.max_entries_per_cycle ?? 1); form.max_entries_per_cycle=Math.min(Number(form.max_entries_per_cycle||1),entries); if(entries===0){form.testnet_execute_trades=false;form.live_trading_enabled=false} }
-function onEnvironmentChange(){ verifiedEnvironment.value=''; if(form.environment==='testnet') form.live_trading_enabled=false; else form.testnet_execute_trades=false }
+function onEnvironmentChange(){ verifiedEnvironment.value=''; universePreview.value=null; universeConfirmation.value=''; if(form.environment==='testnet') form.live_trading_enabled=false; else form.testnet_execute_trades=false }
+const filteredUniverseCatalog = computed(() => {
+  const query = universeSearch.value.trim().toUpperCase()
+  const rows = universe.value.catalog || []
+  return rows.filter((item:any) => !query || String(item.contract || '').includes(query)).slice(0, 80)
+})
+const universeDirty = computed(() => {
+  const current = [...(universe.value.contracts || [])].sort().join(',')
+  return [...selectedContracts.value].sort().join(',') !== current
+})
+const universeEnvironmentReady = computed(() => String(universe.value.environment || '') === String(form.environment || ''))
+function toggleUniverse(contract: string) {
+  universePreview.value = null; universeConfirmation.value = ''
+  if (selectedContracts.value.includes(contract)) selectedContracts.value = selectedContracts.value.filter(x => x !== contract)
+  else if (selectedContracts.value.length < 6) selectedContracts.value = [...selectedContracts.value, contract]
+  else message.value = '自选交易对最多 6 个，请先取消一个'
+}
+async function loadUniverse(){
+  try {
+    universe.value = await api('/api/v1/admin/gate/instruments')
+    selectedContracts.value = [...(universe.value.contracts || [])]
+    universePreview.value = null; universeConfirmation.value = ''
+  } catch (e:any) {
+    message.value = `自选交易对目录加载失败：${e.message}`
+  }
+}
+async function previewUniverse(){
+  if(!universeEnvironmentReady.value){message.value='请先保存并检测当前交易环境，再修改该环境的自选交易对';return}
+  if(selectedContracts.value.length<1 || selectedContracts.value.length>6){message.value='请选择 1 至 6 个 Gate USDT 永续合约';return}
+  loading.value=true; message.value=`正在读取 Gate ${String(universe.value.environment||'').toUpperCase()} 持仓、挂单、计划单和保护单进行预检…`
+  try{
+    universePreview.value=await api('/api/v1/admin/gate/instruments/preview',{method:'POST',body:JSON.stringify({contracts:selectedContracts.value})})
+    universeConfirmation.value=''
+    message.value='✓ 预检通过。请核对新增/取消币种，并输入确认短语后应用。'
+  }catch(e:any){universePreview.value=null;message.value=`预检失败：${e.message}`}
+  finally{loading.value=false}
+}
+async function applyUniverse(){
+  if(!universePreview.value)return
+  if(!universeEnvironmentReady.value){message.value='交易环境已变化，请重新加载并预检自选交易对';return}
+  loading.value=true; message.value=`正在二次校验账户状态并原子更新 ${String(universe.value.environment||'').toUpperCase()} 交易对…`
+  try{
+    const result=await api('/api/v1/admin/gate/instruments/apply',{method:'POST',body:JSON.stringify({token:universePreview.value.token,confirmation:universeConfirmation.value})})
+    message.value=`✓ 自选交易对已更新：${(result.contracts||[]).join('、')}。主页立即刷新，下一轮 AI 决策按新配置运行。`
+    await loadUniverse(); await readAccount()
+  }catch(e:any){message.value=`应用失败，原配置未改变：${e.message}`}
+  finally{loading.value=false}
+}
 const RISK_FIELDS = ['risk_profile', 'max_entries_per_cycle', 'leverage', 'max_position_notional_usd', 'max_total_margin_usd', 'max_order_margin_usd', 'entry_intent_enabled', 'max_entry_slippage_pct', 'breakout_expiration_seconds'] as const
 function riskFieldEqual(key: string, left: any, right: any) {
   if (key === 'risk_profile') return String(left || '') === String(right || '')
@@ -67,7 +119,7 @@ async function save(){
     message.value='开启 Gate Live 前，请在页面内输入确认短语：ENABLE GATE LIVE'
     return
   }
-  loading.value=true; message.value='正在保存并执行只读连接检测…'; try{ await api('/api/v1/admin/gate/config',{method:'PUT',body:JSON.stringify(form)}); form.testnet_api_key=form.testnet_api_secret=form.live_api_key=form.live_api_secret=form.live_confirmation=''; await loadRuntime(); const result=await api('/api/v1/admin/gate/check'); verifiedEnvironment.value=result.ok&&result.environment===form.environment?result.environment:''; message.value=result.ok?`✓ 配置已保存，${result.detail}（${result.environment.toUpperCase()}），已解锁自动交易选项`:`配置已保存，但检测失败：${result.detail}` }catch(e:any){verifiedEnvironment.value=''; message.value=`保存失败：${e.message}`}finally{loading.value=false} }
+  loading.value=true; message.value='正在保存并执行只读连接检测…'; try{ await api('/api/v1/admin/gate/config',{method:'PUT',body:JSON.stringify(form)}); form.testnet_api_key=form.testnet_api_secret=form.live_api_key=form.live_api_secret=form.live_confirmation=''; await loadRuntime(); await loadUniverse(); const result=await api('/api/v1/admin/gate/check'); verifiedEnvironment.value=result.ok&&result.environment===form.environment?result.environment:''; message.value=result.ok?`✓ 配置已保存，${result.detail}（${result.environment.toUpperCase()}），已解锁自动交易选项`:`配置已保存，但检测失败：${result.detail}` }catch(e:any){verifiedEnvironment.value=''; message.value=`保存失败：${e.message}`}finally{loading.value=false} }
 async function confirmEnableLive(){
   if(verifiedEnvironment.value!=='live'){ message.value='请先通过当前 LIVE 私有 API 只读检测'; return }
   if(form.live_confirmation.trim()!=='ENABLE GATE LIVE'){ message.value='请输入完整确认短语：ENABLE GATE LIVE'; return }
@@ -100,7 +152,7 @@ async function stopAndFlattenTestnet(){
   } catch(e:any) { message.value = `✕ ${e.message}`; await loadRuntime() }
   finally { loading.value = false }
 }
-onMounted(loadRuntime)
+onMounted(async()=>{await Promise.all([loadRuntime(),loadUniverse()])})
 </script>
 <template><div class="p-4 sm:p-6 space-y-4 max-w-[1500px] mx-auto">
   <div class="flex items-center justify-between gap-3"><div><h1 class="text-lg font-black font-mono">Gate 账户与合约池</h1><p class="text-xs mt-1 muted">Gate Futures 原生 API · Testnet / Live 凭证完全隔离</p></div><span class="px-3 py-1.5 rounded border text-xs font-bold font-mono" :class="runtime.ready?'text-emerald-400':'text-amber-400'">{{runtime.ready?'READY':'NOT CONFIGURED'}}</span></div>
@@ -110,6 +162,21 @@ onMounted(loadRuntime)
     <label>Testnet API Key（{{runtime.credentials.testnet_configured?'已配置':'未配置'}}）<input v-model="form.testnet_api_key" @input="verifiedEnvironment=''" class="input" autocomplete="off"/></label><label>Testnet API Secret<input v-model="form.testnet_api_secret" @input="verifiedEnvironment=''" class="input" type="password" autocomplete="new-password"/><span class="text-amber-300">Gate Secret 只在创建/重置时显示一次；更换 Key 时必须同时填写对应 Secret，不能混用旧 Secret。</span></label>
     <label>Live API Key（{{runtime.credentials.live_configured?'已配置':'未配置'}}）<input v-model="form.live_api_key" @input="verifiedEnvironment=''" class="input" autocomplete="off"/></label><label>Live API Secret<input v-model="form.live_api_secret" @input="verifiedEnvironment=''" class="input" type="password" autocomplete="new-password"/></label>
   </div><template v-if="form.environment==='testnet'"><label class="testnet"><input v-model="form.testnet_execute_trades" type="checkbox" :disabled="loading || (!form.testnet_execute_trades && verifiedEnvironment!=='testnet')"/> 启用 Gate Testnet 自动交易（仅模拟盘）</label><span v-if="verifiedEnvironment!=='testnet'" class="block mt-2 text-xs font-mono text-amber-300">请先保存配置并通过当前 TESTNET 私有 API 只读检测，自动交易选项才会解锁。</span></template><div v-else class="live-control mt-4"><div class="flex flex-wrap items-center justify-between gap-2"><b class="text-xs font-mono text-red-300">Gate Live 自动交易</b><span class="px-2.5 py-1 rounded border text-xs font-bold font-mono" :class="runtime.live_trading_enabled?'text-red-300 border-red-500':'text-emerald-300 border-emerald-500'">{{runtime.live_trading_enabled?'LIVE 自动交易已确认开启':'LIVE 自动交易已关闭'}}</span></div><template v-if="!runtime.live_trading_enabled"><span v-if="verifiedEnvironment!=='live'" class="block mt-3 text-xs font-mono text-amber-300">请先保存配置并通过当前 LIVE 私有 API 只读检测，确认按钮才会解锁。</span><template v-else><label class="mt-3 text-xs font-mono text-red-300">Live 实盘确认短语<input v-model="form.live_confirmation" class="input" autocomplete="off" placeholder="ENABLE GATE LIVE"/><span>开启时服务端会再次执行 Live 账户只读检测，失败则保持关闭。</span></label><button type="button" @click="confirmEnableLive" :disabled="loading || form.live_confirmation.trim()!=='ENABLE GATE LIVE'" class="btn danger mt-3"><ShieldCheck class="w-4 h-4"/>确认并开启 Live 自动交易</button></template></template><template v-else><p class="mt-3 text-xs font-mono text-red-300">系统允许提交 Gate Live 实盘订单。关闭 Live 不会自动平仓。修改风险档位和杠杆请用下方「保存风险档位与杠杆」，不必重新输入确认短语。</p><button type="button" @click="disableLive" :disabled="loading" class="btn secondary mt-3"><OctagonAlert class="w-4 h-4"/>关闭 Live 自动交易</button></template></div></section>
+  <section class="panel p-4"><div class="title"><Wallet class="w-4 h-4 text-cyan-400"/><h2>AI 自选交易对（1–6 个）</h2></div>
+    <p class="text-xs muted mb-3">当前生效环境：{{String(universe.environment||runtime.environment||'').toUpperCase()}}。修改后会同步 AI 决策合约、提示词标的、因子任务、行情矩阵、K 线选择和主页显示。取消币种前必须确认该币种无持仓、普通挂单、突破计划、保护单及未完成执行意图。</p>
+    <div class="flex flex-wrap gap-2 mb-3"><button v-for="contract in selectedContracts" :key="contract" type="button" @click="toggleUniverse(contract)" class="px-2.5 py-1 rounded border text-xs font-mono text-cyan-300" style="border-color:var(--border-subtle)">{{contract.replace('_USDT','/USDT')}} ×</button><span v-if="!selectedContracts.length" class="text-xs text-red-300">至少保留 1 个交易对</span><span class="text-xs muted ml-auto">{{selectedContracts.length}} / 6</span></div>
+    <input v-model="universeSearch" class="input mb-3" placeholder="搜索 Gate USDT 永续合约，例如 XRP、LINK、BNB"/>
+    <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 max-h-52 overflow-y-auto pr-1">
+      <button v-for="item in filteredUniverseCatalog" :key="item.contract" type="button" @click="toggleUniverse(item.contract)" class="p-2 rounded border text-left text-xs font-mono" :class="selectedContracts.includes(item.contract)?'text-emerald-300 border-emerald-500':'muted'" style="background:var(--bg-card-subtle)"><b>{{item.symbol}}/USDT</b><span class="block text-[10px] mt-1">最小 {{item.order_size_min}} 张 · {{item.enable_decimal?'支持小数张':'整数张'}}</span></button>
+    </div>
+    <div class="flex flex-wrap gap-2 mt-4"><button type="button" @click="previewUniverse" :disabled="loading || !universeEnvironmentReady || !universeDirty || selectedContracts.length<1 || selectedContracts.length>6" class="btn"><ShieldCheck class="w-4 h-4"/>预检并生成确认步骤</button><span v-if="!universeEnvironmentReady" class="text-xs text-amber-300 self-center">页面选择的环境尚未保存，请先保存并检测环境。</span><span v-else-if="!universeDirty" class="text-xs muted self-center">当前选择与运行配置一致</span></div>
+    <div v-if="universePreview" class="mt-4 p-3 rounded border space-y-3 text-xs font-mono" style="border-color:var(--border-subtle);background:var(--bg-card-subtle)">
+      <div class="grid sm:grid-cols-2 gap-3"><div><b class="text-emerald-300">新增</b><p>{{universePreview.added?.length?universePreview.added.join('、'):'无'}}</p></div><div><b class="text-amber-300">取消</b><p>{{universePreview.removed?.length?universePreview.removed.join('、'):'无'}}</p></div></div>
+      <p class="text-emerald-300">✓ 已确认取消币种当前无持仓、挂单、计划单、保护单和未完成执行意图；应用时服务端还会二次校验。</p>
+      <label>确认短语<input v-model="universeConfirmation" class="input mt-1" autocomplete="off" :placeholder="universePreview.confirmation_phrase"/><span>请输入：{{universePreview.confirmation_phrase}}</span></label>
+      <button type="button" @click="applyUniverse" :disabled="loading || universeConfirmation.trim().toUpperCase()!==String(universePreview.confirmation_phrase||'').toUpperCase()" class="btn danger"><Save class="w-4 h-4"/>确认修改当前环境交易对</button>
+    </div>
+  </section>
   <section class="panel p-4 danger-panel"><div class="title"><OctagonAlert class="w-4 h-4 text-red-400"/><h2>Testnet 紧急停止</h2></div><p class="text-xs muted mb-3">关闭 Testnet 新增交易，撤销入场挂单，平掉当前 Testnet 持仓，并在 Gate 确认持仓归零后清理本系统保护单。不会切换到 Live。</p><button @click="stopAndFlattenTestnet" :disabled="loading || form.environment !== 'testnet'" class="btn danger"><OctagonAlert class="w-4 h-4"/>停止 Testnet 自动交易并平仓</button><span v-if="form.environment !== 'testnet'" class="text-xs text-amber-300 ml-3">请先切换到 Gate Testnet</span></section>
   <section v-if="runtime.safety_status?.daily_loss?.tripped" class="panel p-4 danger-panel"><div class="title"><OctagonAlert class="w-4 h-4 text-red-400"/><h2>日亏损熔断</h2></div><p class="text-xs muted mb-3">已实现亏损 {{Number(runtime.safety_status.daily_loss.loss_usd || 0).toFixed(4)}} USDT，超过当前上限 {{Number(runtime.safety_status.daily_loss.limit_usd || 0).toFixed(4)}} USDT。人工重置不会删除交易记录；仅忽略确认时刻之前的今日盈亏，之后从零重新累计，且今日不能再次重置。</p><button @click="resetDailyLoss" :disabled="loading" class="btn danger"><ShieldCheck class="w-4 h-4"/>人工确认并重置今日亏损基线</button></section>
   <section class="panel p-4"><div class="title"><ShieldCheck class="w-4 h-4 text-blue-400"/><h2>AI 风险档位与 Gate 执行参数</h2></div>

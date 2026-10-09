@@ -689,7 +689,7 @@ def construct_full_market_prompt(packages: List[Dict[str, Any]], pos_summary: st
 
 {memory_lessons}
 
-======================= 【六币种原生行情、技术指标与筹码矩阵】 =======================
+======================= 【当前自选交易对原生行情、技术指标与筹码矩阵】 =======================
 {all_market_str}
 
 ================================================================================
@@ -921,7 +921,7 @@ def execute_batch_ai_brain_cycle(
     usdt_available: float = None,
     policy_snapshot: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Fetch all six crypto symbols, call the LLM once, then persist an auditable result."""
+    """Analyze the configured trading pool in one LLM call and persist an auditable result."""
     base_url, api_key = get_cpa_client_config()
     if not api_key:
         print("[AI Brain Batch] Error: CPA API Key not found")

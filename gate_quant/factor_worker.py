@@ -5,9 +5,10 @@ import json
 import time
 from pathlib import Path
 
-from .ai_worker import SYMBOLS, _features, _strategy_package
+from .ai_worker import _features, _strategy_package
 from .client import GateFuturesClient
 from .config import load_settings
+from scripts.instrument_pool import configured_gate_contracts
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "data" / "factor_library_snapshot.json"
@@ -19,7 +20,7 @@ def run() -> dict:
     tickers = market.tickers() or []
     by_symbol = {str(row.get("contract")): row for row in tickers if isinstance(row, dict)}
     packages = []
-    for symbol in SYMBOLS:
+    for symbol in configured_gate_contracts():
         feature = _features(market, symbol, by_symbol.get(symbol))
         packages.append(_strategy_package(feature, by_symbol.get(symbol)))
     payload = {

@@ -137,9 +137,10 @@ def _heartbeat_findings(name: str, heartbeat: dict[str, Any], max_age_seconds: i
     )]
 
 
-def _decision_findings(decision: dict[str, Any], positions: list[dict[str, Any]], now_ms: int) -> list[dict[str, Any]]:
+def _decision_findings(decision: dict[str, Any], positions: list[dict[str, Any]], now_ms: int,
+                       required_contracts: list[str] | tuple[str, ...] | None = None) -> list[dict[str, Any]]:
     result = []
-    required = {"BTC_USDT", "ETH_USDT", "SOL_USDT", "DOGE_USDT", "SUI_USDT", "XRP_USDT"}
+    required = set(required_contracts or ("BTC_USDT", "ETH_USDT", "SOL_USDT", "DOGE_USDT", "SUI_USDT", "XRP_USDT"))
     generated_ms = _timestamp_ms(decision, "generated_at_ms")
     age = max(0, int((now_ms - generated_ms) / 1000)) if generated_ms else None
     if age is None or age > 20 * 60:
@@ -152,7 +153,7 @@ def _decision_findings(decision: dict[str, Any], positions: list[dict[str, Any]]
     missing = sorted(required - available)
     if missing:
         result.append(finding(
-            "decision_contracts_missing", severity="error", category="decision", title="六合约决策不完整",
+            "decision_contracts_missing", severity="error", category="decision", title="自选交易对决策不完整",
             detail="缺少合约决策：" + "、".join(missing), evidence={"missing_contracts": missing},
             suggestion="检查模型 JSON 输出和解析器，不得用旧决策补齐。",
         ))
@@ -344,13 +345,14 @@ def collect_anomalies(
     trader_heartbeat: dict[str, Any], reconciler_heartbeat: dict[str, Any], executions: list[dict[str, Any]],
     positions: list[dict[str, Any]], orders: list[dict[str, Any]], protections: list[dict[str, Any]],
     private_errors: list[str] | None = None, max_pending_age_seconds: int = 1800, now_ms: int | None = None,
+    required_contracts: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     now_ms = int(now_ms or time.time() * 1000)
     findings = []
     findings.extend(_job_findings(job_runs, now_ms))
     findings.extend(_heartbeat_findings("trader", trader_heartbeat, 20 * 60, now_ms))
     findings.extend(_heartbeat_findings("reconciler", reconciler_heartbeat, 120, now_ms))
-    findings.extend(_decision_findings(decision, positions, now_ms))
+    findings.extend(_decision_findings(decision, positions, now_ms, required_contracts))
     findings.extend(_cycle_failure_findings(decision))
     findings.extend(_execution_findings(executions, now_ms))
     exchange_findings, live_reconciliation = _exchange_findings(
@@ -473,6 +475,7 @@ def run_anomaly_audit(*, history_path: Path = ANOMALY_HISTORY_PATH) -> dict[str,
     from .execution_reconciler import JOURNAL_PATH
     from r20_gateway.publisher import DB_PATH
     from r20_gateway.store import GatewayStore
+    from scripts.instrument_pool import configured_gate_contracts
 
     settings = load_settings()
     clients = [GateFuturesClient(settings) for _ in range(3)]
@@ -500,6 +503,7 @@ def run_anomaly_audit(*, history_path: Path = ANOMALY_HISTORY_PATH) -> dict[str,
         protections=protections if isinstance(protections, list) else [],
         private_errors=sorted(set(error for error in (position_error, order_error, protection_error) if error)),
         max_pending_age_seconds=settings.max_pending_order_age_seconds,
+        required_contracts=configured_gate_contracts(),
     )
     return persist_anomaly_history(history_path, report)
 

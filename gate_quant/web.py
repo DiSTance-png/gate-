@@ -33,6 +33,7 @@ from .config import load_settings
 from .execution_journal import ExecutionJournal
 from .execution_reconciler import JOURNAL_PATH as EXECUTION_JOURNAL
 from .exchange_write_lock import gate_write_lock
+from .instrument_universe import create_preview as create_instrument_preview, apply_preview as apply_instrument_preview
 from .risk import RiskLimits
 from .service import GateTradingService, protection_coverage_status
 
@@ -69,6 +70,7 @@ from r20_gateway.supervisor import current_pid, _worker_lock_held
 from r20_gateway.agents import agent_statuses
 from r20_gateway.secrets import status as secret_store_status
 from r20_backend.version import __version__
+from scripts.instrument_pool import configured_gate_contracts, instrument_pool_revision, load_instruments
 
 DATA_DIR = ROOT / "data"
 DAILY_LOSS_RESET = DATA_DIR / "gate_daily_loss_reset.json"
@@ -332,12 +334,29 @@ class GateDailyLossResetRequest(BaseModel):
     confirmation: str = Field(min_length=1, max_length=64)
 
 
+class GateInstrumentPreviewRequest(BaseModel):
+    contracts: list[str] = Field(min_length=1, max_length=6)
+
+
+class GateInstrumentApplyRequest(BaseModel):
+    token: str = Field(min_length=16, max_length=128)
+    confirmation: str = Field(min_length=1, max_length=128)
+
+
 def _require_control_admin(token: str | None):
     from r20_backend.app import admin_auth
     user = admin_auth.validate_session(token or "")
     if not user:
         raise HTTPException(401, "管理员会话无效或已过期")
     return user
+
+
+def _trader_job_running() -> bool:
+    """Only the latest trader row is authoritative; stale history cannot lock edits forever."""
+    for row in GatewayStore(GATEWAY_DB_PATH).job_runs(30):
+        if str(row.get("job_name") or "") == "trader":
+            return str(row.get("status") or "") == "running"
+    return False
 
 
 def _update_env(values: dict[str, str]) -> None:
@@ -520,8 +539,8 @@ def health() -> dict[str, Any]:
 
 
 @app.get("/api/v1/market/tickers")
-def tickers(contracts: str = "BTC_USDT,ETH_USDT,SOL_USDT,DOGE_USDT"):
-    wanted = {v.strip().upper() for v in contracts.split(",") if v.strip()}
+def tickers(contracts: str = ""):
+    wanted = {v.strip().upper() for v in contracts.split(",") if v.strip()} or set(configured_gate_contracts())
     try:
         rows = market_client().tickers()
         return {"items": [row for row in rows if row.get("contract") in wanted], "source": "Gate Futures REST"}
@@ -609,7 +628,8 @@ def all_dashboard():
         age = max(0, int(time.time() - created)) if created else None
         expiration = int(trigger.get("expiration") or s.breakout_expiration_seconds)
         pending.append({"ordId": str(o.get("id_string") or o.get("id") or ""), "instId": initial.get("contract"), "name": initial.get("contract"), "side": "buy" if float(initial.get("size") or 0) > 0 else "sell", "posSide": "long" if float(initial.get("size") or 0) > 0 else "short", "px": str(initial.get("price") or "0"), "triggerPx": str(trigger.get("price") or "0"), "sz": str(abs(float(initial.get("size") or 0))), "state": "waiting_trigger", "cTime": str(int(created * 1000)) if created else "", "text": initial.get("text", ""), "order_kind": "breakout", "age_seconds": age, "expires_in_seconds": max(0, expiration - age) if age is not None else None})
-    dashboard_contracts = {"BTC_USDT", "ETH_USDT", "SOL_USDT", "DOGE_USDT", "SUI_USDT", "XRP_USDT"}
+    dashboard_contracts = configured_gate_contracts()
+    dashboard_contract_set = set(dashboard_contracts)
     account["initial_capital"] = s.initial_capital_usd or None
     factor_snapshot = _read_json_file("factor_library_snapshot.json", {})
     factor_instruments = factor_snapshot.get("instruments", []) if isinstance(factor_snapshot, dict) else []
@@ -621,9 +641,14 @@ def all_dashboard():
     profile = get_risk_profile(s.risk_profile)
     risk_snapshot = profile.snapshot(leverage=s.leverage, environment=s.environment)
     factors = []
-    for t in ticker_rows or []:
-        contract_name = str(t.get("contract") or "")
-        if contract_name not in dashboard_contracts:
+    ticker_map = {
+        str(row.get("contract") or ""): row
+        for row in (ticker_rows or [])
+        if isinstance(row, dict) and str(row.get("contract") or "") in dashboard_contract_set
+    }
+    for contract_name in dashboard_contracts:
+        t = ticker_map.get(contract_name)
+        if not t:
             continue
         snapshot = factor_map.get(contract_name, {})
         envelope = latest_decisions.get(contract_name, {}) if isinstance(latest_decisions, dict) else {}
@@ -648,7 +673,7 @@ def all_dashboard():
     )
     book_stats = _account_book_stats(account_book, ledger_rows)
     normalized_protections = _dashboard_protection_orders(protections_raw or [], positions_raw or [])
-    return {"timestamp": str(int(time.time() * 1000)), "is_stale": bool(errors), "account": {"total_eq": float(account.get("total") or 0), "avail_eq": float(account.get("available") or 0), "upl": float(account.get("unrealised_pnl") or 0), "currency": s.settle.upper(), "margin_usage_pct": 0, "initial_capital": s.initial_capital_usd or None}, "positions_summary": {"total_count": len(positions), "long_count": sum(p["side"] == "long" for p in positions), "short_count": sum(p["side"] == "short" for p in positions), "items": positions}, "pending_orders": pending, "trigger_entry_orders": trigger_entries_raw or [], "factors": factors, "factor_library": factor_snapshot, "macro_assessment": "Gate Futures 原生行情、因子与账户数据巡检中", "llm_runtime": {"model": os.getenv("LLM_MODEL", "Gate AI Worker"), "provider_name": "Gate-native", "reasoning_effort": os.getenv("LLM_REASONING_EFFORT", "high"), "api_format": "openai_chat"}, "logs": [f"Gate {s.environment.upper()} · {profile.label} · {s.leverage:g}x · 私有数据{'可用' if not errors else '未配置或不可用'}"], "trades": ledger_rows, "today_stats": book_stats, "news_intelligence": [], "protection_orders": protections_raw or [], "protection_orders_normalized": normalized_protections, "ai_brain_history": history_view, "risk_snapshot": risk_snapshot, "safety_status": _safety_status(), "gate_environment": s.environment, "gate_public_market_environment": s.public_market_environment, "errors": sorted(set(errors))}
+    return {"timestamp": str(int(time.time() * 1000)), "is_stale": bool(errors), "account": {"total_eq": float(account.get("total") or 0), "avail_eq": float(account.get("available") or 0), "upl": float(account.get("unrealised_pnl") or 0), "currency": s.settle.upper(), "margin_usage_pct": 0, "initial_capital": s.initial_capital_usd or None}, "positions_summary": {"total_count": len(positions), "long_count": sum(p["side"] == "long" for p in positions), "short_count": sum(p["side"] == "short" for p in positions), "items": positions}, "pending_orders": pending, "trigger_entry_orders": trigger_entries_raw or [], "factors": factors, "factor_library": factor_snapshot, "instrument_pool": {"contracts": dashboard_contracts, "revision": instrument_pool_revision()}, "macro_assessment": "Gate Futures 原生行情、因子与账户数据巡检中", "llm_runtime": {"model": os.getenv("LLM_MODEL", "Gate AI Worker"), "provider_name": "Gate-native", "reasoning_effort": os.getenv("LLM_REASONING_EFFORT", "high"), "api_format": "openai_chat"}, "logs": [f"Gate {s.environment.upper()} · {profile.label} · {s.leverage:g}x · 私有数据{'可用' if not errors else '未配置或不可用'}"], "trades": ledger_rows, "today_stats": book_stats, "news_intelligence": [], "protection_orders": protections_raw or [], "protection_orders_normalized": normalized_protections, "ai_brain_history": history_view, "risk_snapshot": risk_snapshot, "safety_status": _safety_status(), "gate_environment": s.environment, "gate_public_market_environment": s.public_market_environment, "errors": sorted(set(errors))}
 
 
 @app.get("/api/v1/contracts/{contract}")
@@ -1180,6 +1205,102 @@ def gate_admin_check(x_gate_session: str | None = Header(default=None, alias="X-
         return {"ok": False, "environment": s.environment, "detail": f"Gate 私有 API 检测失败：{exc}"}
 
 
+@app.get("/api/v1/admin/gate/instruments")
+def gate_admin_instruments(x_gate_session: str | None = Header(default=None, alias="X-R20-Session")):
+    """Return the confirmed live pool and Gate-native selectable USDT contracts."""
+    _require_control_admin(x_gate_session)
+    settings = load_settings()
+    try:
+        rows = market_client().contracts() or []
+        catalog = []
+        for row in rows if isinstance(rows, list) else []:
+            name = str(row.get("name") or "").upper()
+            if not name.endswith("_USDT") or bool(row.get("in_delisting")):
+                continue
+            catalog.append({
+                "contract": name,
+                "symbol": name[:-5],
+                "quanto_multiplier": row.get("quanto_multiplier"),
+                "order_size_min": row.get("order_size_min"),
+                "enable_decimal": bool(row.get("enable_decimal")),
+                "leverage_max": row.get("leverage_max"),
+            })
+        catalog.sort(key=lambda item: item["contract"])
+    except Exception as exc:
+        raise HTTPException(502, f"Gate 合约目录读取失败：{exc}") from exc
+    return {
+        "environment": settings.environment,
+        "live_trading_enabled": settings.live_trading_enabled,
+        "contracts": configured_gate_contracts(),
+        "instruments": load_instruments(),
+        "revision": instrument_pool_revision(),
+        "limits": {"minimum": 1, "maximum": 6},
+        "catalog": catalog,
+    }
+
+
+@app.post("/api/v1/admin/gate/instruments/preview")
+def gate_admin_instruments_preview(
+    payload: GateInstrumentPreviewRequest,
+    x_gate_session: str | None = Header(default=None, alias="X-R20-Session"),
+):
+    """Fail-closed preview: validate metadata and prove removed contracts are unmanaged."""
+    actor = _require_control_admin(x_gate_session)
+    settings = load_settings()
+    if _trader_job_running():
+        raise HTTPException(409, "AI 交易任务正在运行，请等待本轮结束后再修改自选交易对")
+    try:
+        preview = create_instrument_preview(
+            payload.contracts,
+            actor=str(actor.get("username") or "admin"),
+            environment=settings.environment,
+            market_client=market_client(),
+            private_client=client(),
+            execution_journal=ExecutionJournal(EXECUTION_JOURNAL),
+        )
+        store.add("gate.instruments.preview", {
+            "actor": actor.get("username"), "environment": settings.environment,
+            "added": preview["added"], "removed": preview["removed"],
+        })
+        return preview
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, f"Gate 标的池预检失败，配置未修改：{exc}") from exc
+
+
+@app.post("/api/v1/admin/gate/instruments/apply")
+def gate_admin_instruments_apply(
+    payload: GateInstrumentApplyRequest,
+    x_gate_session: str | None = Header(default=None, alias="X-R20-Session"),
+):
+    """Recheck all private state under the exchange write lock, then atomically apply."""
+    actor = _require_control_admin(x_gate_session)
+    settings = load_settings()
+    if _trader_job_running():
+        raise HTTPException(409, "AI 交易任务正在运行，请等待本轮结束后重新确认")
+    try:
+        with gate_write_lock():
+            result = apply_instrument_preview(
+                payload.token,
+                payload.confirmation,
+                actor=str(actor.get("username") or "admin"),
+                environment=settings.environment,
+                market_client=market_client(),
+                private_client=client(),
+                execution_journal=ExecutionJournal(EXECUTION_JOURNAL),
+            )
+        store.add("gate.instruments.apply", {
+            "actor": actor.get("username"), "environment": settings.environment,
+            "added": result["added"], "removed": result["removed"], "revision": result["revision"],
+        })
+        return result
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, f"Gate 标的池应用失败，原配置保持不变：{exc}") from exc
+
+
 @app.get("/api/v1/admin/gate/account-snapshot")
 def gate_account_snapshot(x_gate_session: str | None = Header(default=None, alias="X-R20-Session")):
     _require_control_admin(x_gate_session)
@@ -1201,7 +1322,7 @@ def gate_account_snapshot(x_gate_session: str | None = Header(default=None, alia
         effective_cap = s.max_order_margin_usd * profile.margin_ratio
         m = market_client()
         ticker_map = {str(row.get("contract")): row for row in (m.tickers() or []) if isinstance(row, dict)}
-        for contract_name in ("BTC_USDT", "ETH_USDT", "SOL_USDT", "DOGE_USDT", "SUI_USDT", "XRP_USDT"):
+        for contract_name in configured_gate_contracts():
             meta = m.contracts(contract_name) or {}
             ticker = ticker_map.get(contract_name, {})
             price = float(ticker.get("mark_price") or ticker.get("last") or 0)

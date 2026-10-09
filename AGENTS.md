@@ -70,7 +70,7 @@
 ## 决策与执行顺序
 
 1. Gateway 每 15 分钟启动 `gate_quant.ai_worker`。
-2. Worker 获取六合约行情、K 线、因子、账户、持仓、普通挂单和保护单。
+2. Worker 动态读取当前 1–6 个 Gate 自选交易对，获取其行情、K 线、因子以及账户、持仓、普通挂单和保护单。
 3. 先对交易所状态、日亏损和冷却进行安全巡检。
 4. Gate 数据通过 `strategy_adapter` 进入上游 R20 提示词和拦截器。
 5. AI 给出决策；系统再次执行确定性置信度、ADX、4H 方向、R:R、报价偏差和资金上限校验。
@@ -78,6 +78,8 @@
 7. `GATE_ENTRY_INTENT_ENABLED=false` 时维持旧 GTC 限价语义；启用后按 `immediate/retracement/breakout` 映射到受限 IOC、GTC 或 Gate 原生 `price_orders`，禁止根据价格位置猜测意图。
 8. `execution_reconciler` 每 10 秒只按已有客户端订单号查单；突破单先按计划单 ID/`text` 查找，再使用 Gate `trade_id` 接管触发后的订单，并按真实成交价重算保护。
 9. `sync_gate_ledger.py` 每 15 分钟读取 Gate `/position_close`，生成历史平仓台账。
+
+自选交易对修改必须使用 `gate_quant/instrument_universe.py` 的“预检 → 一次性确认短语 → Gate 写锁内二次校验 → 原子保存”流程。取消币种时必须确认没有持仓、普通挂单、突破计划、保护单或执行台账活动意图；不得自动平仓或撤单来迁就配置变更。AI 周期必须在下单前校验 `instrument_pool_revision`，配置中途变化时旧决策 fail-closed。
 
 同轮候选必须串行执行。保守、标准、积极档最多实际提交 1 单，激进档按 `GATE_MAX_ENTRIES_PER_CYCLE` 可提交 1 或 2 单。等待触发的突破单只占对应合约，但其潜在保证金和名义敞口必须预留；触发或撤单状态不明确时必须停止整轮。等待二次报价确认、冷却或确定性风控拒绝不得遮挡后续合格候选。
 

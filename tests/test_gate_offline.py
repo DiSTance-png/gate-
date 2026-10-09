@@ -745,13 +745,26 @@ def test_llm_parser_uses_reasoning_tail_and_requires_all_contracts():
     contracts = ("BTC_USDT", "ETH_USDT", "SOL_USDT", "DOGE_USDT", "SUI_USDT", "XRP_USDT")
     payload = {"decisions": {symbol: {"action": "WAIT", "confidence": 12} for symbol in contracts}}
     reasoning = "internal analysis {not-json}\nfinal answer:\n" + json.dumps(payload)
-    parsed = _extract_decision_object("", reasoning)
+    parsed = _extract_decision_object("", reasoning, required_symbols=contracts)
     assert parsed is not None
     assert set(parsed) == set(contracts)
-    assert _extract_decision_object(json.dumps({"decisions": {contracts[0]: {"action": "WAIT"}}}), "") is None
+    assert _extract_decision_object(json.dumps({"decisions": {contracts[0]: {"action": "WAIT"}}}), "", required_symbols=contracts) is None
     nested = {"position_management": {symbol: "HOLD" for symbol in contracts}, "pending_orders_management": {symbol: "KEEP" for symbol in contracts}}
-    assert _extract_response_object(json.dumps(nested), "") is None
+    assert _extract_response_object(json.dumps(nested), "", required_symbols=contracts) is None
     assert _as_instruction_list({"BTC_USDT": "HOLD", "ETH_USDT": {"action": "HOLD"}}) == [{"contract": "BTC_USDT", "action": "HOLD"}, {"contract": "ETH_USDT", "action": "HOLD"}]
+
+
+def test_old_ai_cycle_is_fail_closed_after_instrument_pool_change(monkeypatch):
+    from gate_quant import ai_worker
+    monkeypatch.setattr(ai_worker, "instrument_pool_revision", lambda: "new-revision")
+    result = ai_worker._execute_entry_candidate_locked(
+        object(), {"instId": "BTC_USDT"}, settings=object(), risk_profile=object(),
+        risk_snapshot={"instrument_pool_revision": "old-revision"}, policy_snapshot={},
+        confirmed_requotes={}, now_ms=1, sequence=0, risk_state={},
+    )
+    assert result["submitted"] is False
+    assert result["stop_cycle"] is True
+    assert "旧 AI 决策禁止下单" in result["trade"]["reason"]
 
 
 def test_gate_strategy_adapter_reuses_original_rr_gate():

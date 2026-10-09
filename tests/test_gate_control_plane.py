@@ -178,6 +178,105 @@ def test_gate_admin_routes_require_authentication(monkeypatch):
     assert response.status_code == 401
 
 
+def test_instrument_pool_preview_and_apply_routes_are_two_phase_and_offline(monkeypatch):
+    import gate_quant.web as web
+
+    actor = {"username": "tester"}
+    settings = configured_settings(environment="live", live_trading_enabled=True, public_market_environment="live")
+    preview = {
+        "token": "preview-token-1234567890",
+        "confirmation_phrase": "APPLY LIVE SYMBOLS ABC123",
+        "contracts": ["BTC_USDT", "SOL_USDT"],
+        "added": ["SOL_USDT"],
+        "removed": ["ETH_USDT"],
+    }
+    applied = {
+        "ok": True,
+        "contracts": ["BTC_USDT", "SOL_USDT"],
+        "added": ["SOL_USDT"],
+        "removed": ["ETH_USDT"],
+        "revision": "new-revision",
+    }
+    calls = []
+    monkeypatch.setattr(web, "_require_control_admin", lambda token: actor)
+    monkeypatch.setattr(web, "load_settings", lambda: settings)
+    monkeypatch.setattr(web, "_trader_job_running", lambda: False)
+    monkeypatch.setattr(web, "market_client", lambda: object())
+    monkeypatch.setattr(web, "client", lambda: object())
+    monkeypatch.setattr(web, "ExecutionJournal", lambda path: object())
+    monkeypatch.setattr(web, "gate_write_lock", lambda: nullcontext())
+    monkeypatch.setattr(web.store, "add", lambda *args, **kwargs: None)
+
+    def fake_preview(contracts, **kwargs):
+        calls.append(("preview", list(contracts), kwargs["environment"]))
+        return preview
+
+    def fake_apply(token, confirmation, **kwargs):
+        calls.append(("apply", token, confirmation, kwargs["environment"]))
+        return applied
+
+    monkeypatch.setattr(web, "create_instrument_preview", fake_preview)
+    monkeypatch.setattr(web, "apply_instrument_preview", fake_apply)
+
+    result_preview = web.gate_admin_instruments_preview(
+        web.GateInstrumentPreviewRequest(contracts=["BTC_USDT", "SOL_USDT"]), None,
+    )
+    result_apply = web.gate_admin_instruments_apply(
+        web.GateInstrumentApplyRequest(
+            token=preview["token"], confirmation=preview["confirmation_phrase"],
+        ), None,
+    )
+
+    assert result_preview == preview
+    assert result_apply == applied
+    assert calls == [
+        ("preview", ["BTC_USDT", "SOL_USDT"], "live"),
+        ("apply", preview["token"], preview["confirmation_phrase"], "live"),
+    ]
+
+
+def test_instrument_pool_routes_fail_closed_for_running_trader_or_bad_confirmation(monkeypatch):
+    import gate_quant.web as web
+
+    monkeypatch.setattr(web, "_require_control_admin", lambda token: {"username": "tester"})
+    monkeypatch.setattr(web, "load_settings", lambda: configured_settings())
+    monkeypatch.setattr(web, "_trader_job_running", lambda: True)
+    with pytest.raises(web.HTTPException) as running:
+        web.gate_admin_instruments_preview(web.GateInstrumentPreviewRequest(contracts=["BTC_USDT"]), None)
+    assert running.value.status_code == 409
+
+    monkeypatch.setattr(web, "_trader_job_running", lambda: False)
+    monkeypatch.setattr(web, "market_client", lambda: object())
+    monkeypatch.setattr(web, "client", lambda: object())
+    monkeypatch.setattr(web, "ExecutionJournal", lambda path: object())
+    monkeypatch.setattr(web, "gate_write_lock", lambda: nullcontext())
+    monkeypatch.setattr(
+        web, "apply_instrument_preview",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("确认短语必须精确匹配")),
+    )
+    with pytest.raises(web.HTTPException) as bad_confirmation:
+        web.gate_admin_instruments_apply(
+            web.GateInstrumentApplyRequest(token="preview-token-123456", confirmation="WRONG"), None,
+        )
+    assert bad_confirmation.value.status_code == 409
+    assert "确认短语" in bad_confirmation.value.detail
+
+
+def test_latest_trader_run_controls_instrument_edit_lock(monkeypatch):
+    import gate_quant.web as web
+
+    class Store:
+        def __init__(self, path): pass
+        def job_runs(self, limit):
+            return [
+                {"job_name": "trader", "status": "success"},
+                {"job_name": "trader", "status": "running"},
+            ]
+
+    monkeypatch.setattr(web, "GatewayStore", Store)
+    assert web._trader_job_running() is False
+
+
 def test_live_read_only_config_is_allowed_without_trading_switch(monkeypatch):
     import gate_quant.web as web
 

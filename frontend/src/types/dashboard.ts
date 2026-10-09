@@ -142,4 +142,8 @@ export interface DashboardResponse {
   review?: any
   ai_trading_memory_md?: string
   factor_library?: any
+  instrument_pool?: {
+    contracts: string[]
+    revision: string
+  }
 }

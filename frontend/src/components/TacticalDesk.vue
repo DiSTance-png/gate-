@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { useDashboardStore } from '../stores/dashboard'
 import { useI18n } from '../composables/useI18n'
 import TacticalChart from './TacticalChart.vue'
@@ -32,43 +32,55 @@ function focusChartOn(symbol: string) {
   }
 }
 
+function baseSymbol(value: any): string {
+  return String(value || '').replace('-USDT-SWAP', '').replace('-USDT', '').replace('_USDT', '').toUpperCase()
+}
+
 onMounted(() => {
   // If active positions exist, focus chart on the first active position
   if (store.positions.length > 0) {
     const firstPos = store.positions[0]
-    const sym = firstPos.name || firstPos.instId?.split('-')[0]
+    const sym = baseSymbol(firstPos.name || firstPos.instId)
     if (sym) {
       selectedChartSymbol.value = sym
     }
   } else if (store.pendingOrders.length > 0) {
     const firstOrd = store.pendingOrders[0]
-    const sym = firstOrd.name || firstOrd.inst || firstOrd.instId?.split('-')[0]
+    const sym = baseSymbol(firstOrd.name || firstOrd.inst || firstOrd.instId)
     if (sym) {
       selectedChartSymbol.value = sym
     }
+  } else if (store.instrumentContracts.length > 0) {
+    selectedChartSymbol.value = baseSymbol(store.instrumentContracts[0])
+  }
+})
+
+watch(() => store.instrumentContracts.join(','), () => {
+  const configured = store.instrumentContracts.map(baseSymbol)
+  if (configured.length && !configured.includes(baseSymbol(selectedChartSymbol.value))) {
+    selectedChartSymbol.value = configured[0]
   }
 })
 
 const availableSymbols = computed(() => {
   const set = new Set<string>()
   store.positions.forEach((p) => {
-    const s = p.name || p.instId.split('-')[0]
+    const s = baseSymbol(p.name || p.instId)
     if (s) set.add(s)
   })
   store.pendingOrders.forEach((o) => {
-    const s = o.name || o.instId.split('-')[0]
+    const s = baseSymbol(o.name || o.instId)
     if (s) set.add(s)
   })
   // Keep the Gate monitoring pool available even when the account has no
   // position/order (or a private API request is temporarily unavailable).
-  const defaults = ['BTC', 'ETH', 'SOL', 'DOGE', 'SUI', 'XRP']
-  defaults.forEach((s) => set.add(s))
+  store.instrumentContracts.forEach((contract) => set.add(String(contract).replace('_USDT', '')))
   return ['ALL', ...Array.from(set)]
 })
 
 const filteredPositions = computed(() => {
   return store.positions.filter((p) => {
-    const sym = p.name || p.instId.split('-')[0]
+    const sym = baseSymbol(p.name || p.instId)
     const matchSymbol = selectedSymbol.value === 'ALL' || sym === selectedSymbol.value
     const matchQuery =
       !searchQuery.value ||
@@ -80,7 +92,7 @@ const filteredPositions = computed(() => {
 
 const filteredOrders = computed(() => {
   return store.pendingOrders.filter((o) => {
-    const sym = o.name || o.instId.split('-')[0]
+    const sym = baseSymbol(o.name || o.instId)
     const matchSymbol = selectedSymbol.value === 'ALL' || sym === selectedSymbol.value
     const matchQuery =
       !searchQuery.value ||

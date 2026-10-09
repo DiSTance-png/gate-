@@ -89,7 +89,7 @@ const availableSymbols = computed(() => {
   // 1. 优先提取当前持仓标的 (去重)
   if (Array.isArray(store.positions)) {
     store.positions.forEach((p) => {
-      const sym = (p.name || p.instId?.replace('-USDT-SWAP', '').replace('-USDT', '') || '').toUpperCase()
+      const sym = (p.name || p.instId || '').replace('-USDT-SWAP', '').replace('-USDT', '').replace('_USDT', '').toUpperCase()
       if (sym) holdingSet.add(sym)
     })
   }
@@ -97,7 +97,7 @@ const availableSymbols = computed(() => {
   // 2. 优先提取挂单标的 (去重)
   if (Array.isArray(store.pendingOrders)) {
     store.pendingOrders.forEach((o) => {
-      const sym = (o.name || o.instId?.replace('-USDT-SWAP', '').replace('-USDT', '') || '').toUpperCase()
+      const sym = (o.name || o.instId || '').replace('-USDT-SWAP', '').replace('-USDT', '').replace('_USDT', '').toUpperCase()
       if (sym) holdingSet.add(sym)
     })
   }
@@ -115,8 +115,8 @@ const availableSymbols = computed(() => {
   // Gate dashboard's canonical monitoring pool. Keep these visible even if
   // the factor snapshot is temporarily unavailable or a private API call
   // times out; chart navigation is public-data only.
-  const defaults = ['BTC', 'ETH', 'SOL', 'DOGE', 'SUI', 'XRP']
-  defaults.forEach((d) => {
+  const configured = store.instrumentContracts.map((contract) => String(contract).replace('_USDT', ''))
+  configured.forEach((d) => {
     if (!holdingSet.has(d) && !otherSet.has(d)) {
       otherSet.add(d)
     }
@@ -988,6 +988,12 @@ watch(() => props.symbol, (newSym) => {
   }
 })
 
+watch(availableSymbols, (symbols) => {
+  if (symbols.length && !symbols.includes(currentSymbol.value)) {
+    selectSymbol(symbols[0])
+  }
+})
+
 watch([() => activePosition.value, () => activeOrder.value], () => {
   updatePriceLines()
 })
@@ -1007,7 +1013,7 @@ function handleClickOutside(e: MouseEvent) {
 }
 
 onMounted(() => {
-  const initSym = props.initialSymbol || props.symbol
+  const initSym = props.initialSymbol || props.symbol || availableSymbols.value[0]
   if (initSym) currentSymbol.value = initSym.toUpperCase()
   document.addEventListener('click', handleClickOutside)
   nextTick(() => {

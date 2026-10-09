@@ -18,6 +18,7 @@ export const useDashboardStore = defineStore('dashboard', () => {
   const account = computed(() => data.value?.account || null)
   const positions = computed<PositionItem[]>(() => data.value?.positions_summary?.items || [])
   const pendingOrders = computed<PendingOrderItem[]>(() => data.value?.pending_orders || [])
+  const instrumentContracts = computed<string[]>(() => data.value?.instrument_pool?.contracts || [])
   const protectionOrders = computed<ProtectionOrderItem[]>(() => data.value?.protection_orders_normalized || [])
   const factors = computed<InstrumentFactor[]>(() => {
     const rawFactors = data.value?.factors || []
@@ -160,6 +161,7 @@ export const useDashboardStore = defineStore('dashboard', () => {
     account,
     positions,
     pendingOrders,
+    instrumentContracts,
     protectionOrders,
     factors,
     factorLibrary,

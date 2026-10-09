@@ -3,14 +3,17 @@ from __future__ import annotations
 from typing import Any
 
 
-PORTFOLIO_RISK_VERSION = "gate-portfolio-risk-v1"
-CRYPTO_BETA_CLUSTER = frozenset({
-    "BTC_USDT", "ETH_USDT", "SOL_USDT", "DOGE_USDT", "SUI_USDT", "XRP_USDT",
-})
+PORTFOLIO_RISK_VERSION = "gate-portfolio-risk-v2"
 
 
 def _contract(value: Any) -> str:
     return str(value or "").upper().replace("-USDT-SWAP", "_USDT").replace("-", "_")
+
+
+def _is_crypto_beta(value: str) -> bool:
+    # This project trades Gate USDT perpetual crypto contracts only. Newly
+    # selected coins must inherit the same portfolio concentration guard.
+    return value.endswith("_USDT") and len(value) > len("_USDT")
 
 
 def correlated_exposure_gate(
@@ -19,7 +22,7 @@ def correlated_exposure_gate(
     """Limit highly correlated same-direction instruments as one beta risk unit."""
     target = _contract(contract)
     side = "long" if action == "BUY_LONG" else "short" if action == "SELL_SHORT" else ""
-    if not side or target not in CRYPTO_BETA_CLUSTER:
+    if not side or not _is_crypto_beta(target):
         return {"allowed": True, "margin_scale": 1.0, "same_direction_contracts": [], "version": PORTFOLIO_RISK_VERSION}
 
     exposed: set[str] = set()
@@ -29,11 +32,11 @@ def correlated_exposure_gate(
             size = float(row.get("size") or 0)
         except (TypeError, ValueError):
             continue
-        if name in CRYPTO_BETA_CLUSTER and size and ((size > 0) == (side == "long")):
+        if _is_crypto_beta(name) and size and ((size > 0) == (side == "long")):
             exposed.add(name)
     for row in reservations or []:
         name = _contract(row.get("contract"))
-        if name in CRYPTO_BETA_CLUSTER and str(row.get("side") or "").lower() == side:
+        if _is_crypto_beta(name) and str(row.get("side") or "").lower() == side:
             exposed.add(name)
 
     count = len(exposed)

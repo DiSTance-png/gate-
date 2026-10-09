@@ -658,7 +658,7 @@ onMounted(loadData)
 
         <!-- 6 Instruments Points Matrix -->
         <div v-if="testResult.brain_output?.decisions" class="space-y-1.5">
-          <div class="text-xs font-bold font-mono" style="color: var(--text-main);">六大标的落盘点位矩阵:</div>
+          <div class="text-xs font-bold font-mono" style="color: var(--text-main);">当前自选标的落盘点位矩阵:</div>
           <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5 font-mono text-xs">
             <div
               v-for="(dec, sym) in testResult.brain_output?.decisions"

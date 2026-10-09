@@ -1789,56 +1789,23 @@ def admin_instruments(x_r20_admin_token: str | None = Header(default=None)) -> d
     trackers = read_json("position_trackers.json", {})
     active = set(trackers.keys()) if isinstance(trackers, dict) else set()
     return {
-        "instruments": [{**item, "protected": item["instId"] == "BTC-USDT-SWAP", "has_tracker": item["instId"] in active or item["name"] in active} for item in load_instruments()],
-        "limits": {"minimum": 1, "maximum": 6, "btc_required": True},
+        "instruments": [{**item, "protected": False, "has_tracker": item["instId"] in active or item["name"] in active} for item in load_instruments()],
+        "limits": {"minimum": 1, "maximum": 6, "btc_required": False},
+        "read_only": True,
+        "message": "Gate 标的池修改必须使用 /api/v1/admin/gate/instruments 的预览确认流程",
     }
 
 
 @app.post("/api/v1/admin/instruments")
 def add_admin_instrument(payload: InstrumentAddRequest, x_r20_admin_token: str | None = Header(default=None)) -> dict[str, Any]:
-    refresh_settings()
     require_admin_header(x_r20_admin_token)
-    inst_id = payload.inst_id.upper()
-    current = load_instruments()
-    if any(item["instId"] == inst_id for item in current):
-        raise HTTPException(status_code=409, detail="该币种已在交易池中")
-    if len(current) >= 6:
-        raise HTTPException(status_code=409, detail="交易池最多允许 6 个币种；请先删除一个无持仓币种")
-    try:
-        matches = okx.instruments("SWAP", inst_id)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"OKX 合约校验失败：{exc}") from exc
-    raw = matches[0] if matches else {}
-    if raw.get("instId") != inst_id or raw.get("settleCcy") != "USDT" or raw.get("state") != "live":
-        raise HTTPException(status_code=400, detail="仅允许添加 OKX 在线可交易的 USDT 永续合约")
-    item = from_okx_instrument(raw)
-    save_instruments([*current, item])
-    audit_record("instrument.add", "success", {"instId": inst_id})
-    return {"added": item, "count": len(current) + 1, "effective": "immediate", "message": f"{item['name']} 已成功加入交易池并实时同步全网大屏与因果雷达"}
+    raise HTTPException(status_code=410, detail="旧的单币种接口已停用；请使用 Gate 标的池预览和确认接口")
 
 
 @app.delete("/api/v1/admin/instruments/{inst_id}")
 def delete_admin_instrument(inst_id: str, payload: InstrumentDeleteRequest, x_r20_admin_token: str | None = Header(default=None)) -> dict[str, Any]:
-    refresh_settings()
     require_admin_header(x_r20_admin_token)
-    inst_id = inst_id.upper()
-    if payload.confirmation.strip().upper() != f"REMOVE {inst_id}":
-        raise HTTPException(status_code=400, detail=f"确认短语必须精确为：REMOVE {inst_id}")
-    if inst_id == "BTC-USDT-SWAP":
-        raise HTTPException(status_code=403, detail="BTC 是全局黑天鹅哨兵基准，不允许从交易池删除")
-    current = load_instruments()
-    if len(current) <= 1:
-        raise HTTPException(status_code=409, detail="交易池至少保留 1 个币种")
-    if not any(item["instId"] == inst_id for item in current):
-        raise HTTPException(status_code=404, detail="该币种不在交易池中")
-    trackers = read_json("position_trackers.json", {})
-    coin = inst_id.split("-", 1)[0]
-    if isinstance(trackers, dict) and (inst_id in trackers or coin in trackers):
-        raise HTTPException(status_code=409, detail="该币种存在持仓追踪记录，为防止失去风控接管，禁止删除")
-    updated = [item for item in current if item["instId"] != inst_id]
-    save_instruments(updated)
-    audit_record("instrument.remove", "success", {"instId": inst_id})
-    return {"removed": inst_id, "count": len(updated), "effective": "immediate", "message": f"{inst_id} 已从交易池移除并实时同步全网大屏与因果雷达"}
+    raise HTTPException(status_code=410, detail="旧的单币种接口已停用；请使用 Gate 标的池预览和确认接口")
 
 
 @app.get("/api/v1/admin/about")

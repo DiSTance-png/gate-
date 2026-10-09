@@ -285,7 +285,7 @@ onUnmounted(() => {
               </p>
             </div>
             <div class="p-3.5 rounded-xl border space-y-1.5" style="background-color: var(--bg-card); border-color: var(--border-subtle);">
-              <div class="font-bold text-sm" style="color: var(--text-main);">右翼：六币因果动力学与微结构雷达 (38%)</div>
+              <div class="font-bold text-sm" style="color: var(--text-main);">右翼：自选交易对因果动力学与微结构雷达 (38%)</div>
               <p style="color: var(--text-muted);">
                 • <strong>微积分物理动能指标</strong>：实时计算一阶速度 $v$、二阶加速度 $a$、三阶冲击 $j$ 与 ADX 趋势动量。<br>
                 • <strong>聪明钱微结构</strong>：追踪大户多空比与净流入流出，点击卡片即刻呼出深度数学推演与当轮实发 Prompt 抽屉。

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -107,6 +108,66 @@ def from_okx_instrument(raw: dict[str, Any]) -> dict[str, Any]:
         "ctVal": float(raw.get("ctVal") or 1.0),
         "tickSz": tick_size,
         "minSz": str(raw.get("minSz") or "1"),
+        "risk_per_trade_usd": 15.0,
+    }
+
+
+def gate_contract_name(item: dict[str, Any] | str) -> str:
+    """Return the Gate USDT futures contract for a legacy-compatible pool item."""
+    if isinstance(item, dict):
+        raw = str(item.get("gate_contract") or item.get("name") or item.get("instId") or "")
+    else:
+        raw = str(item or "")
+    value = raw.strip().upper().replace("-USDT-SWAP", "_USDT").replace("-", "_")
+    if value.endswith("_USDT"):
+        return value
+    return f"{value}_USDT" if value else ""
+
+
+def configured_gate_contracts() -> list[str]:
+    """Read the current pool on every call so new worker processes use it immediately."""
+    return [contract for item in load_instruments() if (contract := gate_contract_name(item))]
+
+
+def instrument_pool_revision(instruments: list[dict[str, Any]] | None = None) -> str:
+    payload = instruments if instruments is not None else load_instruments()
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def from_gate_contract(raw: dict[str, Any]) -> dict[str, Any]:
+    """Build the shared strategy item from Gate's native FuturesContract schema."""
+    contract = str(raw.get("name") or raw.get("contract") or "").strip().upper()
+    if not contract.endswith("_USDT"):
+        raise ValueError("仅允许 Gate USDT 永续合约")
+    base = contract[:-5]
+    tick_size = str(raw.get("order_price_round") or raw.get("mark_price_round") or "0.0001")
+    tier = evaluate_instrument_tier(contract, base)
+    profile = TIER_PROFILES[tier]
+    min_size = str(raw.get("order_size_min") or "1")
+    multiplier = float(raw.get("quanto_multiplier") or 0)
+    if multiplier <= 0:
+        raise ValueError(f"{contract} 缺少有效 quanto_multiplier")
+    try:
+        gate_leverage_max = max(1, int(float(raw.get("leverage_max") or profile["max_leverage"])))
+    except (TypeError, ValueError):
+        gate_leverage_max = profile["max_leverage"]
+    return {
+        # Preserve the upstream strategy contract while recording the Gate-native identity.
+        "instId": f"{base}-USDT-SWAP",
+        "gate_contract": contract,
+        "name": base,
+        "type": "crypto",
+        "ccy": base,
+        "tier": tier,
+        "max_leverage": min(profile["max_leverage"], gate_leverage_max),
+        "sl_atr_mult": profile["sl_atr_mult"],
+        "base_sz": 1,
+        "precision": _precision(tick_size),
+        "ctVal": multiplier,
+        "tickSz": tick_size,
+        "minSz": min_size,
+        "enable_decimal": bool(raw.get("enable_decimal")),
         "risk_per_trade_usd": 15.0,
     }
 
@@ -255,18 +316,7 @@ def sync_instruments_state() -> None:
         except Exception:
             pass
 
-    # 5. Run factor_library and news_sentiment in a non-blocking background thread
-    import subprocess
-    import threading
-    def _run_bg() -> None:
-        try:
-            fl_script = ROOT / "scripts" / "factor_library.py"
-            if fl_script.exists():
-                subprocess.run(f"python3 {fl_script}", shell=True, capture_output=True, timeout=45)
-            nh_script = ROOT / "scripts" / "news_sentiment_harvester.py"
-            if nh_script.exists():
-                subprocess.run(f"python3 {nh_script}", shell=True, capture_output=True, timeout=45)
-        except Exception:
-            pass
-    threading.Thread(target=_run_bg, daemon=True).start()
+    # Gate's isolated scheduler refreshes gate_quant.factor_worker every minute
+    # and gate_quant.news_worker on its own cadence. Do not launch the upstream
+    # OKX scripts from a live configuration request.
 

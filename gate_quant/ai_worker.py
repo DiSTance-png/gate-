@@ -25,6 +25,7 @@ from .entry_confirmation import evaluate_retracement_confirmation
 from .exchange_write_lock import gate_write_lock
 from .portfolio_risk import correlated_exposure_gate
 from .regime import classify_market_regime, normalize_direction_bias
+from scripts.instrument_pool import configured_gate_contracts, instrument_pool_revision
 
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env", override=True)
@@ -186,7 +187,9 @@ def _console_summary(result: dict) -> str:
     if management_parts:
         summary += "\n持仓判断 | " + " | ".join(management_parts)
     return summary
-SYMBOLS = ("BTC_USDT", "ETH_USDT", "SOL_USDT", "DOGE_USDT", "SUI_USDT", "XRP_USDT")
+# Compatibility export for older tests/importers. Runtime workers must call
+# configured_gate_contracts() so a confirmed universe change applies next cycle.
+SYMBOLS = tuple(configured_gate_contracts())
 
 GATE_LIMIT_PRICE_DEVIATION = 0.02
 GATE_MARKET_DATA_MAX_DIVERGENCE = 0.03
@@ -645,6 +648,11 @@ def _execute_entry_candidate_locked(client: GateFuturesClient, envelope: dict, *
     unknown and the cycle must fail closed.
     """
     trade_symbol = str(envelope["instId"])
+    expected_universe = str(risk_snapshot.get("instrument_pool_revision") or "")
+    if not expected_universe or instrument_pool_revision() != expected_universe:
+        return {"trade": {"status": "blocked_safety_fail_closed", "contract": trade_symbol,
+                          "reason": "交易对配置已变化，旧 AI 决策禁止下单，等待下一轮"},
+                "submitted": False, "stop_cycle": True}
     decision = envelope["decision"]
     trade_feature = envelope["indicators"]
     action = str(decision.get("action") or "WAIT")
@@ -1252,8 +1260,8 @@ def _text_part(value) -> str:
     return str(value or "")
 
 
-def _extract_response_object(*parts):
-    """Find the last complete JSON response containing all six Gate contracts."""
+def _extract_response_object(*parts, required_symbols: list[str] | tuple[str, ...] | None = None):
+    """Find the last complete JSON response containing every configured Gate contract."""
     text = "\n".join(p for p in parts if p)
     candidates = []
     for part in parts:
@@ -1293,7 +1301,7 @@ def _extract_response_object(*parts):
                 if depth == 0:
                     candidates.append(text[start:index + 1])
                     break
-    required = set(SYMBOLS)
+    required = set(required_symbols or configured_gate_contracts())
     for raw in reversed(candidates):
         try:
             parsed = json.loads(raw)
@@ -1330,8 +1338,8 @@ def _extract_response_object(*parts):
     return None
 
 
-def _extract_decision_object(*parts):
-    response = _extract_response_object(*parts)
+def _extract_decision_object(*parts, required_symbols: list[str] | tuple[str, ...] | None = None):
+    response = _extract_response_object(*parts, required_symbols=required_symbols)
     return response.get("decisions") if isinstance(response, dict) else None
 
 
@@ -1421,6 +1429,10 @@ def _execution_enabled(settings) -> bool:
 
 def run_cycle() -> dict:
     settings = load_settings()
+    symbols = configured_gate_contracts()
+    if not symbols:
+        raise RuntimeError("Gate 自选交易对为空，拒绝运行 AI 决策")
+    universe_revision = instrument_pool_revision()
     risk_profile = get_risk_profile(settings.risk_profile)
     risk_snapshot = risk_profile.snapshot(leverage=settings.leverage, environment=settings.environment)
     risk_snapshot["configured_max_entries_per_cycle"] = settings.max_entries_per_cycle
@@ -1429,7 +1441,8 @@ def run_cycle() -> dict:
         policy_snapshot = generate_policy_snapshot(root_dir=ROOT)
     except Exception as exc:
         policy_snapshot = {"policy_version": "gate@unavailable", "policy_hash": "unavailable", "error": str(exc)}
-    risk_snapshot.update({"policy_version": policy_snapshot["policy_version"], "policy_hash": policy_snapshot["policy_hash"]})
+    risk_snapshot.update({"policy_version": policy_snapshot["policy_version"], "policy_hash": policy_snapshot["policy_hash"],
+                          "instrument_pool_revision": universe_revision, "active_contracts": symbols})
     execution_enabled = _execution_enabled(settings)
     client = GateFuturesClient(settings)
     market = GateFuturesClient(replace(settings, environment=settings.public_market_environment, api_key="public-readonly", api_secret="public-readonly", live_trading_enabled=True))
@@ -1438,7 +1451,7 @@ def run_cycle() -> dict:
     except Exception:
         raise
     ticker_by_symbol = {str(row.get("contract")): row for row in (tickers or []) if isinstance(row, dict)}
-    features = [_features(market, symbol, ticker_by_symbol.get(symbol)) for symbol in SYMBOLS]
+    features = [_features(market, symbol, ticker_by_symbol.get(symbol)) for symbol in symbols]
     strategy_packages = [_strategy_package(feature, ticker_by_symbol.get(feature["contract"])) for feature in features]
     private_context = {"account": {}, "positions": [], "pending_orders": [], "trigger_entries": [], "protections": [], "private_errors": []}
     try:
@@ -1476,7 +1489,7 @@ def run_cycle() -> dict:
         max_loss_ratio=settings.max_daily_loss_ratio, equity=equity,
         reset_path=DAILY_LOSS_RESET, environment=settings.environment,
     )
-    cooldowns = {symbol: cooldown_state(LEDGER, cooldown_seconds=settings.stop_cooldown_seconds, contract=symbol) for symbol in SYMBOLS}
+    cooldowns = {symbol: cooldown_state(LEDGER, cooldown_seconds=settings.stop_cooldown_seconds, contract=symbol) for symbol in symbols}
     cooldown = {"active": False, "remaining_seconds": 0, "reason": "per_contract", "contracts": cooldowns}
     safety_status = {
         "environment": settings.environment, "checked_at_ms": int(time.time() * 1000),
@@ -1650,7 +1663,7 @@ def run_cycle() -> dict:
                        "每个合约应独立判断；某个合约等待二次报价确认或被风控拒绝，不代表其他合格合约必须观望。")
         except Exception:
             prompt = ('Output ONLY one compact final JSON object with top-level keys decisions, position_management, pending_orders_management. '
-                      f'The decisions object must contain all six contracts and each item must include direction_bias LONG|SHORT|NEUTRAL, action BUY_LONG|SELL_SHORT|WAIT, confidence 0-100, entry_price, take_profit_price, stop_loss_price, leverage={settings.leverage:g}, margin_usdt (positive and <= {settings.max_order_margin_usd:.2f}), summary_reason'
+                      f'The decisions object must contain exactly the configured Gate contracts {symbols} and each item must include direction_bias LONG|SHORT|NEUTRAL, action BUY_LONG|SELL_SHORT|WAIT, confidence 0-100, entry_price, take_profit_price, stop_loss_price, leverage={settings.leverage:g}, margin_usdt (positive and <= {settings.max_order_margin_usd:.2f}), summary_reason'
                       + (', and entry_intent immediate|retracement|breakout. ' if settings.entry_intent_enabled else '. ')
                       + f'Active Gate risk profile={risk_profile.label}: confidence>={risk_profile.min_confidence:g}%, DOGE>={risk_profile.doge_min_confidence:g}%, ADX>={risk_profile.min_adx:g}, R:R>={risk_profile.min_rr:g}, target R:R>={risk_profile.target_rr:g}, effective per-order margin cap={settings.max_order_margin_usd * risk_profile.margin_ratio:.2f} USDT, total margin cap={settings.max_total_margin_usd:.2f} USDT, max actual entries this cycle={settings.max_entries_per_cycle}. Different Gate contracts may be held concurrently and an active contract may be added to only in the same direction, subject to aggregate limits and complete TP/SL coverage. A deferred or rejected symbol must not force unrelated qualified symbols to WAIT. '
                       'position_management actions are HOLD|CLOSE_MARKET|UPDATE_SL; pending_orders_management actions are KEEP|CANCEL. '
@@ -1684,11 +1697,11 @@ def run_cycle() -> dict:
         content = _text_part(message.get("content"))
         reasoning = _text_part(message.get("reasoning_content"))
         llm_preview = (content or reasoning)[-500:]
-        full_response = _extract_response_object(content, reasoning)
+        full_response = _extract_response_object(content, reasoning, required_symbols=symbols)
         raw_decisions = full_response.get("decisions") if full_response else None
         valid = raw_decisions is not None
         if not valid:
-            raise ValueError("LLM response did not contain a complete six-contract JSON decision")
+            raise ValueError("LLM response did not contain a complete configured-contract JSON decision")
         for feature in features:
             item = raw_decisions.get(feature["contract"]) or {}
             if isinstance(item, str):
@@ -1841,7 +1854,8 @@ def run_cycle() -> dict:
     # recorded but does not consume an entry slot or hide the next valid signal.
     candidate_outcomes: list[dict] = []
     submitted_trades: list[dict] = []
-    if execution_enabled and safety_status["safe_for_new_risk"] and not breakout_stop_cycle and llm_source == "gate-multifactor-llm":
+    universe_unchanged = instrument_pool_revision() == universe_revision
+    if execution_enabled and safety_status["safe_for_new_risk"] and not breakout_stop_cycle and llm_source == "gate-multifactor-llm" and universe_unchanged:
         ordered_candidates = sorted(
             executable,
             key=lambda row: (row["instId"] in confirmed_requotes, float(row["decision"].get("confidence") or 0)),
@@ -1883,6 +1897,10 @@ def run_cycle() -> dict:
         for trade_outcome in candidate_outcomes:
             trade_outcome.setdefault("policy_version", policy_snapshot["policy_version"])
             trade_outcome.setdefault("policy_hash", policy_snapshot["policy_hash"])
+    elif execution_enabled and not universe_unchanged:
+        candidate_outcomes.append({"status": "blocked_safety_fail_closed",
+                                   "reason": "交易对配置在本轮 AI 决策期间发生变化；旧标的决策已作废，等待下一轮",
+                                   "instrument_pool_revision": instrument_pool_revision()})
     elif execution_enabled and (not safety_status["safe_for_new_risk"] or breakout_stop_cycle):
         candidate_outcomes.append({"status": "blocked_safety_fail_closed",
                                    "reason": "Gate reconciliation, breakout lifecycle, or daily-loss gate blocked new risk",
