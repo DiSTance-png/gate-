@@ -793,8 +793,35 @@ def test_gate_decimal_contract_size_uses_exchange_quantum():
 def test_risk_profiles_are_versioned_and_observe_disables_execution():
     active = get_risk_profile("active").snapshot(leverage=3, environment="testnet")
     assert active["min_rr"] >= 2.0
+    aggressive = get_risk_profile("aggressive").snapshot(leverage=3, environment="testnet")
+    assert aggressive["min_rr"] == 1.9
+    assert aggressive["absolute_min_rr"] == 1.8
+    assert aggressive["risk_profile_version"] == "gate-risk-v3"
     assert len(active["risk_profile_hash"]) == 16
     assert not _execution_enabled(GateSettings(environment="testnet", testnet_execute_trades=True, risk_profile="observe"))
+
+
+def test_aggressive_profile_accepts_1_9r_without_weakening_other_profiles():
+    package = {"name": "BTC", "instId": "BTC_USDT", "data_quality": "valid", "macro_4h": "RANGE", "adx_1h": 20}
+    decision = {"action": "BUY_LONG", "confidence": 76, "entry_price": 100, "take_profit_price": 119, "stop_loss_price": 90}
+    aggressive = get_risk_profile("aggressive").snapshot(leverage=3, environment="testnet")
+    active = get_risk_profile("active").snapshot(leverage=3, environment="testnet")
+
+    assert validate_decision(package, decision, active_inst_ids=set(), active_position_sides={}, risk_snapshot=aggressive)[0] == "BUY_LONG"
+    action, reason, rr = validate_decision(package, decision, active_inst_ids=set(), active_position_sides={}, risk_snapshot=active)
+    assert action == "WAIT"
+    assert "底线 2:1" in reason
+    assert rr == pytest.approx(1.9)
+
+
+def test_aggressive_profile_keeps_absolute_1_8r_floor():
+    package = {"name": "BTC", "instId": "BTC_USDT", "data_quality": "valid", "macro_4h": "RANGE", "adx_1h": 20}
+    decision = {"action": "BUY_LONG", "confidence": 76, "entry_price": 100, "take_profit_price": 117.9, "stop_loss_price": 90}
+    aggressive = get_risk_profile("aggressive").snapshot(leverage=3, environment="testnet")
+    action, reason, rr = validate_decision(package, decision, active_inst_ids=set(), active_position_sides={}, risk_snapshot=aggressive)
+    assert action == "WAIT"
+    assert "底线 1.8:1" in reason
+    assert rr == pytest.approx(1.79)
 
 
 def test_gate_risk_budget_is_single_dynamic_source_for_money_and_profit_locking():
@@ -866,7 +893,7 @@ def test_profile_leverage_cap_is_fail_closed():
 
 def test_strategy_interceptors_use_the_same_risk_snapshot():
     package = {"name": "SOL", "instId": "SOL_USDT", "data_quality": "valid", "macro_4h": "RANGE", "adx_1h": 15}
-    decision = {"action": "BUY_LONG", "confidence": 72, "entry_price": 100, "take_profit_price": 110, "stop_loss_price": 95}
+    decision = {"action": "BUY_LONG", "confidence": 72, "entry_price": 100, "take_profit_price": 111, "stop_loss_price": 95}
     aggressive = get_risk_profile("aggressive").snapshot(leverage=3, environment="testnet")
     standard = get_risk_profile("standard").snapshot(leverage=3, environment="testnet")
     assert validate_decision(package, decision, active_inst_ids=set(), active_position_sides={}, risk_snapshot=aggressive)[0] == "BUY_LONG"

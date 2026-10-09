@@ -7,9 +7,10 @@ import math
 from typing import Any, Tuple
 
 
-def validate_quote_geometry_and_rr(action: str, entry: Any, tp: Any, sl: Any) -> Tuple[bool, str, float]:
+def validate_quote_geometry_and_rr(action: str, entry: Any, tp: Any, sl: Any, *, min_rr: float = 2.0) -> Tuple[bool, str, float]:
     """Validates that opening quote prices are positive, finite numbers satisfying
-    action-specific geometry, and that the calculated risk-reward ratio meets or exceeds 2.0.
+    action-specific geometry, and that the calculated risk-reward ratio meets the supplied floor.
+    The default remains 2.0 for inherited/non-Gate callers.
     Returns (is_valid, failure_reason, rr_ratio).
     """
     raw_act = str(action or "").upper()
@@ -47,7 +48,14 @@ def validate_quote_geometry_and_rr(action: str, entry: Any, tp: Any, sl: Any) ->
     if not math.isfinite(rr):
         return False, "核心风控拦截：盈亏比计算异常", 0.0
 
-    if rr < 2.0:
-        return False, f"核心风控拦截：盈亏比不足 2.0 (当前 R:R = {rr:.2f}:1，底线 2.0:1)", rr
+    try:
+        rr_floor = float(min_rr)
+    except (TypeError, ValueError, OverflowError):
+        return False, "核心风控拦截：盈亏比底线配置无效", rr
+    if not math.isfinite(rr_floor) or rr_floor <= 0:
+        return False, "核心风控拦截：盈亏比底线配置无效", rr
+
+    if rr + 1e-9 < rr_floor:
+        return False, f"核心风控拦截：盈亏比不足 {rr_floor:g} (当前 R:R = {rr:.2f}:1，底线 {rr_floor:g}:1)", rr
 
     return True, "", rr

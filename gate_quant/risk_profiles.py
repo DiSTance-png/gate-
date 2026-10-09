@@ -6,8 +6,8 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 
-PROFILE_VERSION = "gate-risk-v2"
-ABSOLUTE_MIN_RR = 2.0
+PROFILE_VERSION = "gate-risk-v3"
+ABSOLUTE_MIN_RR = 1.8
 
 PROFIT_LOCK_PROFILES: dict[str, dict[str, Any]] = {
     "observe": {"breakeven_r": 0.8, "breakeven_roi_pct": 1.5, "second_lock_r": 1.5, "second_lock_roi_pct": 3.0, "locked_profit_r": 0.6, "peak_exit_roi_pct": 2.5, "peak_exit_r": 1.0, "peak_drawdown_min_pct": 35, "peak_drawdown_max_pct": 45, "dissipation_roi_pct": 1.5, "dissipation_phi": -0.12, "dissipation_curvature": 1.5, "dissipation_requires_all": False},
@@ -63,10 +63,10 @@ RISK_PROFILES: dict[str, RiskProfile] = {
         "standard", "标准", "平衡信号质量与机会频率，保留完整硬风控。", 80, 83, 18, 2.2, 2.5, 0.65, 5, 1.8, 2.2, 1
     ),
     "active": RiskProfile(
-        "active", "积极", "适度降低趋势和置信度门槛，但不降低绝对 2R 底线。", 75, 80, 16, 2.0, 2.3, 0.85, 8, 1.6, 2.2, 1
+        "active", "积极", "适度降低趋势和置信度门槛，但仍保持 2R 档位底线。", 75, 80, 16, 2.0, 2.3, 0.85, 8, 1.6, 2.2, 1
     ),
     "aggressive": RiskProfile(
-        "aggressive", "激进", "扩大可参与信号范围并使用完整保证金额度，绝对风控仍不可绕过。", 72, 78, 14, 2.0, 2.2, 1.0, 10, 1.6, 2.0, 2
+        "aggressive", "激进", "扩大可参与信号范围并使用完整保证金额度，最低 1.9R，绝对风控仍不可绕过。", 72, 78, 14, 1.9, 2.2, 1.0, 10, 1.6, 2.0, 2
     ),
 }
 

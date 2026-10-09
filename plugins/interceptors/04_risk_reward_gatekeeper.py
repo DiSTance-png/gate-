@@ -5,7 +5,7 @@ id: 04_risk_reward_gatekeeper
 name: 动态真实盈亏比门禁
 version: 1.0.0
 author: R20 Official
-description: 执行层真实 R:R 门槛由 Gate 风险快照提供，且永不低于绝对 2R。
+description: 执行层真实 R:R 门槛由 Gate 风险快照提供，且永不低于快照中的绝对底线。
 tags: 盈亏比, 赔率保障, 官方预设
 """
 
@@ -28,8 +28,9 @@ def check_risk(package: dict, decision: dict, context: dict) -> tuple[bool, str]
         rr = (entry - tp) / (sl - entry)
 
     risk = context.get("risk_context") or {}
-    minimum = max(2.0, float(risk.get("min_rr", 2.0)))
-    if rr < minimum:
+    absolute_minimum = float(risk.get("absolute_min_rr", 2.0))
+    minimum = max(absolute_minimum, float(risk.get("min_rr", 2.0)))
+    if rr + 1e-9 < minimum:
         return False, f"模型报价盈亏比 {rr:.2f}R 未满足当前档位 {minimum:g}R 门禁，执行层降级为 WAIT。"
 
     return True, ""

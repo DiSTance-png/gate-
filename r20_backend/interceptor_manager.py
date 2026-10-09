@@ -309,10 +309,22 @@ def run_interceptor_pipeline(package: dict[str, Any], decision: dict[str, Any], 
         if not is_same:
             return "WAIT", "已有反向或不兼容持仓，禁止借决策通道反向开仓，安全降级为 WAIT。", 0.0
 
-    # 2. Non-Bypassable Core Safety Floor: Finite values, Geometry & Global Minimum RR >= 2.0
-    quote_valid, quote_reason, rr = validate_quote_geometry_and_rr(raw_action, entry, tp, sl)
+    # 2. Non-Bypassable Core Safety Floor: finite values, geometry and the
+    # environment-specific absolute RR floor. Inherited callers keep 2.0;
+    # Gate snapshots may explicitly provide a lower absolute floor.
+    risk_context = context.get("risk_context") or {}
+    try:
+        absolute_rr_floor = float(risk_context.get("absolute_min_rr", 2.0))
+        configured_rr_floor = max(absolute_rr_floor, float(risk_context.get("min_rr", 2.0)))
+    except (TypeError, ValueError, OverflowError):
+        return "WAIT", "核心风控拦截：盈亏比底线配置无效", 0.0
+    quote_valid, quote_reason, rr = validate_quote_geometry_and_rr(
+        raw_action, entry, tp, sl, min_rr=absolute_rr_floor
+    )
     if not quote_valid:
         return "WAIT", quote_reason, rr
+    if rr + 1e-9 < configured_rr_floor:
+        return "WAIT", f"核心风控拦截：盈亏比不足 {configured_rr_floor:g} (当前 R:R = {rr:.2f}:1，底线 {configured_rr_floor:g}:1)", rr
 
     # 3. Non-Bypassable Gate safety floor. The per-cycle risk context may
     # tighten this value, but can never lower the absolute floor.
@@ -321,7 +333,6 @@ def run_interceptor_pipeline(package: dict[str, Any], decision: dict[str, Any], 
     except (TypeError, ValueError):
         return "WAIT", "核心风控拦截：置信度必须是有效数字", rr
 
-    risk_context = context.get("risk_context") or {}
     configured_floor = float(risk_context.get("doge_min_confidence" if "DOGE" in inst_id.upper() else "min_confidence", 80.0 if "DOGE" in inst_id.upper() else 75.0))
     absolute_floor = 75.0 if "DOGE" in inst_id.upper() else 70.0
     conf_floor = max(absolute_floor, configured_floor)
