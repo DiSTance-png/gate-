@@ -880,7 +880,7 @@ def test_gate_prompt_emits_retracement_candidates_without_weakening_hard_gates(m
     for prompt in (system_prompt, user_prompt):
         assert "retracement 候选尚未触价或收回时仍可输出 BUY_LONG/SELL_SHORT" in prompt
         assert "PULLBACK_UP/REBOUND_DOWN 可以生成 retracement 候选" in prompt
-        assert "TRANSITION 或与开仓方向相同的 EXHAUSTION 状态必须 WAIT" in prompt
+        assert "TRANSITION 默认必须 WAIT" in prompt
         assert "1H RSI 必须低于 78" in prompt
         assert "VWAP 正偏离必须低于 6%" in prompt
         assert "PULLBACK/REBOUND 不是入场信号" not in prompt
@@ -900,6 +900,44 @@ def test_strategy_interceptors_use_the_same_risk_snapshot():
     action, reason, _ = validate_decision(package, decision, active_inst_ids=set(), active_position_sides={}, risk_snapshot=standard)
     assert action == "WAIT"
     assert "80.0%" in reason or "80%" in reason
+
+
+def test_transition_macro_aligned_retracement_can_enter_confirmation_pipeline():
+    package = {
+        "name": "BTC", "instId": "BTC_USDT", "data_quality": "valid", "macro_4h": "4H_MACRO_BULL",
+        "adx_1h": 20, "price": 100.0,
+        "market_regime": {"name": "TRANSITION"},
+    }
+    decision = {
+        "action": "BUY_LONG", "confidence": 76, "entry_intent": "retracement",
+        "entry_price": 99.5, "take_profit_price": 101.4, "stop_loss_price": 98.5,
+    }
+    aggressive = get_risk_profile("aggressive").snapshot(leverage=3, environment="testnet")
+    action, reason, rr = validate_decision(
+        package, decision, active_inst_ids=set(), active_position_sides={}, risk_snapshot=aggressive
+    )
+    assert action == "BUY_LONG"
+    assert reason == ""
+    assert rr == pytest.approx(1.9)
+
+
+def test_transition_retracement_exception_requires_confidence_and_distance():
+    package = {
+        "name": "BTC", "instId": "BTC_USDT", "data_quality": "valid", "macro_4h": "4H_MACRO_BULL",
+        "adx_1h": 20, "price": 100.0,
+        "market_regime": {"name": "TRANSITION"},
+    }
+    aggressive = get_risk_profile("aggressive").snapshot(leverage=3, environment="testnet")
+    for confidence, entry in ((75, 99.5), (76, 99.0)):
+        decision = {
+            "action": "BUY_LONG", "confidence": confidence, "entry_intent": "retracement",
+            "entry_price": entry, "take_profit_price": 101.4, "stop_loss_price": 98.5,
+        }
+        action, reason, _ = validate_decision(
+            package, decision, active_inst_ids=set(), active_position_sides={}, risk_snapshot=aggressive
+        )
+        assert action == "WAIT"
+        assert "转换期" in reason
 
 
 def test_existing_other_contract_does_not_block_new_contract_signal():

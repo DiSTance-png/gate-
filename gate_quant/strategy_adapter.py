@@ -24,6 +24,8 @@ ANTI_CHASE_RSI_HIGH = 78.0
 ANTI_CHASE_RSI_LOW = 22.0
 ANTI_CHASE_VWAP_BIAS_PCT = 6.0
 ANTI_CHASE_24H_MOVE_PCT = 18.0
+TRANSITION_RETRACEMENT_MAX_DISTANCE_PCT = 0.8
+TRANSITION_RETRACEMENT_CONFIDENCE_BONUS = 4.0
 
 
 def anti_chase_rejection(package: dict[str, Any], action: str) -> str:
@@ -52,6 +54,38 @@ def anti_chase_rejection(package: dict[str, Any], action: str) -> str:
         if change_24h <= -ANTI_CHASE_24H_MOVE_PCT and acceleration_15m > 0:
             return f"防杀跌门禁：24H 已下跌 {abs(change_24h):.2f}% 且 15M 加速度转正，禁止末端追空。"
     return ""
+
+
+def allow_transition_retracement(
+    package: dict[str, Any], decision: dict[str, Any], risk_snapshot: dict[str, Any] | None,
+) -> bool:
+    """Allow only a tightly bounded, macro-aligned pullback candidate in transition.
+
+    This does not authorize an order: the normal quote, RR, plugin and retracement
+    confirmation gates still run after this exception.
+    """
+    regime = package.get("market_regime")
+    if not isinstance(regime, dict) or str(regime.get("name") or "") != "TRANSITION":
+        return False
+    if str(decision.get("entry_intent") or "").lower() != "retracement":
+        return False
+    action = str(decision.get("action") or "").upper()
+    macro = str(package.get("macro_4h") or "").upper()
+    if (action == "BUY_LONG" and "BULL" not in macro) or (action == "SELL_SHORT" and "BEAR" not in macro):
+        return False
+    try:
+        confidence = float(decision.get("confidence") or 0)
+        minimum_confidence = float((risk_snapshot or {}).get("min_confidence", 75.0))
+        current = float(package.get("price") or package.get("last") or 0)
+        entry = float(decision.get("entry_price") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if confidence < minimum_confidence + TRANSITION_RETRACEMENT_CONFIDENCE_BONUS:
+        return False
+    if current <= 0 or entry <= 0:
+        return False
+    distance_pct = abs(entry - current) / current * 100.0
+    return distance_pct <= TRANSITION_RETRACEMENT_MAX_DISTANCE_PCT
 
 def strip_legacy_risk_values(text: str) -> str:
     """Preserve strategy meaning while removing inherited fixed risk numbers."""
@@ -152,7 +186,7 @@ def build_prompt(packages: list[dict[str, Any]], *, positions: list[dict[str, An
         "retracement 候选尚未触价或收回时仍可输出 BUY_LONG/SELL_SHORT，实际下单必须由执行层完成触价与已收盘 15M 收回确认。"
         "4H 方向只限定研究方向，不构成立即入场理由；ADX 只代表强度，必须结合 +DI/-DI 判断方向。"
         "PULLBACK_UP/REBOUND_DOWN 可以生成 retracement 候选，但不能直接视为已确认成交信号；"
-        "TRANSITION 或与开仓方向相同的 EXHAUSTION 状态必须 WAIT。"
+        "TRANSITION 默认必须 WAIT；只有宏观方向一致、retracement、置信度至少高于当前档位门槛 4 个百分点且计划价距离当前价不超过 0.8% 时，才可输出候选，最终仍须执行层确认。与开仓方向相同的 EXHAUSTION 状态必须 WAIT。"
         "不得为了通过置信度门槛抬高置信度，也不得虚构候选；"
         "但未触发明确硬否决时，不得自行扩大 RSI、VWAP、状态或确认阈值，把全部正常顺势候选提前降级为 WAIT。"
         + entry_contract
@@ -180,6 +214,8 @@ def validate_decision(package: dict[str, Any], decision: dict[str, Any], *, acti
     }
     action = str(decision.get("action") or "WAIT").upper()
     regime_reason = market_regime_rejection(package, action) if action != "WAIT" else ""
+    if regime_reason and allow_transition_retracement(package, decision, risk_snapshot):
+        regime_reason = ""
     if regime_reason:
         return "WAIT", regime_reason, 0.0
     anti_chase_reason = anti_chase_rejection(package, action)
