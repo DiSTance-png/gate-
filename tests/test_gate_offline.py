@@ -837,6 +837,28 @@ def test_gate_final_prompt_orders_layout_admin_override_and_immutable_constraint
     assert "2x~5x" not in user_prompt and "有效单笔保证金上限=65.00 USDT" in user_prompt
 
 
+def test_gate_prompt_emits_retracement_candidates_without_weakening_hard_gates(monkeypatch):
+    monkeypatch.setattr(strategy_adapter, "construct_full_market_prompt", lambda *args, **kwargs: "用户策略")
+    monkeypatch.setattr(strategy_adapter, "active_profile", lambda: {"name": "测试", "pipelines": {}})
+    monkeypatch.setattr(strategy_adapter, "apply_module_layout", lambda base, *args, **kwargs: base)
+    monkeypatch.setattr(strategy_adapter, "get_effective_system_prompt", lambda base=None: base or "")
+    snapshot = get_risk_profile("aggressive").snapshot(leverage=3, environment="testnet")
+
+    system_prompt, user_prompt = strategy_adapter.build_prompt(
+        [], positions=[], pending_orders=[], available_usdt=1000, execution_leverage=3,
+        max_order_margin_usdt=100, max_total_margin_usdt=300, current_margin_usdt=0,
+        risk_snapshot=snapshot, entry_intent_enabled=True,
+    )
+
+    for prompt in (system_prompt, user_prompt):
+        assert "retracement 候选尚未触价或收回时仍可输出 BUY_LONG/SELL_SHORT" in prompt
+        assert "PULLBACK_UP/REBOUND_DOWN 可以生成 retracement 候选" in prompt
+        assert "TRANSITION 或与开仓方向相同的 EXHAUSTION 状态必须 WAIT" in prompt
+        assert "1H RSI 必须低于 78" in prompt
+        assert "VWAP 正偏离必须低于 6%" in prompt
+        assert "PULLBACK/REBOUND 不是入场信号" not in prompt
+
+
 def test_profile_leverage_cap_is_fail_closed():
     with pytest.raises(ValueError, match="cannot exceed"):
         GateSettings(environment="testnet", risk_profile="conservative", leverage=4).validate()

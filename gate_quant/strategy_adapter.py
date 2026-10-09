@@ -144,10 +144,13 @@ def build_prompt(packages: list[dict[str, Any]], *, positions: list[dict[str, An
         f"SELL_SHORT 时 1H RSI 必须高于 {ANTI_CHASE_RSI_LOW:g} 且 VWAP 负偏离绝对值必须低于 {ANTI_CHASE_VWAP_BIAS_PCT:g}%；"
         f"24H 涨跌绝对值达到 {ANTI_CHASE_24H_MOVE_PCT:g}% 后，若 15M 加速度朝反转方向变化则必须 WAIT。"
         "每个决策必须区分 direction_bias 与 action：direction_bias 只允许 LONG、SHORT、NEUTRAL；"
-        "即使中期方向偏多或偏空，只要当前入场未确认，action 必须为 WAIT。"
+        "action 可以表达通过方向、结构、价格几何和 R:R 初筛后的入场候选；"
+        "retracement 候选尚未触价或收回时仍可输出 BUY_LONG/SELL_SHORT，实际下单必须由执行层完成触价与已收盘 15M 收回确认。"
         "4H 方向只限定研究方向，不构成立即入场理由；ADX 只代表强度，必须结合 +DI/-DI 判断方向。"
-        "PULLBACK/REBOUND 不是入场信号；TRANSITION 或 EXHAUSTION 状态必须 WAIT。"
-        "不得为了通过置信度门槛抬高置信度，也不得因存在候选而强制开单。"
+        "PULLBACK_UP/REBOUND_DOWN 可以生成 retracement 候选，但不能直接视为已确认成交信号；"
+        "TRANSITION 或与开仓方向相同的 EXHAUSTION 状态必须 WAIT。"
+        "不得为了通过置信度门槛抬高置信度，也不得虚构候选；"
+        "但未触发明确硬否决时，不得自行扩大 RSI、VWAP、状态或确认阈值，把全部正常顺势候选提前降级为 WAIT。"
         + entry_contract
     )
     profile = active_profile()
