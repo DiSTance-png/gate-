@@ -32,6 +32,8 @@ GATE_MAX_ENTRY_SLIPPAGE_PCT=0.003
 GATE_BREAKOUT_EXPIRATION_SECONDS=840
 ```
 
+启用显式入场意图后，AI 必须返回 `immediate/retracement/breakout`。缺失时系统最多请求模型补全一次（20 秒），仅补意图，不改变原报价；补全失败仍安全观望，补全成功仍须通过全部执行风控。
+
 启用后 AI 策略主体不变，只在每个非观望决策中增加 `entry_intent=immediate|retracement|breakout`。滑点和有效期是执行层硬参数，AI 无权覆盖。
 
 `GATE_TESTNET_BASE_URL` 和 `GATE_LIVE_BASE_URL` 可按 Gate 账户集群覆盖，必须是完整的 `/api/v4` 地址。当前默认 Testnet 地址已用本账户验证；Gate 官方 SDK 当前列出的 `fx-api-testnet.gateio.ws` 属于另一集群，切换前必须用同一凭证做只读检测。

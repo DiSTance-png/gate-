@@ -197,6 +197,14 @@ def build_prompt(packages: list[dict[str, Any]], *, positions: list[dict[str, An
         base_system, profile, "trading_system", f"{profile.get('name', '稳健')}交易系统提示词模板"
     ))
     effective_system = get_effective_system_prompt(laid_out_system)
+    if entry_intent_enabled:
+        gate_constraints += (
+            '\n【最终 JSON 输出契约】每个 decisions 内的非 WAIT 合约对象必须包含字符串 entry_intent。'
+            '示例：{"action":"BUY_LONG","entry_intent":"retracement","entry_price":100,'
+            '"take_profit_price":102,"stop_loss_price":99,"confidence":80,"margin_usdt":25}。'
+            '示例数值不可照抄。返回前逐合约自检 entry_intent 是 immediate/retracement/breakout 之一；'
+            '不得遗漏、返回空字符串或仅在理由中描述意图。'
+        )
     return effective_system + gate_constraints, strip_legacy_risk_values(prompt) + gate_constraints
 
 

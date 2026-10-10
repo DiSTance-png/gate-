@@ -1338,6 +1338,55 @@ def _extract_response_object(*parts, required_symbols: list[str] | tuple[str, ..
     return None
 
 
+def _repair_entry_intents(raw_decisions, *, request_url, request_headers, request_body, request_proxies):
+    """One bounded model-only repair; never infer intent or replace trade parameters."""
+    missing = {
+        symbol: item for symbol, item in raw_decisions.items()
+        if isinstance(item, dict) and str(item.get("action", "")).upper() in {"BUY_LONG", "SELL_SHORT"}
+        and str(item.get("entry_intent") or "").strip().lower() not in ENTRY_INTENTS
+    }
+    if not missing:
+        return {}
+    repair_prompt = (
+        "你的上一份交易决策缺少合法 entry_intent。只补全下列合约的入场意图，禁止改变方向、价格、TP/SL、保证金或置信度。"
+        "immediate=立即入场；retracement=等待回调做多/反弹做空；breakout=等待突破/跌破后入场。"
+        "必须根据你原来的策略意图明确选择，不得只凭价格位置猜测；无法确定时返回 null。"
+        '只返回 JSON：{"entry_intents":{"合约":"retracement"}}。原决策：'
+        + json.dumps(missing, ensure_ascii=False)
+    )
+    body = dict(request_body)
+    body["messages"] = [*request_body["messages"], {"role": "user", "content": repair_prompt}]
+    body["max_tokens"] = 500
+    telemetry = None
+    try:
+        from r20_gateway.telemetry import ModelCallTelemetry
+        telemetry = ModelCallTelemetry("gate_quant.entry_intent_repair", body["model"], "none", "", repair_prompt)
+        response = requests.post(request_url, headers=request_headers, json=body, timeout=20, proxies=request_proxies)
+        response.raise_for_status()
+        payload = response.json()
+        message = payload["choices"][0].get("message") or {}
+        content = _text_part(message.get("content")).strip()
+        if content.startswith("```"):
+            content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content)
+        mapping = json.loads(content).get("entry_intents")
+        if not isinstance(mapping, dict):
+            raise ValueError("entry_intents must be an object")
+        repaired = {}
+        for symbol in missing:
+            value = mapping.get(symbol)
+            intent = value.strip().lower() if isinstance(value, str) else ""
+            if intent in ENTRY_INTENTS:
+                raw_decisions[symbol] = {**raw_decisions[symbol], "entry_intent": intent}
+                repaired[symbol] = intent
+        if telemetry:
+            telemetry.finish("success", payload, output_chars=len(content))
+        return repaired
+    except Exception as exc:
+        if telemetry:
+            telemetry.finish("error", error=exc)
+        return {}
+
+
 def _extract_decision_object(*parts, required_symbols: list[str] | tuple[str, ...] | None = None):
     response = _extract_response_object(*parts, required_symbols=required_symbols)
     return response.get("decisions") if isinstance(response, dict) else None
@@ -1702,6 +1751,10 @@ def run_cycle() -> dict:
         valid = raw_decisions is not None
         if not valid:
             raise ValueError("LLM response did not contain a complete configured-contract JSON decision")
+        repaired_intents = _repair_entry_intents(
+            raw_decisions, request_url=request_url, request_headers=request_headers,
+            request_body=request_body, request_proxies=request_proxies,
+        ) if settings.entry_intent_enabled else {}
         for feature in features:
             item = raw_decisions.get(feature["contract"]) or {}
             if isinstance(item, str):
@@ -1714,11 +1767,13 @@ def run_cycle() -> dict:
             raw_margin = float(item.get("margin_usdt") or item.get("margin_usd") or 0)
             effective_margin_cap = settings.max_order_margin_usd * risk_profile.margin_ratio
             accepted_margin = max(0.0, min(raw_margin, effective_margin_cap, available))
-            entry_intent = str(item.get("entry_intent") or "").lower()
+            entry_intent = str(item.get("entry_intent") or "").strip().lower()
             intent_valid = candidate == "WAIT" or not settings.entry_intent_enabled or entry_intent in ENTRY_INTENTS
             regime = feature.get("market_regime") or classify_market_regime(feature)
             decisions[feature["contract"]] = {"direction_bias": normalize_direction_bias(item.get("direction_bias"), candidate), "market_regime": str(regime.get("name") or "TRANSITION"), "action": candidate if intent_valid else "WAIT", "raw_action": candidate, "confidence": max(0.0, min(100.0, float(item.get("confidence") or 0))), "entry_intent": entry_intent if candidate != "WAIT" else "", "entry_price": float(item.get("entry_price") or feature["last"]) if candidate != "WAIT" and intent_valid else 0.0, "take_profit_price": float(item.get("take_profit_price") or 0) if intent_valid else 0.0, "stop_loss_price": float(item.get("stop_loss_price") or 0) if intent_valid else 0.0, "leverage": settings.leverage, "margin_usdt": accepted_margin, "margin_usd": accepted_margin, "summary_reason": str(item.get("summary_reason") or "LLM decision"), **({"rejection_reason": "AI 未返回合法 entry_intent，已安全转为观望"} if not intent_valid else {})}
         llm_source = "gate-multifactor-llm"
+        for symbol in repaired_intents:
+            decisions[symbol]["entry_intent_source"] = "model_contract_repair"
         if model_telemetry:
             model_telemetry.finish("success", response.json(), output_chars=len(content or reasoning))
     except Exception as exc:

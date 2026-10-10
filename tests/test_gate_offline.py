@@ -35,6 +35,56 @@ class FakeSession:
         return R()
 
 
+@pytest.mark.parametrize("reply", [None, "retracement", "invalid"])
+def test_entry_intent_repair_changes_only_explicit_valid_intent(monkeypatch, reply):
+    decisions = {
+        "ETH_USDT": {"action": "SELL_SHORT", "entry_price": 2500, "confidence": 76},
+        "SOL_USDT": {"action": "SELL_SHORT", "entry_intent": "breakout", "entry_price": 100},
+        "BTC_USDT": {"action": "WAIT"},
+    }
+    before = json.loads(json.dumps(decisions))
+    calls = []
+    class Response:
+        def raise_for_status(self): pass
+        def json(self):
+            return {"choices": [{"message": {"content": json.dumps({"entry_intents": {
+                "ETH_USDT": reply, "SOL_USDT": "immediate", "BTC_USDT": "immediate",
+            }, "decisions": {"ETH_USDT": {"entry_price": 1}}})}}]}
+    def post(url, **kwargs):
+        calls.append(kwargs)
+        return Response()
+    monkeypatch.setattr(ai_worker.requests, "post", post)
+    repaired = ai_worker._repair_entry_intents(
+        decisions, request_url="https://model.invalid/chat/completions", request_headers={},
+        request_body={"model": "offline", "messages": []}, request_proxies=None,
+    )
+    assert len(calls) == 1
+    assert calls[0]["timeout"] == 20
+    assert decisions["SOL_USDT"] == before["SOL_USDT"]
+    assert decisions["BTC_USDT"] == before["BTC_USDT"]
+    if reply == "retracement":
+        assert repaired == {"ETH_USDT": reply}
+        assert decisions["ETH_USDT"] == {**before["ETH_USDT"], "entry_intent": reply}
+    else:
+        assert repaired == {}
+        assert decisions == before
+
+
+def test_entry_intent_repair_timeout_keeps_original_and_does_not_retry(monkeypatch):
+    decisions = {"ETH_USDT": {"action": "SELL_SHORT", "entry_price": 2500}}
+    calls = []
+    def post(*args, **kwargs):
+        calls.append(kwargs)
+        raise requests.Timeout("offline model timeout")
+    monkeypatch.setattr(ai_worker.requests, "post", post)
+    assert ai_worker._repair_entry_intents(
+        decisions, request_url="https://model.invalid", request_headers={},
+        request_body={"model": "offline", "messages": []}, request_proxies=None,
+    ) == {}
+    assert len(calls) == 1
+    assert "entry_intent" not in decisions["ETH_USDT"]
+
+
 def settings(): return GateSettings(environment="testnet", api_key="offline-key", api_secret="offline-secret", max_order_margin_usd=10, max_total_margin_usd=20, max_position_notional_usd=100)
 
 

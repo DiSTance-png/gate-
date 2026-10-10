@@ -74,6 +74,7 @@
 3. 先对交易所状态、日亏损和冷却进行安全巡检。
 4. Gate 数据通过 `strategy_adapter` 进入上游 R20 提示词和拦截器。
 5. AI 给出决策；系统再次执行确定性置信度、ADX、4H 方向、R:R、报价偏差和资金上限校验。
+   显式入场意图缺失时最多调用同一模型补全一次（20 秒），仅接受 entry_intent，不得修改原报价或从价格位置猜测意图；失败按合约 WAIT。
 6. 下单前把客户端订单号、基准持仓、计划张数和 TP/SL 写入 `gate_execution.db`。
 7. `GATE_ENTRY_INTENT_ENABLED=false` 时维持旧 GTC 限价语义；启用后按 `immediate/retracement/breakout` 映射到受限 IOC、GTC 或 Gate 原生 `price_orders`，禁止根据价格位置猜测意图。
 8. `execution_reconciler` 每 10 秒只按已有客户端订单号查单；突破单先按计划单 ID/`text` 查找，再使用 Gate `trade_id` 接管触发后的订单，并按真实成交价重算保护。
