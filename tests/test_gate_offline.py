@@ -7,7 +7,7 @@ from gate_quant.client import GateFuturesClient, AmbiguousOrderError
 from gate_quant.config import GateSettings
 from gate_quant.risk import RiskLimits
 from gate_quant.service import GateTradingService, protection_coverage_status
-from gate_quant.ai_worker import _extract_decision_object, _extract_response_object, _as_instruction_list, _order_size_for_margin, _protection_matches, _reduce_crossed_protection_slice, _execution_enabled, _account_committed_margin, _portfolio_position_notional, _requote_decision, _confirm_pending_requotes, _confirmed_requote_candidates, _preflight_candidate_quotes, _run_serial_candidates, _entry_execution_plan, _breakout_compatible_size, _manage_breakout_plans, _untracked_trigger_entries, _features, _strategy_package, _stop_is_at_breakeven, _add_on_rejection, _chronological_candles
+from gate_quant.ai_worker import _extract_decision_object, _extract_response_object, _as_instruction_list, _order_size_for_margin, _protection_matches, _reduce_crossed_protection_slice, _execution_enabled, _account_committed_margin, _portfolio_position_notional, _requote_decision, _confirm_pending_requotes, _confirmed_requote_candidates, _preflight_candidate_quotes, _run_serial_candidates, _manage_open_entry_orders, _entry_execution_plan, _breakout_compatible_size, _manage_breakout_plans, _untracked_trigger_entries, _features, _strategy_package, _stop_is_at_breakeven, _add_on_rejection, _chronological_candles
 from gate_quant.execution_journal import ExecutionJournal
 from gate_quant.strategy_adapter import validate_decision
 from gate_quant.risk_profiles import get_risk_profile
@@ -272,7 +272,7 @@ def test_confirmed_requote_cannot_use_new_cycle_price_as_a_fresh_plan(monkeypatc
             return [{"mark_price": "110"}]
 
     eligible, blocked = _preflight_candidate_quotes(
-        Quotes(), candidates, {}, confirmed, now_ms=2000, entry_intent_enabled=True,
+        Quotes(), candidates, {}, confirmed, now_ms=2000, entry_intent_enabled=False,
     )
 
     assert eligible == []
@@ -377,6 +377,128 @@ def test_confirmed_retracement_reprices_to_current_quote(monkeypatch, tmp_path):
     assert eligible[0]["decision"]["take_profit_price"] == 106
     assert eligible[0]["decision"]["stop_loss_price"] == 97
     assert eligible[0]["quote_preflight"]["confirmation_state"] == "CONFIRMED"
+
+
+def test_explicit_retracement_creates_real_gtc_candidate_without_touch_reclaim(monkeypatch, tmp_path):
+    import gate_quant.ai_worker as worker
+    monkeypatch.setattr(worker, "PENDING_REQUOTES", tmp_path / "pending.json")
+    class Quotes:
+        def tickers(self, symbol):
+            return [{"mark_price": "100", "highest_bid": "99.9", "lowest_ask": "100.1"}]
+    candidate = {"instId": "ETH_USDT", "indicators": {"last": 100}, "decision": {
+        "action": "BUY_LONG", "confidence": 80, "entry_intent": "retracement",
+        "entry_price": 99, "take_profit_price": 103, "stop_loss_price": 97,
+    }}
+    pending = {}
+    eligible, blocked = _preflight_candidate_quotes(
+        Quotes(), [candidate], pending, set(), now_ms=2000, entry_intent_enabled=True,
+    )
+    assert blocked == []
+    assert eligible == [candidate]
+    assert candidate["quote_preflight"]["requote_status"] == "explicit_entry_intent"
+    assert pending == {}
+
+
+def test_existing_entry_order_defaults_to_keep_and_blocks_duplicate():
+    class Client:
+        def cancel_order(self, order_id, contract=None):
+            raise AssertionError("KEEP must not cancel")
+        def open_orders(self, contract=None):
+            return []
+    class Journal:
+        def get(self, client_id):
+            return {"client_id": client_id}
+        def update(self, *args, **kwargs):
+            raise AssertionError("KEEP must not mutate journal")
+    order = {"id": "11", "contract": "ETH_USDT", "size": "2", "left": "2", "text": "t-gate-ai-old"}
+    result = _manage_open_entry_orders(Client(), Journal(), [order], [], {}, settings())
+    assert result["blocked_contracts"] == {"ETH_USDT"}
+    assert result["replacement_contracts"] == set()
+    assert result["outcomes"][0]["action"] == "KEEP"
+    assert result["stop_cycle"] is False
+
+
+def test_amend_cancel_confirms_then_allows_fresh_candidate_through_full_pipeline():
+    class Client:
+        def __init__(self):
+            self.orders = [{"id": "11", "contract": "ETH_USDT", "size": "2", "left": "2", "text": "t-gate-ai-old"}]
+        def cancel_order(self, order_id, contract=None):
+            self.orders = [row for row in self.orders if row["id"] != order_id]
+            return {"id": order_id, "status": "cancelled"}
+        def open_orders(self, contract=None):
+            return list(self.orders)
+    class Journal:
+        def __init__(self):
+            self.updates = []
+        def get(self, client_id):
+            return {"client_id": client_id, "contract": "ETH_USDT", "requested_size": "2"}
+        def update(self, client_id, status=None, **fields):
+            self.updates.append((client_id, status, fields))
+            return {"client_id": client_id, "status": status, **fields}
+    client, journal = Client(), Journal()
+    decisions = {"ETH_USDT": {"decision": {
+        "action": "BUY_LONG", "entry_intent": "retracement", "entry_price": 99,
+    }}}
+    result = _manage_open_entry_orders(
+        client, journal, list(client.orders),
+        [{"order_id": "11", "contract": "ETH_USDT", "action": "AMEND"}],
+        decisions, settings(),
+    )
+    assert result["blocked_contracts"] == set()
+    assert result["replacement_contracts"] == {"ETH_USDT"}
+    assert result["cancelled_order_ids"] == {"11"}
+    assert result["outcomes"][0]["status"] == "cancelled_for_revalidation"
+    assert journal.updates[0][1] == "replaced_by_new_signal"
+
+
+def test_amend_is_rejected_after_partial_fill_or_without_valid_retracement():
+    class Client:
+        def cancel_order(self, order_id, contract=None):
+            raise AssertionError("invalid AMEND must keep the order")
+        def open_orders(self, contract=None):
+            return []
+    class Journal:
+        def get(self, client_id):
+            return {"client_id": client_id}
+        def update(self, *args, **kwargs):
+            raise AssertionError("invalid AMEND must not mutate journal")
+    order = {"id": "11", "contract": "ETH_USDT", "size": "2", "left": "1", "text": "t-gate-ai-old"}
+    decisions = {"ETH_USDT": {"decision": {
+        "action": "BUY_LONG", "entry_intent": "retracement", "entry_price": 99,
+    }}}
+    result = _manage_open_entry_orders(
+        Client(), Journal(), [order],
+        [{"order_id": "11", "contract": "ETH_USDT", "action": "AMEND"}],
+        decisions, settings(),
+    )
+    assert result["blocked_contracts"] == {"ETH_USDT"}
+    assert result["outcomes"][0]["status"] == "amend_rejected"
+    assert result["stop_cycle"] is False
+
+
+def test_pending_order_cancel_timeout_stops_cycle_without_replacement():
+    class Client:
+        def cancel_order(self, order_id, contract=None):
+            raise RuntimeError("Gate DELETE request timed out")
+        def open_orders(self, contract=None):
+            return [{"id": "11"}]
+    class Journal:
+        def get(self, client_id):
+            return {"client_id": client_id, "contract": "ETH_USDT", "requested_size": "2"}
+        def update(self, *args, **kwargs):
+            raise AssertionError("ambiguous cancellation must not become terminal")
+    order = {"id": "11", "contract": "ETH_USDT", "size": "2", "left": "2", "text": "t-gate-ai-old"}
+    result = _manage_open_entry_orders(
+        Client(), Journal(), [order],
+        [{"order_id": "11", "contract": "ETH_USDT", "action": "AMEND"}],
+        {"ETH_USDT": {"decision": {
+            "action": "BUY_LONG", "entry_intent": "retracement", "entry_price": 99,
+        }}}, settings(),
+    )
+    assert result["blocked_contracts"] == {"ETH_USDT"}
+    assert result["replacement_contracts"] == set()
+    assert result["stop_cycle"] is True
+    assert result["outcomes"][0]["status"] == "ambiguous_or_failed"
 
 
 def test_deferred_high_confidence_candidate_does_not_hide_next_signal(monkeypatch, tmp_path):
@@ -928,7 +1050,9 @@ def test_gate_prompt_emits_retracement_candidates_without_weakening_hard_gates(m
     )
 
     for prompt in (system_prompt, user_prompt):
-        assert "retracement 候选尚未触价或收回时仍可输出 BUY_LONG/SELL_SHORT" in prompt
+        assert "retracement 候选通过全部确定性风控后会创建 Gate 原生 GTC 限价单" in prompt
+        assert "KEEP、AMEND 或 CANCEL" in prompt
+        assert "本地触价、收回和二次动量确认" in prompt
         assert "PULLBACK_UP/REBOUND_DOWN 可以生成 retracement 候选" in prompt
         assert "TRANSITION 默认必须 WAIT" in prompt
         assert "1H RSI 必须低于 78" in prompt

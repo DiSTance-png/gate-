@@ -32,7 +32,7 @@
 - `gate_quant/client.py`：Gate API v4 签名、请求和 Gate Futures 原生端点。
 - `gate_quant/config.py`：环境选择、凭证选择和 fail-closed 配置校验。
 - `gate_quant/strategy_adapter.py`：把 Gate 数据适配到上游 R20 策略契约；不要另造平行策略链。
-- `gate_quant/regime.py`、`gate_quant/entry_confirmation.py`、`gate_quant/portfolio_risk.py`：确定性行情状态、回踩确认与相关敞口门禁；AI 输出不得绕过。
+- `gate_quant/regime.py`、`gate_quant/portfolio_risk.py`：确定性行情状态与相关敞口门禁；AI 输出不得绕过。`gate_quant/entry_confirmation.py` 仅保留给关闭显式入场意图时的旧兼容路径。
 - `gate_quant/ai_worker.py`：15 分钟 AI 决策、持仓/挂单管理和入场入口。
 - `gate_quant/execution_journal.py`：下单前 SQLite 执行意图台账。
 - `gate_quant/execution_reconciler.py`：10 秒成交、持仓与保护单对账。
@@ -76,9 +76,10 @@
 5. AI 给出决策；系统再次执行确定性置信度、ADX、4H 方向、R:R、报价偏差和资金上限校验。
    显式入场意图缺失时最多调用同一模型补全一次（20 秒），仅接受 entry_intent，不得修改原报价或从价格位置猜测意图；失败按合约 WAIT。
 6. 下单前把客户端订单号、基准持仓、计划张数和 TP/SL 写入 `gate_execution.db`。
-7. `GATE_ENTRY_INTENT_ENABLED=false` 时维持旧 GTC 限价语义；启用后按 `immediate/retracement/breakout` 映射到受限 IOC、GTC 或 Gate 原生 `price_orders`，禁止根据价格位置猜测意图。
-8. `execution_reconciler` 每 10 秒只按已有客户端订单号查单；突破单先按计划单 ID/`text` 查找，再使用 Gate `trade_id` 接管触发后的订单，并按真实成交价重算保护。
-9. `sync_gate_ledger.py` 每 15 分钟读取 Gate `/position_close`，生成历史平仓台账。
+7. `GATE_ENTRY_INTENT_ENABLED=false` 时维持旧报价确认兼容路径；启用后按 `immediate/retracement/breakout` 映射到受限 IOC、Gate 原生 GTC 或 Gate 原生 `price_orders`，禁止根据价格位置猜测意图。显式 `retracement` 不再进入本地触价/收回状态机。
+8. 普通入场挂单按 `KEEP/AMEND/CANCEL` 管理。缺少合法指令默认 KEEP；AMEND 必须先确认撤销旧单，再让本轮同方向 retracement 新决策完整通过报价几何、R:R、资金、台账和保护检查，使用新客户端订单号重新提交；旧单部分成交或身份不可验证时禁止 AMEND。
+9. `execution_reconciler` 每 10 秒只按已有客户端订单号查单；突破单先按计划单 ID/`text` 查找，再使用 Gate `trade_id` 接管触发后的订单，并按真实成交价重算保护。
+10. `sync_gate_ledger.py` 每 15 分钟读取 Gate `/position_close`，生成历史平仓台账。
 
 自选交易对修改必须使用 `gate_quant/instrument_universe.py` 的“预检 → 一次性确认短语 → Gate 写锁内二次校验 → 原子保存”流程。取消币种时必须确认没有持仓、普通挂单、突破计划、保护单或执行台账活动意图；不得自动平仓或撤单来迁就配置变更。AI 周期必须在下单前校验 `instrument_pool_revision`，配置中途变化时旧决策 fail-closed。
 

@@ -405,9 +405,21 @@ def _preflight_candidate_quotes(client, candidates: list[dict], pending_requotes
         intent = str(item.get("entry_intent") or "").lower()
         entry = float(item.get("entry_price") or 0)
         action = str(item.get("action") or "")
+        # Explicit entry intent is already validated against the live Gate book
+        # by _entry_execution_plan immediately before submission.  In
+        # particular, retracement maps to a real Gate GTC order; it must not be
+        # intercepted by the legacy touch/reclaim state machine first.
+        if entry_intent_enabled and intent in ENTRY_INTENTS:
+            envelope["quote_preflight"] = {
+                "requote_status": "explicit_entry_intent",
+                "original_entry_price": entry,
+                "reference_price": reference,
+            }
+            eligible.append(envelope)
+            continue
         is_retracement = (
-            intent == "retracement" if entry_intent_enabled
-            else (action == "BUY_LONG" and 0 < entry < reference) or (action == "SELL_SHORT" and entry > reference > 0)
+            (action == "BUY_LONG" and 0 < entry < reference)
+            or (action == "SELL_SHORT" and entry > reference > 0)
         )
         if is_retracement and symbol in confirmed_requotes:
             confirmed_decision, confirmed_quote = _requote_decision(
@@ -460,14 +472,6 @@ def _preflight_candidate_quotes(client, candidates: list[dict], pending_requotes
             blocked.append({"status": "blocked_pending_reconfirmation", "contract": symbol,
                             "reason": reason, "requested_entry": entry,
                             "reference_price": reference, "confirmation_state": state})
-            continue
-        if entry_intent_enabled and intent in ENTRY_INTENTS:
-            envelope["quote_preflight"] = {
-                "requote_status": "explicit_entry_intent",
-                "original_entry_price": float(item.get("entry_price") or 0),
-                "reference_price": reference,
-            }
-            eligible.append(envelope)
             continue
         _, requote = _requote_decision(item, reference)
         if symbol in confirmed_requotes or requote["requote_status"] == "unchanged":
@@ -988,6 +992,157 @@ def _run_serial_candidates(candidates: list[dict], max_entries: int, executor) -
         if outcome["stop_cycle"]:
             break
     return outcomes, submitted
+
+
+def _manage_open_entry_orders(
+    client: GateFuturesClient,
+    journal: ExecutionJournal,
+    pending_orders: list[dict],
+    instructions: list[dict],
+    decisions_payload: dict[str, dict],
+    settings,
+) -> dict[str, Any]:
+    """Apply KEEP/CANCEL/AMEND without allowing duplicate Gate entry orders.
+
+    AMEND deliberately uses cancel-confirm-then-recreate instead of mutating an
+    exchange order in place.  The replacement therefore passes through the
+    normal quote geometry, R:R, exposure, journal and protection checks with a
+    fresh client order id.  Missing instructions default to KEEP.
+    """
+    by_id: dict[str, dict] = {}
+    by_contract: dict[str, list[dict]] = {}
+    for raw in instructions:
+        if not isinstance(raw, dict):
+            continue
+        order_id = str(raw.get("order_id") or raw.get("ordId") or "")
+        contract = str(raw.get("contract") or raw.get("instId") or "").upper().replace("-USDT-SWAP", "_USDT").replace("-", "_")
+        if order_id:
+            by_id[order_id] = raw
+        if contract:
+            by_contract.setdefault(contract, []).append(raw)
+
+    limits = RiskLimits(
+        settings.max_position_notional_usd,
+        settings.max_total_margin_usd,
+        settings.max_order_margin_usd,
+    )
+    service = GateTradingService(client, limits)
+    blocked_contracts: set[str] = set()
+    replacement_contracts: set[str] = set()
+    cancelled_order_ids: set[str] = set()
+    outcomes: list[dict] = []
+    stop_cycle = False
+
+    entry_orders = [
+        row for row in pending_orders
+        if isinstance(row, dict)
+        and not bool(row.get("reduce_only") or row.get("is_reduce_only"))
+        and not bool(row.get("close") or row.get("is_close"))
+    ]
+    contract_counts: dict[str, int] = {}
+    for row in entry_orders:
+        contract = str(row.get("contract") or "").upper()
+        contract_counts[contract] = contract_counts.get(contract, 0) + 1
+
+    for order in entry_orders:
+        order_id = str(order.get("id") or "")
+        contract = str(order.get("contract") or "").upper()
+        if not order_id or not contract:
+            stop_cycle = True
+            outcomes.append({"action": "KEEP", "error": "Gate 挂单缺少订单号或合约，整轮安全暂停"})
+            continue
+        candidates = by_contract.get(contract) or []
+        instruction = by_id.get(order_id)
+        if instruction is None and len(candidates) == 1 and contract_counts.get(contract) == 1:
+            instruction = candidates[0]
+        action = str((instruction or {}).get("action") or "KEEP").upper()
+        if action not in {"KEEP", "CANCEL", "AMEND"}:
+            action = "KEEP"
+
+        order_text = str(order.get("text") or "")
+        system_owned = order_text.startswith("t-gate-ai-")
+        try:
+            signed_size = Decimal(str(order.get("size") or 0))
+            size = abs(signed_size)
+            left = abs(Decimal(str(order.get("left") if order.get("left") is not None else size)))
+        except Exception:
+            blocked_contracts.add(contract)
+            stop_cycle = True
+            outcomes.append({
+                "contract": contract, "order_id": order_id, "action": "KEEP",
+                "status": "kept_invalid_order_shape",
+                "error": "Gate 挂单张数字段无效，整轮安全暂停",
+            })
+            continue
+        partially_filled = size > 0 and left < size
+        intent = journal.get(order_text) if system_owned else None
+
+        if action == "KEEP":
+            blocked_contracts.add(contract)
+            outcomes.append({"contract": contract, "order_id": order_id, "action": "KEEP", "status": "kept"})
+            continue
+        if not system_owned or not intent:
+            blocked_contracts.add(contract)
+            outcomes.append({
+                "contract": contract, "order_id": order_id, "action": "KEEP",
+                "status": "kept_unverified_order",
+                "error": "非本系统订单或执行台账缺失，禁止自动撤改",
+            })
+            continue
+
+        if action == "AMEND":
+            current = (decisions_payload.get(contract) or {}).get("decision") or {}
+            expected_action = "BUY_LONG" if signed_size > 0 else "SELL_SHORT"
+            replacement_valid = (
+                not partially_filled
+                and str(current.get("action") or "") == expected_action
+                and str(current.get("entry_intent") or "").lower() == "retracement"
+                and float(current.get("entry_price") or 0) > 0
+            )
+            if not replacement_valid:
+                blocked_contracts.add(contract)
+                outcomes.append({
+                    "contract": contract, "order_id": order_id, "action": "KEEP",
+                    "status": "amend_rejected",
+                    "error": "AMEND 缺少同方向 retracement 新决策，或旧单已部分成交",
+                })
+                continue
+        try:
+            cancelled = service.cancel_order_confirmed(contract=contract, order_id=order_id)
+            cancelled_order_ids.add(order_id)
+            if action == "AMEND":
+                journal.update(order_text, "replaced_by_new_signal", order_status="cancelled_for_replacement", last_error="")
+                replacement_contracts.add(contract)
+                outcomes.append({
+                    "contract": contract, "order_id": order_id, "action": "AMEND",
+                    "status": "cancelled_for_revalidation", "result": cancelled,
+                })
+            else:
+                if partially_filled:
+                    reconciled = reconcile_intent(client, journal, intent, settings)
+                    stop_cycle = stop_cycle or str(reconciled.get("status") or "") in {"manual_review", "reconciliation_pending"}
+                else:
+                    reconciled = journal.update(order_text, "unfilled", order_status="cancelled_by_ai", last_error="")
+                blocked_contracts.add(contract)
+                outcomes.append({
+                    "contract": contract, "order_id": order_id, "action": "CANCEL",
+                    "status": "cancelled", "result": cancelled, "reconciliation": reconciled,
+                })
+        except Exception as exc:
+            blocked_contracts.add(contract)
+            stop_cycle = True
+            outcomes.append({
+                "contract": contract, "order_id": order_id, "action": action,
+                "status": "ambiguous_or_failed", "error": str(exc),
+            })
+
+    return {
+        "outcomes": outcomes,
+        "blocked_contracts": blocked_contracts - replacement_contracts,
+        "replacement_contracts": replacement_contracts,
+        "cancelled_order_ids": cancelled_order_ids,
+        "stop_cycle": stop_cycle,
+    }
 
 
 def _manage_breakout_plans(client: GateFuturesClient, journal: ExecutionJournal,
@@ -1715,7 +1870,7 @@ def run_cycle() -> dict:
                       f'The decisions object must contain exactly the configured Gate contracts {symbols} and each item must include direction_bias LONG|SHORT|NEUTRAL, action BUY_LONG|SELL_SHORT|WAIT, confidence 0-100, entry_price, take_profit_price, stop_loss_price, leverage={settings.leverage:g}, margin_usdt (positive and <= {settings.max_order_margin_usd:.2f}), summary_reason'
                       + (', and entry_intent immediate|retracement|breakout. ' if settings.entry_intent_enabled else '. ')
                       + f'Active Gate risk profile={risk_profile.label}: confidence>={risk_profile.min_confidence:g}%, DOGE>={risk_profile.doge_min_confidence:g}%, ADX>={risk_profile.min_adx:g}, R:R>={risk_profile.min_rr:g}, target R:R>={risk_profile.target_rr:g}, effective per-order margin cap={settings.max_order_margin_usd * risk_profile.margin_ratio:.2f} USDT, total margin cap={settings.max_total_margin_usd:.2f} USDT, max actual entries this cycle={settings.max_entries_per_cycle}. Different Gate contracts may be held concurrently and an active contract may be added to only in the same direction, subject to aggregate limits and complete TP/SL coverage. A deferred or rejected symbol must not force unrelated qualified symbols to WAIT. '
-                      'position_management actions are HOLD|CLOSE_MARKET|UPDATE_SL; pending_orders_management actions are KEEP|CANCEL. '
+                      'position_management actions are HOLD|CLOSE_MARKET|UPDATE_SL; pending_orders_management actions are KEEP|AMEND|CANCEL and must include order_id plus contract. '
                       'Gate Futures data: ' + json.dumps({"instruments": features, "account": private_context["account"], "positions": private_context["positions"], "pending_orders": private_context["pending_orders"]}, ensure_ascii=False))
             system_prompt = "You are a Gate Futures risk-controlled trading decision model. Return the final JSON object only."
         if position_age_reviews:
@@ -1786,7 +1941,14 @@ def run_cycle() -> dict:
     position_management = _as_instruction_list(management.get("position_management"))
     pending_management = _as_instruction_list(management.get("pending_orders_management"))
     decisions_payload = {symbol: {"instId": symbol, "decision_timestamp_ms": now, "decision": item, "source": llm_source, "llm_error": llm_error, "llm_preview": llm_preview, "policy_version": policy_snapshot["policy_version"], "policy_hash": policy_snapshot["policy_hash"], "risk_snapshot": risk_snapshot, "indicators": next(f for f in features if f["contract"] == symbol)} for symbol, item in decisions.items()}
-    pending_requotes = _load_pending_requotes(now)
+    if settings.entry_intent_enabled:
+        # The explicit-intent path owns a real Gate order lifecycle.  Legacy
+        # local touch/reclaim plans are not execution state and must not be
+        # allowed to re-enter the candidate set after this mode is enabled.
+        pending_requotes = {}
+        _save_pending_requotes(pending_requotes)
+    else:
+        pending_requotes = _load_pending_requotes(now)
     # Apply the inherited deterministic quote gate before selecting a candidate.
     try:
         from .strategy_adapter import validate_decision
@@ -1822,7 +1984,16 @@ def run_cycle() -> dict:
             settings,
         )
     result: dict = {"trade": {"status": "not_submitted", "reason": f"Gate {settings.environment.title()} automatic execution is disabled" if not execution_enabled else f"No qualifying {settings.environment.title()} signal"}}
-    confirmed_requotes = _confirm_pending_requotes(pending_requotes, decisions_payload, min_confidence=risk_profile.min_confidence, now_ms=now)
+    confirmed_requotes = (
+        {}
+        if settings.entry_intent_enabled
+        else _confirm_pending_requotes(
+            pending_requotes,
+            decisions_payload,
+            min_confidence=risk_profile.min_confidence,
+            now_ms=now,
+        )
+    )
     executable_by_symbol = {
         str(d["instId"]): d for d in decisions_payload.values()
         if d["decision"].get("action") in {"BUY_LONG", "SELL_SHORT"}
@@ -1845,6 +2016,8 @@ def run_cycle() -> dict:
     action = decision["decision"]["action"]
     confidence = float(decision["decision"].get("confidence") or 0)
     last = trade_feature["last"]
+    pending_order_blocked_contracts: set[str] = set()
+    pending_lifecycle_stop = False
     if execution_enabled and llm_source == "gate-multifactor-llm":
         management_result = {"positions": [], "pending_orders": []}
         # Apply only explicit, schema-valid lifecycle instructions. Missing or
@@ -1884,33 +2057,35 @@ def run_cycle() -> dict:
                     })
             except Exception as exc:
                 management_result["positions"].append({"contract": contract_name, "action": mgmt_action, "error": str(exc)})
-        for instruction in pending_management:
-            if not isinstance(instruction, dict) or str(instruction.get("action") or "").upper() != "CANCEL":
-                continue
-            order_id = str(instruction.get("order_id") or instruction.get("ordId") or "")
-            contract_name = str(instruction.get("contract") or instruction.get("instId") or "").upper().replace("-USDT-SWAP", "_USDT").replace("-", "_")
-            if not order_id or not contract_name:
-                continue
-            try:
-                pending = next((row for row in private_context["pending_orders"] if str(row.get("id") or "") == order_id and str(row.get("contract") or "").upper() == contract_name), {})
-                order_text = str(pending.get("text") or "")
-                cancelled_protections = []
-                if order_text.startswith("t-gate-ai-"):
-                    suffix = order_text.removeprefix("t-gate-ai-")
-                    for protection in client.protection_orders(contract_name) or []:
-                        protection_text = str((protection.get("initial") or {}).get("text") or "")
-                        if protection_text in {f"t-gate-tp-{suffix}", f"t-gate-sl-{suffix}"}:
-                            cancelled_protections.append(client.cancel_protection_order(str(protection.get("id"))))
-                management_result["pending_orders"].append({"contract": contract_name, "order_id": order_id, "result": client.cancel_order(order_id, contract_name), "cancelled_protections": cancelled_protections})
-            except Exception as exc:
-                management_result["pending_orders"].append({"contract": contract_name, "order_id": order_id, "error": str(exc)})
+        pending_lifecycle = _manage_open_entry_orders(
+            client,
+            ExecutionJournal(EXECUTION_JOURNAL),
+            private_context["pending_orders"],
+            pending_management,
+            decisions_payload,
+            settings,
+        )
+        management_result["pending_orders"] = pending_lifecycle["outcomes"]
+        pending_order_blocked_contracts = set(pending_lifecycle["blocked_contracts"])
+        pending_lifecycle_stop = bool(pending_lifecycle["stop_cycle"])
+        cancelled_order_ids = set(pending_lifecycle["cancelled_order_ids"])
+        if cancelled_order_ids:
+            private_context["pending_orders"] = [
+                row for row in private_context["pending_orders"]
+                if str((row or {}).get("id") or "") not in cancelled_order_ids
+            ]
         result["management"] = management_result
+    if pending_order_blocked_contracts:
+        executable = [
+            row for row in executable
+            if str(row.get("instId") or "") not in pending_order_blocked_contracts
+        ]
     # Execute qualifying symbols independently. A deferred/rejected candidate is
     # recorded but does not consume an entry slot or hide the next valid signal.
     candidate_outcomes: list[dict] = []
     submitted_trades: list[dict] = []
     universe_unchanged = instrument_pool_revision() == universe_revision
-    if execution_enabled and safety_status["safe_for_new_risk"] and not breakout_stop_cycle and llm_source == "gate-multifactor-llm" and universe_unchanged:
+    if execution_enabled and safety_status["safe_for_new_risk"] and not breakout_stop_cycle and not pending_lifecycle_stop and llm_source == "gate-multifactor-llm" and universe_unchanged:
         ordered_candidates = sorted(
             executable,
             key=lambda row: (row["instId"] in confirmed_requotes, float(row["decision"].get("confidence") or 0)),
@@ -1956,9 +2131,9 @@ def run_cycle() -> dict:
         candidate_outcomes.append({"status": "blocked_safety_fail_closed",
                                    "reason": "交易对配置在本轮 AI 决策期间发生变化；旧标的决策已作废，等待下一轮",
                                    "instrument_pool_revision": instrument_pool_revision()})
-    elif execution_enabled and (not safety_status["safe_for_new_risk"] or breakout_stop_cycle):
+    elif execution_enabled and (not safety_status["safe_for_new_risk"] or breakout_stop_cycle or pending_lifecycle_stop):
         candidate_outcomes.append({"status": "blocked_safety_fail_closed",
-                                   "reason": "Gate reconciliation, breakout lifecycle, or daily-loss gate blocked new risk",
+                                   "reason": "Gate reconciliation, pending-order lifecycle, breakout lifecycle, or daily-loss gate blocked new risk",
                                    "safety_status": safety_status})
 
     all_outcomes = [*(result.get("trade_candidates_blocked") or []), *breakout_lifecycle, *candidate_outcomes]

@@ -183,7 +183,10 @@ def build_prompt(packages: list[dict[str, Any]], *, positions: list[dict[str, An
         f"24H 涨跌绝对值达到 {ANTI_CHASE_24H_MOVE_PCT:g}% 后，若 15M 加速度朝反转方向变化则必须 WAIT。"
         "每个决策必须区分 direction_bias 与 action：direction_bias 只允许 LONG、SHORT、NEUTRAL；"
         "action 可以表达通过方向、结构、价格几何和 R:R 初筛后的入场候选；"
-        "retracement 候选尚未触价或收回时仍可输出 BUY_LONG/SELL_SHORT，实际下单必须由执行层完成触价与已收盘 15M 收回确认。"
+        "retracement 候选通过全部确定性风控后会创建 Gate 原生 GTC 限价单，不再叠加本地触价、收回和二次动量确认。"
+        "已有普通入场挂单时，必须在 pending_orders_management 中逐单输出 KEEP、AMEND 或 CANCEL："
+        "KEEP 继续等待原价；AMEND 仅在同方向 retracement 新决策仍有效时使用，执行层会先确认撤销旧单，再让新报价重新通过完整风控并创建新订单；"
+        "CANCEL 用于信号失效、转为 WAIT 或方向变化。不得通过 decisions 为同合约重复创建第二张入场单。"
         "4H 方向只限定研究方向，不构成立即入场理由；ADX 只代表强度，必须结合 +DI/-DI 判断方向。"
         "PULLBACK_UP/REBOUND_DOWN 可以生成 retracement 候选，但不能直接视为已确认成交信号；"
         "TRANSITION 默认必须 WAIT；只有宏观方向一致、retracement、置信度至少高于当前档位门槛 4 个百分点且计划价距离当前价不超过 0.8% 时，才可输出候选，最终仍须执行层确认。与开仓方向相同的 EXHAUSTION 状态必须 WAIT。"
@@ -204,6 +207,7 @@ def build_prompt(packages: list[dict[str, Any]], *, positions: list[dict[str, An
             '"take_profit_price":102,"stop_loss_price":99,"confidence":80,"margin_usdt":25}。'
             '示例数值不可照抄。返回前逐合约自检 entry_intent 是 immediate/retracement/breakout 之一；'
             '不得遗漏、返回空字符串或仅在理由中描述意图。'
+            'pending_orders_management 中每张普通入场挂单必须包含 order_id、contract 和 action，action 只能为 KEEP、AMEND、CANCEL。'
         )
     return effective_system + gate_constraints, strip_legacy_risk_values(prompt) + gate_constraints
 

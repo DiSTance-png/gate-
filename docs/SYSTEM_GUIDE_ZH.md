@@ -123,7 +123,15 @@ Gate Futures K 线进入指标计算前必须按数值时间戳升序排序，�
 
 决策链把方向观点与执行动作分开：`direction_bias=LONG|SHORT|NEUTRAL` 可在 `action=WAIT` 时保留，但不能绕过执行门禁。`gate_quant/regime.py` 使用 4H/1H 结构、1H 加速度、`+DI/-DI`、15M/1H 动量占比、VWAP 偏离和涨跌幅确定性分类 `TREND_UP/TREND_DOWN/PULLBACK_UP/REBOUND_DOWN/RANGE/TRANSITION/EXHAUSTION_*`。`TRANSITION` 禁止双向新仓；上涨衰竭禁止追多，下跌衰竭禁止追空。ADX 仅表示强度，方向必须由 `+DI/-DI` 和结构共同确认。
 
-回踩/反弹候选使用 `WAITING_TOUCH -> WAITING_RECLAIM -> CONFIRMED` 二阶段状态机。下一轮 AI 保持同方向只是必要条件；价格还必须真实触及计划区，由后续已收盘 15M K 线收回，并至少满足两个方向确认信号。确认后按受限当前报价重算入场及原 TP/SL 距离；价格偏离原计划超过 2% 时拒绝追价。
+启用显式入场意图后，回踩/反弹候选不再进入 `WAITING_TOUCH -> WAITING_RECLAIM` 本地二次策略状态机。通过确定性行情、价格几何、R:R、资金和组合风险检查后，`retracement` 直接创建 Gate 原生 GTC 限价单，由交易所等待计划价。关闭显式入场意图时，旧状态机仅作为兼容路径保留。
+
+普通入场挂单会在下一轮 AI 输入中携带订单号、合约、方向、价格、剩余张数和建立时间。`pending_orders_management` 必须逐单给出：
+
+- `KEEP`：继续等待原订单；缺少或无法识别的指令默认按 KEEP 处理。
+- `AMEND`：仅适用于本系统创建、完全未成交、且本轮仍有同方向 `retracement` 新决策的订单。执行层先确认旧单已经撤销，再让新报价重新通过全部入场风控并使用新的客户端订单号创建订单；不是绕过风控的原地改价。
+- `CANCEL`：确认撤销未成交余量。订单已部分成交时必须立即进入成交、持仓和保护对账，不能同时当作全新订单替换。
+
+同合约已有普通入场挂单时，未完成上述生命周期前禁止再提交第二张入场单。撤单或网络状态不明确时整轮 fail-closed。
 
 因此主页出现“现价做多”或 AI 原始动作，并不代表订单必然已提交。页面和审计记录同时保留原始动作、最终动作、拦截原因和交易结果，诊断时必须看最终状态。
 
@@ -308,7 +316,7 @@ Gate 官方 `FuturesInitialOrder.size` 对 `price_orders` 定义为整数张。�
 - 突破计划最长等待 `GATE_BREAKOUT_EXPIRATION_SECONDS`，默认 840 秒；下一轮 AI 观望或反向时提前撤销。
 - 同一合约只保留一个同方向突破计划；维持信号时不重复叠加。
 - 突破计划属于普通入场计划，不得计入 TP/SL 保护覆盖；主页在“在途入场委托”中独立标记。
-- AI 可在 `pending_orders_management` 中明确要求撤单，但系统仍校验订单身份和合约。
+- AI 通过 `pending_orders_management` 对普通入场单输出 `KEEP/AMEND/CANCEL`。系统仍校验订单身份、合约、成交量和执行台账；来源不明订单默认保留并阻止同合约重复开单。
 - 持仓超过 `GATE_MAX_POSITION_AGE_SECONDS`（默认 16 小时）后进入最长持仓复核，不再仅因时间到点机械平仓。AI 结合浮盈、1H/4H 趋势、结构失效和反向信号选择 `HOLD`、`UPDATE_SL` 或 `CLOSE_MARKET`。
 - 持仓达到 `GATE_ABSOLUTE_MAX_POSITION_AGE_SECONDS`（默认 36 小时）后由执行层强制平仓；该值必须大于复核阈值。
 - Gate 双向持仓使用原生 `size=0, reduce_only=true, close=false, auto_size=close_long/close_short` 平仓；单向持仓继续使用 `size=0, close=true`。平仓请求超时后必须先按客户端订单号查单，禁止盲目重发。
