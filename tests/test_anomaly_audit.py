@@ -162,3 +162,17 @@ def test_anomaly_history_keeps_immutable_occurrence_events(tmp_path):
     assert [row["first_seen_ms"] for row in events] == [NOW, NOW, NOW]
     assert [row["observed_at_ms"] for row in events] == [NOW, NOW + 60_000, NOW + 120_000]
     assert second["event_total"] > first["event_total"]
+
+
+def test_anomaly_history_backfills_first_seen_for_legacy_events(tmp_path):
+    path = tmp_path / "history.json"
+    first = persist_anomaly_history(path, collect_anomalies(**healthy_inputs(private_errors=["timeout"])))
+    events_path = tmp_path / "history_events.json"
+    legacy = [{key: value for key, value in row.items() if key != "first_seen_ms"} for row in first["events"]]
+    events_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    saved = persist_anomaly_history(
+        path,
+        collect_anomalies(**healthy_inputs(private_errors=["timeout"], now_ms=NOW + 60_000)),
+    )
+    assert all(row.get("first_seen_ms") == NOW for row in saved["events"])

@@ -445,6 +445,22 @@ def persist_anomaly_history(path: Path, report: dict[str, Any], *, max_records: 
             events.append({**old, "event": "resolved", "observed_at_ms": now_ms, "resolved_at_ms": now_ms})
     records = sorted(previous.values(), key=lambda row: int(row.get("last_seen_ms") or 0), reverse=True)[:max_records]
     events = sorted(events, key=lambda row: int(row.get("observed_at_ms") or 0))[-max_records * 5:]
+    first_seen_by_fingerprint = {
+        str(row.get("fingerprint") or ""): int(row.get("first_seen_ms") or 0)
+        for row in records if row.get("fingerprint")
+    }
+    events = [
+        {
+            **row,
+            "first_seen_ms": int(
+                row.get("first_seen_ms")
+                or first_seen_by_fingerprint.get(str(row.get("fingerprint") or ""))
+                or row.get("observed_at_ms")
+                or now_ms
+            ),
+        }
+        for row in events
+    ]
     atomic_json(path, records)
     atomic_json(events_path, events)
     return {
