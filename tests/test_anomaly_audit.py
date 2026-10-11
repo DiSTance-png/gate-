@@ -159,4 +159,6 @@ def test_anomaly_history_keeps_immutable_occurrence_events(tmp_path):
     fingerprint = next(row["fingerprint"] for row in first["items"] if row["code"] == "private_api_unavailable")
     events = [row for row in recovered["events"] if row["fingerprint"] == fingerprint]
     assert [row["event"] for row in events] == ["detected", "observed", "resolved"]
+    assert [row["first_seen_ms"] for row in events] == [NOW, NOW, NOW]
+    assert [row["observed_at_ms"] for row in events] == [NOW, NOW + 60_000, NOW + 120_000]
     assert second["event_total"] > first["event_total"]

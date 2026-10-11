@@ -93,14 +93,36 @@ def _safety_status() -> dict[str, Any]:
                   if str(row.get("status") or "") != "awaiting_trigger"]
     except Exception as exc:
         return {**payload, "safe_for_new_risk": False, "execution_journal_error": str(exc)}
-    if not active:
-        return payload
+    return _overlay_execution_reconciliation(payload, len(active))
+
+
+def _overlay_execution_reconciliation(payload: dict[str, Any], active_count: int) -> dict[str, Any]:
+    """Overlay the durable execution journal onto the slower Trader safety snapshot.
+
+    The Trader snapshot is refreshed every 15 minutes, while execution intents are
+    reconciled every 10 seconds.  Without this overlay, a completed cancellation or
+    close can leave the UI showing a stale execution_reconciliation_pending issue
+    until the next Trader cycle.
+    """
     reconciliation = dict(payload.get("reconciliation") or {})
     issues = list(reconciliation.get("issues") or [])
-    if not any(item.get("code") == "execution_reconciliation_pending" for item in issues if isinstance(item, dict)):
-        issues.append({"code": "execution_reconciliation_pending", "count": len(active)})
-    reconciliation.update({"safe_for_new_risk": False, "issues": issues})
-    return {**payload, "safe_for_new_risk": False, "reconciliation": reconciliation}
+    pending = [item for item in issues if isinstance(item, dict) and item.get("code") == "execution_reconciliation_pending"]
+    if active_count > 0:
+        if not pending:
+            issues.append({"code": "execution_reconciliation_pending", "count": active_count})
+        reconciliation.update({"safe_for_new_risk": False, "issues": issues})
+        return {**payload, "safe_for_new_risk": False, "reconciliation": reconciliation}
+    if not pending:
+        return payload
+    issues = [item for item in issues if not (isinstance(item, dict) and item.get("code") == "execution_reconciliation_pending")]
+    reconciliation.update({"safe_for_new_risk": not issues, "issues": issues})
+    safe = bool(
+        not issues
+        and not payload.get("private_errors")
+        and not (payload.get("daily_loss") or {}).get("tripped")
+        and not (payload.get("cooldown") or {}).get("active")
+    )
+    return {**payload, "safe_for_new_risk": safe, "reconciliation": reconciliation}
 
 
 def _heartbeat_status() -> dict[str, Any]:

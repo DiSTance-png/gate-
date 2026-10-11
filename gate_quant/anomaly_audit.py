@@ -426,10 +426,16 @@ def persist_anomaly_history(path: Path, report: dict[str, Any], *, max_records: 
         active_ids.add(fingerprint)
         old = previous.get(fingerprint) or {}
         event_name = "observed" if old.get("status") == "active" else "detected"
-        events.append({**current, "event": event_name, "observed_at_ms": now_ms})
+        first_seen_ms = int(old.get("first_seen_ms") or current.get("first_seen_ms") or now_ms)
+        events.append({
+            **current,
+            "event": event_name,
+            "first_seen_ms": first_seen_ms,
+            "observed_at_ms": now_ms,
+        })
         previous[fingerprint] = {
             **old, **current, "status": "active",
-            "first_seen_ms": int(old.get("first_seen_ms") or now_ms),
+            "first_seen_ms": first_seen_ms,
             "last_seen_ms": now_ms, "resolved_at_ms": None,
             "occurrences": int(old.get("occurrences") or 0) + 1,
         }

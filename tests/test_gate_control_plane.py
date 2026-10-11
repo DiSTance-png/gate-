@@ -13,6 +13,46 @@ from gate_quant.config import GateSettings, load_settings
 from gate_quant.web import _account_book_stats
 
 
+def test_execution_overlay_clears_only_stale_pending_issue():
+    from gate_quant.web import _overlay_execution_reconciliation
+
+    payload = {
+        "safe_for_new_risk": False,
+        "reconciliation": {
+            "safe_for_new_risk": False,
+            "issues": [{"code": "execution_reconciliation_pending", "count": 2}],
+        },
+        "daily_loss": {"tripped": False},
+        "cooldown": {"active": False},
+        "private_errors": [],
+    }
+    result = _overlay_execution_reconciliation(payload, 0)
+    assert result["safe_for_new_risk"] is True
+    assert result["reconciliation"]["safe_for_new_risk"] is True
+    assert result["reconciliation"]["issues"] == []
+
+
+def test_execution_overlay_remains_closed_for_other_safety_issue():
+    from gate_quant.web import _overlay_execution_reconciliation
+
+    payload = {
+        "safe_for_new_risk": False,
+        "reconciliation": {
+            "safe_for_new_risk": False,
+            "issues": [
+                {"code": "execution_reconciliation_pending", "count": 1},
+                {"code": "protection_gap", "contract": "BTC_USDT"},
+            ],
+        },
+        "daily_loss": {"tripped": False},
+        "cooldown": {"active": False},
+        "private_errors": [],
+    }
+    result = _overlay_execution_reconciliation(payload, 0)
+    assert result["safe_for_new_risk"] is False
+    assert result["reconciliation"]["issues"] == [{"code": "protection_gap", "contract": "BTC_USDT"}]
+
+
 class CaptureSession:
     def __init__(self, response):
         self.response = response
