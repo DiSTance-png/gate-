@@ -1631,6 +1631,48 @@ def _execution_enabled(settings) -> bool:
     return False
 
 
+def _refresh_entry_safety(client, journal, settings, safety_status):
+    """Reconcile existing intents, then rebuild safety from fresh exchange facts."""
+    with gate_write_lock():
+        for row in journal.active(settings.environment):
+            if str(row.get("status") or "") in {"awaiting_trigger", "manual_review"}:
+                continue
+            # Reload under the shared lock: the background reconciler may have
+            # already completed this intent since the initial cycle snapshot.
+            current = journal.get(str(row["client_id"]))
+            active_ids = {str(item["client_id"]) for item in journal.active(settings.environment)}
+            if current and str(row["client_id"]) in active_ids:
+                reconcile_intent(client, journal, current, settings)
+        context = {
+            "account": client.account() or {}, "positions": client.positions() or [],
+            "pending_orders": client.open_orders() or [],
+            "trigger_entries": client.trigger_entry_orders() or [],
+            "protections": client.protection_orders() or [], "private_errors": [],
+        }
+        pending = journal.active(settings.environment)
+        reconciliation = reconcile_exchange_state(
+            context["positions"], context["pending_orders"], context["protections"],
+            max_pending_age_seconds=settings.max_pending_order_age_seconds,
+        )
+        unsafe = [row for row in pending if str(row.get("status") or "") != "awaiting_trigger"]
+        if unsafe:
+            reconciliation["issues"].append({"code": "execution_reconciliation_pending", "count": len(unsafe),
+                "contracts": sorted({str(row.get("contract") or "") for row in unsafe})})
+        untracked = _untracked_trigger_entries(context["trigger_entries"], pending)
+        if untracked:
+            reconciliation["issues"].append({"code": "untracked_trigger_entry_orders", "orders": untracked})
+        reconciliation["safe_for_new_risk"] = not reconciliation["issues"]
+        equity = float(context["account"].get("total") or context["account"].get("available") or 0)
+        loss = daily_loss_state(LEDGER, max_loss_usd=settings.max_daily_loss_usd,
+            max_loss_ratio=settings.max_daily_loss_ratio, equity=equity,
+            reset_path=DAILY_LOSS_RESET, environment=settings.environment)
+        safety = {**safety_status, "checked_at_ms": int(time.time() * 1000),
+            "reconciliation": reconciliation, "daily_loss": loss, "private_errors": []}
+        safety["safe_for_new_risk"] = bool(reconciliation["safe_for_new_risk"] and not loss["tripped"]
+            and not (safety.get("cooldown") or {}).get("active"))
+        return context, pending, safety
+
+
 def run_cycle() -> dict:
     settings = load_settings()
     symbols = configured_gate_contracts()
@@ -2085,6 +2127,15 @@ def run_cycle() -> dict:
     candidate_outcomes: list[dict] = []
     submitted_trades: list[dict] = []
     universe_unchanged = instrument_pool_revision() == universe_revision
+    if execution_enabled and not breakout_stop_cycle and not pending_lifecycle_stop and llm_source == "gate-multifactor-llm" and universe_unchanged:
+        try:
+            private_context, pending_executions, safety_status = _refresh_entry_safety(
+                client, ExecutionJournal(EXECUTION_JOURNAL), settings, safety_status,
+            )
+        except Exception as exc:
+            safety_status = {**safety_status, "safe_for_new_risk": False,
+                "private_errors": [{"category": classify_error(exc), "error": f"执行前安全复核失败: {exc}"}]}
+        atomic_json(SAFETY_STATUS, safety_status)
     if execution_enabled and safety_status["safe_for_new_risk"] and not breakout_stop_cycle and not pending_lifecycle_stop and llm_source == "gate-multifactor-llm" and universe_unchanged:
         ordered_candidates = sorted(
             executable,

@@ -76,6 +76,7 @@
 5. AI 给出决策；系统再次执行确定性置信度、ADX、4H 方向、R:R、报价偏差和资金上限校验。
    显式入场意图缺失时最多调用同一模型补全一次（20 秒），仅接受 entry_intent，不得修改原报价或从价格位置猜测意图；失败按合约 WAIT。
 6. 下单前把客户端订单号、基准持仓、计划张数和 TP/SL 写入 `gate_execution.db`。
+   执行新候选前，在共用写锁内同步对账既有非人工复核执行意图，并重新读取账户、持仓、挂单与保护覆盖，重建安全门。不能沿用 AI 周期开始时的待对账快照；对账仍不明确、私有查询失败或真实风险异常时继续 fail-closed。
 7. `GATE_ENTRY_INTENT_ENABLED=false` 时维持旧报价确认兼容路径；启用后按 `immediate/retracement/breakout` 映射到受限 IOC、Gate 原生 GTC 或 Gate 原生 `price_orders`，禁止根据价格位置猜测意图。显式 `retracement` 不再进入本地触价/收回状态机。
 8. 普通入场挂单按 `KEEP/AMEND/CANCEL` 管理。缺少合法指令默认 KEEP；AMEND 必须先确认撤销旧单，再让本轮同方向 retracement 新决策完整通过报价几何、R:R、资金、台账和保护检查，使用新客户端订单号重新提交；旧单部分成交或身份不可验证时禁止 AMEND。
 9. `execution_reconciler` 每 10 秒只按已有客户端订单号查单；突破单先按计划单 ID/`text` 查找，再使用 Gate `trade_id` 接管触发后的订单，并按真实成交价重算保护。
