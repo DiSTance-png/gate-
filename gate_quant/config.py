@@ -26,6 +26,7 @@ class GateSettings:
     max_position_notional_usd: float = 0.0
     max_total_margin_usd: float = 0.0
     max_order_margin_usd: float = 0.0
+    max_contract_margin_usd: float = 300.0
     public_market_environment: str = "live"
     require_proxy: bool = False
     initial_capital_usd: float = 0.0
@@ -69,7 +70,7 @@ class GateSettings:
             raise ValueError("GATE_MAX_ENTRIES_PER_CYCLE must be between 0 and 2")
         if self.max_entries_per_cycle > profile.max_entries_per_cycle:
             raise ValueError(f"GATE_MAX_ENTRIES_PER_CYCLE cannot exceed {profile.max_entries_per_cycle} for risk profile {profile.key}")
-        for name, value in (("max_position_notional_usd", self.max_position_notional_usd), ("max_total_margin_usd", self.max_total_margin_usd), ("max_order_margin_usd", self.max_order_margin_usd)):
+        for name, value in (("max_position_notional_usd", self.max_position_notional_usd), ("max_total_margin_usd", self.max_total_margin_usd), ("max_order_margin_usd", self.max_order_margin_usd), ("max_contract_margin_usd", self.max_contract_margin_usd)):
             if value < 0:
                 raise ValueError(f"{name} cannot be negative")
         if self.public_market_environment not in {"testnet", "live"}:
@@ -120,6 +121,7 @@ def load_settings() -> GateSettings:
         max_position_notional_usd=float(os.getenv("GATE_MAX_POSITION_NOTIONAL_USD", "0")),
         max_total_margin_usd=float(os.getenv("GATE_MAX_TOTAL_MARGIN_USD", "0")),
         max_order_margin_usd=float(os.getenv("GATE_MAX_ORDER_MARGIN_USD", "0")),
+        max_contract_margin_usd=float(os.getenv("GATE_MAX_CONTRACT_MARGIN_USD", "300")),
         public_market_environment=os.getenv("GATE_PUBLIC_MARKET_ENV", "live").strip().lower(),
         require_proxy=_bool("GATE_REQUIRE_PROXY"),
         initial_capital_usd=float(os.getenv("GATE_INITIAL_CAPITAL_USD", "0")),

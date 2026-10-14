@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 
-PORTFOLIO_RISK_VERSION = "gate-portfolio-risk-v2"
+PORTFOLIO_RISK_VERSION = "gate-portfolio-risk-v3"
 
 
 def _contract(value: Any) -> str:
@@ -39,19 +39,21 @@ def correlated_exposure_gate(
         if _is_crypto_beta(name) and str(row.get("side") or "").lower() == side:
             exposed.add(name)
 
-    count = len(exposed)
-    if count >= 2:
+    # An add-on to an already exposed contract does not create another
+    # correlated instrument. Count distinct *other* contracts only.
+    other_exposed = exposed - {target}
+    if len(other_exposed) >= 3:
         return {
             "allowed": False,
             "margin_scale": 0.0,
             "same_direction_contracts": sorted(exposed),
-            "reason": "组合相关风险门禁：已有两个同方向加密 Beta 敞口，禁止新增或加仓。",
+            "reason": "组合相关风险门禁：已有三个其他币种的同方向加密 Beta 敞口，禁止新增第四个币种。",
             "version": PORTFOLIO_RISK_VERSION,
         }
     return {
         "allowed": True,
-        "margin_scale": 0.5 if count == 1 else 1.0,
+        "margin_scale": 1.0,
         "same_direction_contracts": sorted(exposed),
-        "reason": "组合相关风险缩放：第二个同方向加密 Beta 敞口保证金减半。" if count == 1 else "",
+        "reason": "",
         "version": PORTFOLIO_RISK_VERSION,
     }

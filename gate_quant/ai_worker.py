@@ -59,6 +59,7 @@ TRADE_STATUS_LABELS = {
     "blocked_add_limit": "本持仓周期已加仓一次",
     "blocked_unfilled_cooldown": "未成交订单冷却中",
     "blocked_correlated_exposure": "相关同向敞口已满，禁止开仓",
+    "blocked_contract_margin_limit": "单币种累计保证金已达上限",
     "existing_breakout_plan_kept": "保留现有突破计划单",
     "breakout_cancelled_by_new_signal": "新信号已撤销突破计划单",
     "breakout_triggered_reconciliation_pending": "突破已触发，等待成交保护对账",
@@ -560,6 +561,62 @@ def _portfolio_position_notional(client: GateFuturesClient, positions: list[dict
     return float(total)
 
 
+def _contract_position_margin(client: GateFuturesClient, positions: list[dict], contract: str,
+                              fallback_leverage: float) -> float:
+    """Conservatively derive one contract's occupied position margin."""
+    target = str(contract or "").upper()
+    total = Decimal("0")
+    multiplier_cache: dict[str, Decimal] = {}
+    for position in positions or []:
+        if str(position.get("contract") or "").upper() != target:
+            continue
+        size = abs(Decimal(str(position.get("size") or 0)))
+        if size == 0:
+            continue
+        price = Decimal(str(position.get("mark_price") or position.get("entry_price") or 0))
+        multiplier = Decimal(str(position.get("quanto_multiplier") or 0))
+        if multiplier <= 0:
+            if target not in multiplier_cache:
+                metadata = client.contracts(target)
+                multiplier_cache[target] = Decimal(str(metadata.get("quanto_multiplier") or 0))
+            multiplier = multiplier_cache[target]
+        leverage = Decimal(str(position.get("leverage") or 0))
+        if leverage <= 0:
+            leverage = Decimal(str(fallback_leverage or 0))
+        if price <= 0 or multiplier <= 0 or leverage <= 0:
+            raise RuntimeError(f"Cannot enforce contract margin limit for {target}")
+        total += size * multiplier * price / leverage
+    return float(total)
+
+
+def _contract_open_order_margin(client: GateFuturesClient, orders: list[dict], contract: str,
+                                fallback_leverage: float) -> float:
+    target = str(contract or "").upper()
+    metadata = None
+    total = Decimal("0")
+    for order in orders or []:
+        if str(order.get("contract") or "").upper() != target:
+            continue
+        size = abs(Decimal(str(order.get("left") or order.get("size") or 0)))
+        if size == 0:
+            continue
+        price = Decimal(str(order.get("price") or 0))
+        if metadata is None:
+            metadata = client.contracts(target)
+        multiplier = Decimal(str((metadata or {}).get("quanto_multiplier") or 0))
+        leverage = Decimal(str(order.get("leverage") or 0))
+        if leverage <= 0:
+            leverage = Decimal(str(fallback_leverage or 0))
+        if price <= 0 or multiplier <= 0 or leverage <= 0:
+            raise RuntimeError(f"Cannot enforce open-order contract margin limit for {target}")
+        total += size * multiplier * price / leverage
+    return float(total)
+
+
+def _contract_margin_allowed(current_margin: float, order_margin: float, limit: float) -> bool:
+    return limit > 0 and current_margin >= 0 and order_margin > 0 and current_margin + order_margin <= limit + 1e-9
+
+
 def _untracked_trigger_entries(trigger_entries: list[dict], execution_intents: list[dict]) -> list[dict]:
     """Return non-reduce price orders that have no matching durable execution intent."""
     known_client_ids = {str(row.get("client_id") or "") for row in execution_intents}
@@ -812,6 +869,16 @@ def _execute_entry_candidate_locked(client: GateFuturesClient, envelope: dict, *
 
     current_margin = max(_account_committed_margin(account), risk_state["baseline_margin"] + risk_state["reserved_margin"])
     current_notional = max(_portfolio_position_notional(client, positions), risk_state["baseline_notional"] + risk_state["reserved_notional"])
+    contract_margin = _contract_position_margin(client, positions, trade_symbol, leverage)
+    contract_margin += _contract_open_order_margin(client, client.open_orders() or [], trade_symbol, leverage)
+    contract_margin += float(risk_state.setdefault("contract_reserved_margin", {}).get(trade_symbol, 0))
+    if not _contract_margin_allowed(contract_margin, estimated_margin, settings.max_contract_margin_usd):
+        return {"trade": {"status": "blocked_contract_margin_limit", "contract": trade_symbol,
+                          "reason": "单币种累计保证金超过配置上限",
+                          "current_contract_margin_usd": contract_margin,
+                          "order_margin_usd": estimated_margin,
+                          "max_contract_margin_usd": settings.max_contract_margin_usd},
+                "submitted": False, "stop_cycle": False}
     risk = {"order_margin_usd": estimated_margin, "current_margin_usd": current_margin,
             "current_position_notional_usd": current_notional, "order_notional_usd": order_notional,
             "environment": settings.environment, "live_enabled": settings.live_trading_enabled}
@@ -936,6 +1003,8 @@ def _execute_entry_candidate_locked(client: GateFuturesClient, envelope: dict, *
         lifecycle = {"status": "reconciliation_pending", "last_error": str(exc)}
     risk_state["reserved_margin"] += estimated_margin
     risk_state["reserved_notional"] += order_notional
+    contract_reservations = risk_state.setdefault("contract_reserved_margin", {})
+    contract_reservations[trade_symbol] = float(contract_reservations.get(trade_symbol, 0)) + estimated_margin
     risk_state["directional_reservations"].append({
         "contract": trade_symbol,
         "side": "long" if size > 0 else "short",
@@ -1911,7 +1980,7 @@ def run_cycle() -> dict:
             prompt = ('Output ONLY one compact final JSON object with top-level keys decisions, position_management, pending_orders_management. '
                       f'The decisions object must contain exactly the configured Gate contracts {symbols} and each item must include direction_bias LONG|SHORT|NEUTRAL, action BUY_LONG|SELL_SHORT|WAIT, confidence 0-100, entry_price, take_profit_price, stop_loss_price, leverage={settings.leverage:g}, margin_usdt (positive and <= {settings.max_order_margin_usd:.2f}), summary_reason'
                       + (', and entry_intent immediate|retracement|breakout. ' if settings.entry_intent_enabled else '. ')
-                      + f'Active Gate risk profile={risk_profile.label}: confidence>={risk_profile.min_confidence:g}%, DOGE>={risk_profile.doge_min_confidence:g}%, ADX>={risk_profile.min_adx:g}, R:R>={risk_profile.min_rr:g}, target R:R>={risk_profile.target_rr:g}, effective per-order margin cap={settings.max_order_margin_usd * risk_profile.margin_ratio:.2f} USDT, total margin cap={settings.max_total_margin_usd:.2f} USDT, max actual entries this cycle={settings.max_entries_per_cycle}. Different Gate contracts may be held concurrently and an active contract may be added to only in the same direction, subject to aggregate limits and complete TP/SL coverage. A deferred or rejected symbol must not force unrelated qualified symbols to WAIT. '
+                      + f'Active Gate risk profile={risk_profile.label}: confidence>={risk_profile.min_confidence:g}%, DOGE>={risk_profile.doge_min_confidence:g}%, ADX>={risk_profile.min_adx:g}, R:R>={risk_profile.min_rr:g}, target R:R>={risk_profile.target_rr:g}, effective per-order margin cap={settings.max_order_margin_usd * risk_profile.margin_ratio:.2f} USDT, per-contract aggregate margin cap={settings.max_contract_margin_usd:.2f} USDT, total margin cap={settings.max_total_margin_usd:.2f} USDT, max actual entries this cycle={settings.max_entries_per_cycle}. Different Gate contracts may be held concurrently and an active contract may be added to only in the same direction, subject to aggregate limits and complete TP/SL coverage. A deferred or rejected symbol must not force unrelated qualified symbols to WAIT. '
                       'position_management actions are HOLD|CLOSE_MARKET|UPDATE_SL; pending_orders_management actions are KEEP|AMEND|CANCEL and must include order_id plus contract. '
                       'Gate Futures data: ' + json.dumps({"instruments": features, "account": private_context["account"], "positions": private_context["positions"], "pending_orders": private_context["pending_orders"]}, ensure_ascii=False))
             system_prompt = "You are a Gate Futures risk-controlled trading decision model. Return the final JSON object only."
@@ -2151,6 +2220,12 @@ def run_cycle() -> dict:
             "baseline_notional": _portfolio_position_notional(client, fresh_positions),
             "reserved_margin": sum(float(row.get("estimated_margin_usdt") or 0) for row in pending_executions if str(row.get("status") or "") == "awaiting_trigger" and str(row.get("contract") or "") in breakout_kept_contracts),
             "reserved_notional": sum(float(row.get("order_notional_usdt") or 0) for row in pending_executions if str(row.get("status") or "") == "awaiting_trigger" and str(row.get("contract") or "") in breakout_kept_contracts),
+            "contract_reserved_margin": {
+                contract: sum(float(row.get("estimated_margin_usdt") or 0) for row in pending_executions
+                              if str(row.get("status") or "") == "awaiting_trigger"
+                              and str(row.get("contract") or "") == contract)
+                for contract in breakout_kept_contracts
+            },
             "directional_reservations": [
                 {"contract": str(row.get("contract") or ""),
                  "side": "long" if str(row.get("entry_action") or "") == "BUY_LONG" else "short"}

@@ -7,7 +7,7 @@ from gate_quant.client import GateFuturesClient, AmbiguousOrderError
 from gate_quant.config import GateSettings
 from gate_quant.risk import RiskLimits
 from gate_quant.service import GateTradingService, protection_coverage_status
-from gate_quant.ai_worker import _extract_decision_object, _extract_response_object, _as_instruction_list, _order_size_for_margin, _protection_matches, _reduce_crossed_protection_slice, _execution_enabled, _account_committed_margin, _portfolio_position_notional, _requote_decision, _confirm_pending_requotes, _confirmed_requote_candidates, _preflight_candidate_quotes, _run_serial_candidates, _manage_open_entry_orders, _entry_execution_plan, _breakout_compatible_size, _manage_breakout_plans, _untracked_trigger_entries, _features, _strategy_package, _stop_is_at_breakeven, _add_on_rejection, _chronological_candles
+from gate_quant.ai_worker import _extract_decision_object, _extract_response_object, _as_instruction_list, _order_size_for_margin, _protection_matches, _reduce_crossed_protection_slice, _execution_enabled, _account_committed_margin, _portfolio_position_notional, _contract_position_margin, _contract_open_order_margin, _contract_margin_allowed, _requote_decision, _confirm_pending_requotes, _confirmed_requote_candidates, _preflight_candidate_quotes, _run_serial_candidates, _manage_open_entry_orders, _entry_execution_plan, _breakout_compatible_size, _manage_breakout_plans, _untracked_trigger_entries, _features, _strategy_package, _stop_is_at_breakeven, _add_on_rejection, _chronological_candles
 from gate_quant.execution_journal import ExecutionJournal
 from gate_quant.strategy_adapter import validate_decision
 from gate_quant.risk_profiles import get_risk_profile
@@ -1723,18 +1723,68 @@ def test_direction_bias_is_independent_from_wait_action():
     assert normalize_direction_bias("", "WAIT") == "NEUTRAL"
 
 
-def test_correlated_portfolio_risk_scales_second_and_blocks_third_position():
+def test_correlated_portfolio_risk_keeps_second_and_third_margin_and_blocks_fourth():
     first = [{"contract": "BTC_USDT", "size": "1"}]
     second = correlated_exposure_gate(first, [], contract="SOL_USDT", action="BUY_LONG")
     assert second["allowed"] is True
-    assert second["margin_scale"] == 0.5
+    assert second["margin_scale"] == 1.0
 
     third = correlated_exposure_gate(
         first, [{"contract": "SOL_USDT", "side": "long"}],
         contract="DOGE_USDT", action="BUY_LONG",
     )
-    assert third["allowed"] is False
+    assert third["allowed"] is True
+    assert third["margin_scale"] == 1.0
     assert set(third["same_direction_contracts"]) == {"BTC_USDT", "SOL_USDT"}
+    fourth = correlated_exposure_gate(
+        first, [{"contract": name, "side": "long"} for name in ("SOL_USDT", "DOGE_USDT")],
+        contract="ADA_USDT", action="BUY_LONG",
+    )
+    assert fourth["allowed"] is False
+
+
+@pytest.mark.parametrize("action,size", [("BUY_LONG", "1"), ("SELL_SHORT", "-1")])
+def test_correlated_portfolio_risk_allows_existing_contract_add_on(action, size):
+    positions = [{"contract": "ETH_USDT", "size": size}, {"contract": "SOL_USDT", "size": size}]
+    result = correlated_exposure_gate(positions, [{"contract": "SOL_USDT", "side": "long" if size == "1" else "short"}],
+                                     contract="ETH_USDT", action=action)
+    assert result["allowed"] is True
+    assert result["margin_scale"] == 1.0
+    assert set(result["same_direction_contracts"]) == {"ETH_USDT", "SOL_USDT"}
+
+
+def test_correlated_portfolio_risk_blocks_add_on_when_three_other_contracts_exposed():
+    positions = [{"contract": coin, "size": "1"} for coin in ("ETH_USDT", "SOL_USDT", "BTC_USDT", "DOGE_USDT")]
+    result = correlated_exposure_gate(positions, [], contract="ETH_USDT", action="BUY_LONG")
+    assert result["allowed"] is False
+
+
+def test_contract_margin_counts_positions_and_open_orders():
+    class Client:
+        def contracts(self, contract): return {"quanto_multiplier": "0.01"}
+    client = Client()
+    positions = [{"contract": "ETH_USDT", "size": "10", "mark_price": "2000", "leverage": "10"},
+                 {"contract": "SOL_USDT", "size": "10", "mark_price": "100", "leverage": "10"}]
+    orders = [{"contract": "ETH_USDT", "left": "5", "price": "2000"}]
+    assert _contract_position_margin(client, positions, "ETH_USDT", 10) == pytest.approx(20)
+    assert _contract_open_order_margin(client, orders, "ETH_USDT", 10) == pytest.approx(10)
+    assert _contract_margin_allowed(280, 20, 300)
+    assert not _contract_margin_allowed(290, 20, 300)
+
+
+@pytest.mark.parametrize("bad", [
+    [{"contract": "ETH_USDT", "size": "1", "mark_price": "0", "leverage": "10"}],
+    [{"contract": "ETH_USDT", "size": "1", "mark_price": "2000", "leverage": "0"}],
+])
+def test_contract_position_margin_fails_closed_on_unobservable_risk(bad):
+    class Client:
+        def contracts(self, contract): return {"quanto_multiplier": "0.01"}
+    # A zero position leverage uses the configured fallback; only zero price is invalid.
+    if bad[0]["mark_price"] == "0":
+        with pytest.raises(RuntimeError):
+            _contract_position_margin(Client(), bad, "ETH_USDT", 10)
+    else:
+        assert _contract_position_margin(Client(), bad, "ETH_USDT", 10) > 0
 
 
 @pytest.mark.parametrize(("macro", "action"), [
