@@ -1723,7 +1723,7 @@ def test_direction_bias_is_independent_from_wait_action():
     assert normalize_direction_bias("", "WAIT") == "NEUTRAL"
 
 
-def test_correlated_portfolio_risk_keeps_second_and_third_margin_and_blocks_fourth():
+def test_correlated_portfolio_risk_keeps_fourth_margin_and_blocks_fifth():
     first = [{"contract": "BTC_USDT", "size": "1"}]
     second = correlated_exposure_gate(first, [], contract="SOL_USDT", action="BUY_LONG")
     assert second["allowed"] is True
@@ -1740,7 +1740,12 @@ def test_correlated_portfolio_risk_keeps_second_and_third_margin_and_blocks_four
         first, [{"contract": name, "side": "long"} for name in ("SOL_USDT", "DOGE_USDT")],
         contract="ADA_USDT", action="BUY_LONG",
     )
-    assert fourth["allowed"] is False
+    assert fourth["allowed"] is True
+    fifth = correlated_exposure_gate(
+        first, [{"contract": name, "side": "long"} for name in ("SOL_USDT", "DOGE_USDT", "ADA_USDT")],
+        contract="XRP_USDT", action="BUY_LONG",
+    )
+    assert fifth["allowed"] is False
 
 
 @pytest.mark.parametrize("action,size", [("BUY_LONG", "1"), ("SELL_SHORT", "-1")])
@@ -1753,8 +1758,8 @@ def test_correlated_portfolio_risk_allows_existing_contract_add_on(action, size)
     assert set(result["same_direction_contracts"]) == {"ETH_USDT", "SOL_USDT"}
 
 
-def test_correlated_portfolio_risk_blocks_add_on_when_three_other_contracts_exposed():
-    positions = [{"contract": coin, "size": "1"} for coin in ("ETH_USDT", "SOL_USDT", "BTC_USDT", "DOGE_USDT")]
+def test_correlated_portfolio_risk_blocks_add_on_when_four_other_contracts_exposed():
+    positions = [{"contract": coin, "size": "1"} for coin in ("ETH_USDT", "SOL_USDT", "BTC_USDT", "DOGE_USDT", "XRP_USDT")]
     result = correlated_exposure_gate(positions, [], contract="ETH_USDT", action="BUY_LONG")
     assert result["allowed"] is False
 

@@ -94,6 +94,23 @@ const safetyIssues = computed(() => {
   const value = runtime.value?.safety_status?.reconciliation?.issues
   return Array.isArray(value) ? value : []
 })
+const safetyReasons = computed(() => {
+  const value = runtime.value?.safety_status?.safety_reasons
+  return Array.isArray(value) ? value : []
+})
+function safetyReasonText(item: any) {
+  const detail = item?.detail || {}
+  const contract = item?.contract || detail?.contract || detail?.contracts?.join?.('、')
+  const labels: Record<string, string> = {
+    execution_reconciliation_pending: '存在未完成订单对账',
+    untracked_trigger_entry_orders: '存在未跟踪的计划入场单',
+    orphan_protections: '存在孤立保护单',
+    stale_orders: '存在过期挂单',
+    daily_loss_limit: '触发日亏损熔断',
+    post_stop_cooldown: '处于止损后冷静期',
+  }
+  return `${labels[item?.code] || item?.code || '安全检查异常'}${contract ? `（${contract}）` : ''}`
+}
 
 async function loadRuntime() {
   loading.value = true
@@ -285,7 +302,10 @@ const quickNav = [
             {{ runtime.safety_status?.safe_for_new_risk ? '允许开仓' : 'FAIL-CLOSED' }}
           </div>
           <div class="mt-1 text-[11px]" style="color: var(--text-muted);">
-            {{ safetyIssues.length ? `${safetyIssues.length} 项持仓/保护单对账异常` : '持仓、保护单、日亏损与冷却门禁正常' }}
+            <template v-if="safetyReasons.length">
+              <span>{{ safetyReasons.map(safetyReasonText).join('；') }}</span>
+            </template>
+            <template v-else>{{ safetyIssues.length ? `${safetyIssues.length} 项持仓/保护单对账异常` : '持仓、保护单、日亏损与冷却门禁正常' }}</template>
           </div>
         </div>
         <div class="rounded-xl border p-4" style="background-color: var(--bg-card); border-color: var(--border-subtle);">

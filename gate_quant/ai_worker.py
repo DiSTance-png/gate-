@@ -719,7 +719,10 @@ def _execute_entry_candidate_locked(client: GateFuturesClient, envelope: dict, *
     action = str(decision.get("action") or "WAIT")
     confidence = float(decision.get("confidence") or 0)
     journal = ExecutionJournal(EXECUTION_JOURNAL)
-    cooldown = cooldown_state(LEDGER, cooldown_seconds=settings.stop_cooldown_seconds, contract=trade_symbol)
+    cooldown = (cooldown_state(LEDGER, cooldown_seconds=settings.stop_cooldown_seconds, contract=trade_symbol)
+                if settings.stop_cooldown_enabled else {
+                    "active": False, "remaining_seconds": 0, "reason": "disabled", "contract": trade_symbol,
+                })
     if cooldown["active"]:
         return {"trade": {"status": "blocked_symbol_cooldown", "contract": trade_symbol,
                           "reason": f"{trade_symbol} is in post-stop cooldown; other contracts remain eligible",
@@ -1804,8 +1807,20 @@ def run_cycle() -> dict:
         max_loss_ratio=settings.max_daily_loss_ratio, equity=equity,
         reset_path=DAILY_LOSS_RESET, environment=settings.environment,
     )
-    cooldowns = {symbol: cooldown_state(LEDGER, cooldown_seconds=settings.stop_cooldown_seconds, contract=symbol) for symbol in symbols}
-    cooldown = {"active": False, "remaining_seconds": 0, "reason": "per_contract", "contracts": cooldowns}
+    cooldowns = {
+        symbol: (cooldown_state(LEDGER, cooldown_seconds=settings.stop_cooldown_seconds, contract=symbol)
+                 if settings.stop_cooldown_enabled else {
+                     "active": False, "remaining_seconds": 0, "reason": "disabled", "contract": symbol,
+                 })
+        for symbol in symbols
+    }
+    active_cooldowns = [state for state in cooldowns.values() if state.get("active")]
+    cooldown = {
+        "active": bool(active_cooldowns),
+        "remaining_seconds": max((int(state.get("remaining_seconds") or 0) for state in active_cooldowns), default=0),
+        "reason": "per_contract" if active_cooldowns else ("disabled" if not settings.stop_cooldown_enabled else "ok"),
+        "contracts": cooldowns,
+    }
     safety_status = {
         "environment": settings.environment, "checked_at_ms": int(time.time() * 1000),
         "reconciliation": reconciliation, "daily_loss": daily_loss, "cooldown": cooldown,

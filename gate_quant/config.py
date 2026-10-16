@@ -34,6 +34,7 @@ class GateSettings:
     max_position_age_seconds: int = 57600
     absolute_max_position_age_seconds: int = 129600
     stop_cooldown_seconds: int = 1800
+    stop_cooldown_enabled: bool = True
     max_entry_slippage_pct: float = 0.003
     entry_intent_enabled: bool = False
     breakout_expiration_seconds: int = 840
@@ -129,6 +130,7 @@ def load_settings() -> GateSettings:
         max_position_age_seconds=int(os.getenv("GATE_MAX_POSITION_AGE_SECONDS", "57600")),
         absolute_max_position_age_seconds=int(os.getenv("GATE_ABSOLUTE_MAX_POSITION_AGE_SECONDS", "129600")),
         stop_cooldown_seconds=int(os.getenv("GATE_STOP_COOLDOWN_SECONDS", "1800")),
+        stop_cooldown_enabled=_bool("GATE_STOP_COOLDOWN_ENABLED", True),
         max_entry_slippage_pct=float(os.getenv("GATE_MAX_ENTRY_SLIPPAGE_PCT", "0.003")),
         entry_intent_enabled=_bool("GATE_ENTRY_INTENT_ENABLED"),
         breakout_expiration_seconds=int(os.getenv("GATE_BREAKOUT_EXPIRATION_SECONDS", "840")),

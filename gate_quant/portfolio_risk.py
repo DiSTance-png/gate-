@@ -42,12 +42,12 @@ def correlated_exposure_gate(
     # An add-on to an already exposed contract does not create another
     # correlated instrument. Count distinct *other* contracts only.
     other_exposed = exposed - {target}
-    if len(other_exposed) >= 3:
+    if len(other_exposed) >= 4:
         return {
             "allowed": False,
             "margin_scale": 0.0,
             "same_direction_contracts": sorted(exposed),
-            "reason": "组合相关风险门禁：已有三个其他币种的同方向加密 Beta 敞口，禁止新增第四个币种。",
+            "reason": "组合相关风险门禁：已有四个其他币种的同方向加密 Beta 敞口，禁止新增第五个币种。",
             "version": PORTFOLIO_RISK_VERSION,
         }
     return {
