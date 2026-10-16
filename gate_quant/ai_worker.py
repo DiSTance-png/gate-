@@ -1826,7 +1826,12 @@ def run_cycle() -> dict:
         "reconciliation": reconciliation, "daily_loss": daily_loss, "cooldown": cooldown,
         "private_errors": private_context["private_errors"],
     }
-    safety_status["safe_for_new_risk"] = bool(not private_context["private_errors"] and reconciliation["safe_for_new_risk"] and not daily_loss["tripped"])
+    safety_status["safe_for_new_risk"] = bool(
+        not private_context["private_errors"]
+        and reconciliation["safe_for_new_risk"]
+        and not daily_loss["tripped"]
+        and not cooldown["active"]
+    )
     lifecycle_actions: list[dict] = []
     position_age_reviews: dict[str, dict] = {}
     if execution_enabled and not private_context["private_errors"]:
@@ -2273,8 +2278,17 @@ def run_cycle() -> dict:
                                    "reason": "交易对配置在本轮 AI 决策期间发生变化；旧标的决策已作废，等待下一轮",
                                    "instrument_pool_revision": instrument_pool_revision()})
     elif execution_enabled and (not safety_status["safe_for_new_risk"] or breakout_stop_cycle or pending_lifecycle_stop):
+        safety_reasons = []
+        if safety_status.get("private_errors"):
+            safety_reasons.extend(safety_status["private_errors"])
+        safety_reasons.extend(safety_status.get("reconciliation", {}).get("issues") or [])
+        if safety_status.get("daily_loss", {}).get("tripped"):
+            safety_reasons.append({"code": "daily_loss_limit", "detail": safety_status["daily_loss"]})
+        if safety_status.get("cooldown", {}).get("active"):
+            safety_reasons.append({"code": "post_stop_cooldown", "detail": safety_status["cooldown"]})
         candidate_outcomes.append({"status": "blocked_safety_fail_closed",
-                                   "reason": "Gate reconciliation, pending-order lifecycle, breakout lifecycle, or daily-loss gate blocked new risk",
+                                   "reason": "安全门关闭：" + ("；".join(str(item.get("code") or item.get("error") or item) for item in safety_reasons) if safety_reasons else "存在未通过的执行生命周期检查"),
+                                   "safety_reasons": safety_reasons,
                                    "safety_status": safety_status})
 
     all_outcomes = [*(result.get("trade_candidates_blocked") or []), *breakout_lifecycle, *candidate_outcomes]
