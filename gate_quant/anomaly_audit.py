@@ -373,7 +373,10 @@ def collect_anomalies(
         ))
     snapshot_safe = bool(safety_snapshot.get("safe_for_new_risk"))
     risky_execution = any(str(row.get("status") or "") != "awaiting_trigger" for row in executions)
-    daily_loss_tripped = bool((safety_snapshot.get("daily_loss") or {}).get("tripped"))
+    daily_loss_tripped = bool(
+        (safety_snapshot.get("daily_loss") or {}).get("tripped")
+        and safety_snapshot.get("daily_loss_circuit_breaker_enabled", True)
+    )
     live_safe = bool(live_reconciliation.get("safe_for_new_risk")) and not private_errors and not risky_execution and not daily_loss_tripped
     if safety_checked_ms and snapshot_safe != live_safe:
         findings.append(finding(

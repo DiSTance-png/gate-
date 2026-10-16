@@ -40,6 +40,7 @@ class GateSettings:
     breakout_expiration_seconds: int = 840
     max_daily_loss_usd: float = 100.0
     max_daily_loss_ratio: float = 0.05
+    daily_loss_circuit_breaker_enabled: bool = True
     testnet_base_url: str = "https://api-testnet.gateapi.io/api/v4"
     live_base_url: str = "https://fx-api.gateio.ws/api/v4"
 
@@ -136,6 +137,7 @@ def load_settings() -> GateSettings:
         breakout_expiration_seconds=int(os.getenv("GATE_BREAKOUT_EXPIRATION_SECONDS", "840")),
         max_daily_loss_usd=float(os.getenv("GATE_MAX_DAILY_LOSS_USD", "100")),
         max_daily_loss_ratio=float(os.getenv("GATE_MAX_DAILY_LOSS_RATIO", "0.05")),
+        daily_loss_circuit_breaker_enabled=_bool("GATE_DAILY_LOSS_CIRCUIT_BREAKER_ENABLED", True),
         testnet_base_url=os.getenv("GATE_TESTNET_BASE_URL", "https://api-testnet.gateapi.io/api/v4").rstrip("/"),
         live_base_url=os.getenv("GATE_LIVE_BASE_URL", "https://fx-api.gateio.ws/api/v4").rstrip("/"),
     )

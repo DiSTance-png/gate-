@@ -53,6 +53,22 @@ def test_execution_overlay_remains_closed_for_other_safety_issue():
     assert result["reconciliation"]["issues"] == [{"code": "protection_gap", "contract": "BTC_USDT"}]
 
 
+def test_execution_overlay_daily_loss_switch_allows_new_risk_but_keeps_record():
+    from gate_quant.web import _overlay_execution_reconciliation
+
+    payload = {
+        "safe_for_new_risk": False,
+        "reconciliation": {"safe_for_new_risk": True, "issues": []},
+        "daily_loss": {"tripped": True, "loss_usd": 67.12},
+        "daily_loss_circuit_breaker_enabled": False,
+        "cooldown": {"active": False},
+        "private_errors": [],
+    }
+    result = _overlay_execution_reconciliation(payload, 0)
+    assert result["safe_for_new_risk"] is True
+    assert result["daily_loss"]["tripped"] is True
+
+
 class CaptureSession:
     def __init__(self, response):
         self.response = response

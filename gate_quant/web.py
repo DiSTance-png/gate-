@@ -88,6 +88,10 @@ def _read_json_file(name: str, default):
 def _safety_status() -> dict[str, Any]:
     payload = _read_json_file("gate_safety_status.json", {"safe_for_new_risk": False, "reason": "no safety check recorded"})
     try:
+        payload.setdefault("daily_loss_circuit_breaker_enabled", load_settings().daily_loss_circuit_breaker_enabled)
+    except Exception:
+        payload.setdefault("daily_loss_circuit_breaker_enabled", True)
+    try:
         environment = load_settings().environment
         active = [row for row in ExecutionJournal(EXECUTION_JOURNAL).active(environment)
                   if str(row.get("status") or "") != "awaiting_trigger"]
@@ -108,7 +112,7 @@ def _with_safety_reasons(payload: dict[str, Any]) -> dict[str, Any]:
     for error in payload.get("private_errors") or []:
         reasons.append({"source": "private_api", "code": (error or {}).get("category", "private_api_error") if isinstance(error, dict) else "private_api_error", "detail": error})
     daily_loss = payload.get("daily_loss") or {}
-    if daily_loss.get("tripped"):
+    if daily_loss.get("tripped") and payload.get("daily_loss_circuit_breaker_enabled", True):
         reasons.append({"source": "daily_loss", "code": "daily_loss_limit", "detail": daily_loss})
     cooldown = payload.get("cooldown") or {}
     if cooldown.get("active"):
@@ -135,14 +139,13 @@ def _overlay_execution_reconciliation(payload: dict[str, Any], active_count: int
             issues.append({"code": "execution_reconciliation_pending", "count": active_count})
         reconciliation.update({"safe_for_new_risk": False, "issues": issues})
         return {**payload, "safe_for_new_risk": False, "reconciliation": reconciliation}
-    if not pending:
-        return payload
-    issues = [item for item in issues if not (isinstance(item, dict) and item.get("code") == "execution_reconciliation_pending")]
+    if pending:
+        issues = [item for item in issues if not (isinstance(item, dict) and item.get("code") == "execution_reconciliation_pending")]
     reconciliation.update({"safe_for_new_risk": not issues, "issues": issues})
     safe = bool(
         not issues
         and not payload.get("private_errors")
-        and not (payload.get("daily_loss") or {}).get("tripped")
+        and (not (payload.get("daily_loss") or {}).get("tripped") or payload.get("daily_loss_circuit_breaker_enabled") is False)
         and not (payload.get("cooldown") or {}).get("active")
     )
     return {**payload, "safe_for_new_risk": safe, "reconciliation": reconciliation}
@@ -345,6 +348,7 @@ class GateAdminConfig(BaseModel):
     max_total_margin_usd: float = Field(gt=0)
     max_order_margin_usd: float = Field(gt=0)
     max_contract_margin_usd: float = Field(default=300, gt=0)
+    daily_loss_circuit_breaker_enabled: bool = True
     stop_cooldown_enabled: bool = True
     entry_intent_enabled: bool = False
     max_entry_slippage_pct: float = Field(default=0.003, ge=0, le=0.02)
@@ -881,7 +885,7 @@ def gate_admin_runtime(x_gate_session: str | None = Header(default=None, alias="
     tunnel_payload = {**tunnel.__dict__, "running": bool(tunnel.running or shared_tunnel_ready), "pid": tunnel.pid or None}
     profile = get_risk_profile(s.risk_profile)
     snapshot = profile.snapshot(leverage=s.leverage, environment=s.environment)
-    return {"exchange": "gate", "environment": s.environment, "ready": bool(s.api_key and s.api_secret), "base_url": s.base_url, "public_market_environment": s.public_market_environment, "proxy_configured": bool(s.proxy_url), "proxy_url": s.proxy_url or "", "proxy_required": s.require_proxy, "tunnel": tunnel_payload, "testnet_execute_trades": bool(s.testnet_execute_trades), "live_trading_enabled": bool(s.environment == "live" and s.live_trading_enabled), "safety_status": _safety_status(), "credentials": {"testnet_configured": bool(_stored_gate_credential("GATE_TESTNET_API_KEY") and _stored_gate_credential("GATE_TESTNET_API_SECRET")), "live_configured": bool(_stored_gate_credential("GATE_LIVE_API_KEY") and _stored_gate_credential("GATE_LIVE_API_SECRET"))}, "risk_profiles": profile_catalog(), "risk_snapshot": snapshot, "risk": {"risk_profile": s.risk_profile, "max_entries_per_cycle": s.max_entries_per_cycle, "leverage": s.leverage, "max_position_notional_usd": s.max_position_notional_usd, "max_total_margin_usd": s.max_total_margin_usd, "max_order_margin_usd": s.max_order_margin_usd, "max_contract_margin_usd": s.max_contract_margin_usd, "stop_cooldown_enabled": s.stop_cooldown_enabled, "entry_intent_enabled": s.entry_intent_enabled, "max_entry_slippage_pct": s.max_entry_slippage_pct, "breakout_expiration_seconds": s.breakout_expiration_seconds}}
+    return {"exchange": "gate", "environment": s.environment, "ready": bool(s.api_key and s.api_secret), "base_url": s.base_url, "public_market_environment": s.public_market_environment, "proxy_configured": bool(s.proxy_url), "proxy_url": s.proxy_url or "", "proxy_required": s.require_proxy, "tunnel": tunnel_payload, "testnet_execute_trades": bool(s.testnet_execute_trades), "live_trading_enabled": bool(s.environment == "live" and s.live_trading_enabled), "safety_status": _safety_status(), "credentials": {"testnet_configured": bool(_stored_gate_credential("GATE_TESTNET_API_KEY") and _stored_gate_credential("GATE_TESTNET_API_SECRET")), "live_configured": bool(_stored_gate_credential("GATE_LIVE_API_KEY") and _stored_gate_credential("GATE_LIVE_API_SECRET"))}, "risk_profiles": profile_catalog(), "risk_snapshot": snapshot, "risk": {"risk_profile": s.risk_profile, "max_entries_per_cycle": s.max_entries_per_cycle, "leverage": s.leverage, "max_position_notional_usd": s.max_position_notional_usd, "max_total_margin_usd": s.max_total_margin_usd, "max_order_margin_usd": s.max_order_margin_usd, "max_contract_margin_usd": s.max_contract_margin_usd, "stop_cooldown_enabled": s.stop_cooldown_enabled, "daily_loss_circuit_breaker_enabled": s.daily_loss_circuit_breaker_enabled, "entry_intent_enabled": s.entry_intent_enabled, "max_entry_slippage_pct": s.max_entry_slippage_pct, "breakout_expiration_seconds": s.breakout_expiration_seconds}}
 
 
 @app.post("/api/v1/admin/gate/daily-loss/reset")
@@ -941,7 +945,8 @@ def reset_gate_daily_loss(payload: GateDailyLossResetRequest, x_gate_session: st
         safety = {
             **current, "environment": settings.environment, "checked_at_ms": int(now * 1000),
             "reconciliation": reconciliation, "daily_loss": after, "private_errors": [],
-            "safe_for_new_risk": bool(reconciliation["safe_for_new_risk"] and not after["tripped"]),
+            "daily_loss_circuit_breaker_enabled": settings.daily_loss_circuit_breaker_enabled,
+            "safe_for_new_risk": bool(reconciliation["safe_for_new_risk"] and (not after["tripped"] or not settings.daily_loss_circuit_breaker_enabled)),
             "lifecycle_actions": [],
         }
         atomic_json(DATA_DIR / "gate_safety_status.json", safety)
@@ -1119,7 +1124,7 @@ def gate_admin_config(payload: GateAdminConfig, x_gate_session: str | None = Hea
         except Exception as exc:
             raise HTTPException(409, str(exc)) from exc
     managed_proxy = os.getenv("GATE_PROXY_URL", "") if gate_tunnel.enabled else (payload.proxy_url or "")
-    values = {"GATE_ENVIRONMENT": payload.environment, "GATE_PUBLIC_MARKET_ENV": payload.environment, "GATE_TESTNET_EXECUTE_TRADES": str(payload.testnet_execute_trades).lower(), "GATE_LIVE_TRADING_ENABLED": str(payload.live_trading_enabled).lower(), "GATE_RISK_PROFILE": payload.risk_profile, "GATE_MAX_ENTRIES_PER_CYCLE": str(payload.max_entries_per_cycle), "GATE_LEVERAGE": str(payload.leverage), "GATE_PROXY_URL": managed_proxy, "GATE_MAX_POSITION_NOTIONAL_USD": str(payload.max_position_notional_usd), "GATE_MAX_TOTAL_MARGIN_USD": str(payload.max_total_margin_usd), "GATE_MAX_ORDER_MARGIN_USD": str(payload.max_order_margin_usd), "GATE_MAX_CONTRACT_MARGIN_USD": str(payload.max_contract_margin_usd), "GATE_STOP_COOLDOWN_ENABLED": str(payload.stop_cooldown_enabled).lower(), "GATE_ENTRY_INTENT_ENABLED": str(payload.entry_intent_enabled).lower(), "GATE_MAX_ENTRY_SLIPPAGE_PCT": str(payload.max_entry_slippage_pct), "GATE_BREAKOUT_EXPIRATION_SECONDS": str(payload.breakout_expiration_seconds)}
+    values = {"GATE_ENVIRONMENT": payload.environment, "GATE_PUBLIC_MARKET_ENV": payload.environment, "GATE_TESTNET_EXECUTE_TRADES": str(payload.testnet_execute_trades).lower(), "GATE_LIVE_TRADING_ENABLED": str(payload.live_trading_enabled).lower(), "GATE_RISK_PROFILE": payload.risk_profile, "GATE_MAX_ENTRIES_PER_CYCLE": str(payload.max_entries_per_cycle), "GATE_LEVERAGE": str(payload.leverage), "GATE_PROXY_URL": managed_proxy, "GATE_MAX_POSITION_NOTIONAL_USD": str(payload.max_position_notional_usd), "GATE_MAX_TOTAL_MARGIN_USD": str(payload.max_total_margin_usd), "GATE_MAX_ORDER_MARGIN_USD": str(payload.max_order_margin_usd), "GATE_MAX_CONTRACT_MARGIN_USD": str(payload.max_contract_margin_usd), "GATE_STOP_COOLDOWN_ENABLED": str(payload.stop_cooldown_enabled).lower(), "GATE_DAILY_LOSS_CIRCUIT_BREAKER_ENABLED": str(payload.daily_loss_circuit_breaker_enabled).lower(), "GATE_ENTRY_INTENT_ENABLED": str(payload.entry_intent_enabled).lower(), "GATE_MAX_ENTRY_SLIPPAGE_PCT": str(payload.max_entry_slippage_pct), "GATE_BREAKOUT_EXPIRATION_SECONDS": str(payload.breakout_expiration_seconds)}
     # Keep market data, credentials and order writes on the selected cluster.
     # In particular, a Live order must never be priced from Testnet data.
     values["GATE_PUBLIC_MARKET_ENV"] = payload.environment
@@ -1145,6 +1150,7 @@ def gate_admin_config(payload: GateAdminConfig, x_gate_session: str | None = Hea
         max_order_margin_usd=payload.max_order_margin_usd,
         max_contract_margin_usd=payload.max_contract_margin_usd,
         stop_cooldown_enabled=payload.stop_cooldown_enabled,
+        daily_loss_circuit_breaker_enabled=payload.daily_loss_circuit_breaker_enabled,
         entry_intent_enabled=payload.entry_intent_enabled,
         max_entry_slippage_pct=payload.max_entry_slippage_pct,
         breakout_expiration_seconds=payload.breakout_expiration_seconds,

@@ -1740,7 +1740,7 @@ def _refresh_entry_safety(client, journal, settings, safety_status):
             reset_path=DAILY_LOSS_RESET, environment=settings.environment)
         safety = {**safety_status, "checked_at_ms": int(time.time() * 1000),
             "reconciliation": reconciliation, "daily_loss": loss, "private_errors": []}
-        safety["safe_for_new_risk"] = bool(reconciliation["safe_for_new_risk"] and not loss["tripped"]
+        safety["safe_for_new_risk"] = bool(reconciliation["safe_for_new_risk"] and (not loss["tripped"] or not settings.daily_loss_circuit_breaker_enabled)
             and not (safety.get("cooldown") or {}).get("active"))
         return context, pending, safety
 
@@ -1824,12 +1824,13 @@ def run_cycle() -> dict:
     safety_status = {
         "environment": settings.environment, "checked_at_ms": int(time.time() * 1000),
         "reconciliation": reconciliation, "daily_loss": daily_loss, "cooldown": cooldown,
+        "daily_loss_circuit_breaker_enabled": settings.daily_loss_circuit_breaker_enabled,
         "private_errors": private_context["private_errors"],
     }
     safety_status["safe_for_new_risk"] = bool(
         not private_context["private_errors"]
         and reconciliation["safe_for_new_risk"]
-        and not daily_loss["tripped"]
+        and (not daily_loss["tripped"] or not settings.daily_loss_circuit_breaker_enabled)
         and not cooldown["active"]
     )
     lifecycle_actions: list[dict] = []
@@ -1956,7 +1957,7 @@ def run_cycle() -> dict:
                 private_context["protections"] = client.protection_orders() or []
                 reconciliation = reconcile_exchange_state(private_context["positions"], private_context["pending_orders"], private_context["protections"], max_pending_age_seconds=settings.max_pending_order_age_seconds)
                 safety_status["reconciliation"] = reconciliation
-                safety_status["safe_for_new_risk"] = bool(reconciliation["safe_for_new_risk"] and not daily_loss["tripped"])
+                safety_status["safe_for_new_risk"] = bool(reconciliation["safe_for_new_risk"] and (not daily_loss["tripped"] or not settings.daily_loss_circuit_breaker_enabled))
             except Exception as exc:
                 safety_status["safe_for_new_risk"] = False
                 safety_status["private_errors"].append({"category": classify_error(exc), "error": f"post-action reconciliation: {exc}"})
@@ -2282,7 +2283,8 @@ def run_cycle() -> dict:
         if safety_status.get("private_errors"):
             safety_reasons.extend(safety_status["private_errors"])
         safety_reasons.extend(safety_status.get("reconciliation", {}).get("issues") or [])
-        if safety_status.get("daily_loss", {}).get("tripped"):
+        if (safety_status.get("daily_loss", {}).get("tripped")
+                and safety_status.get("daily_loss_circuit_breaker_enabled", True)):
             safety_reasons.append({"code": "daily_loss_limit", "detail": safety_status["daily_loss"]})
         if safety_status.get("cooldown", {}).get("active"):
             safety_reasons.append({"code": "post_stop_cooldown", "detail": safety_status["cooldown"]})
