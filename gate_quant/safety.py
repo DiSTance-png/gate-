@@ -108,9 +108,9 @@ def reconcile_exchange_state(
         if contract and contract not in active_contracts and contract not in pending_contracts:
             orphan_protections.append(protection)
     if stale_orders:
-        issues.append({"code": "stale_entry_orders", "count": len(stale_orders)})
+        issues.append({"code": "stale_entry_orders", "count": len(stale_orders), "contracts": sorted({str(row.get("contract") or "").upper() for row in stale_orders if row.get("contract")})})
     if orphan_protections:
-        issues.append({"code": "orphan_protections", "count": len(orphan_protections)})
+        issues.append({"code": "orphan_protections", "count": len(orphan_protections), "contracts": sorted({str((row.get("initial") or {}).get("contract") or row.get("contract") or "").upper() for row in orphan_protections if (row.get("initial") or {}).get("contract") or row.get("contract")})})
     return {"safe_for_new_risk": not issues, "issues": issues, "stale_orders": stale_orders, "orphan_protections": orphan_protections, "checked_at_ms": int(now * 1000)}
 
 

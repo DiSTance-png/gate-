@@ -43,6 +43,29 @@ PENDING_REQUOTES = DATA / "pending_requotes.json"
 PENDING_REQUOTE_TTL_SECONDS = 20 * 60
 UNFILLED_REENTRY_COOLDOWN_SECONDS = 15 * 60
 
+
+def _safety_scope(safety_status: dict[str, Any]) -> tuple[bool, set[str]]:
+    blocked: set[str] = set()
+    global_block = bool(safety_status.get("private_errors"))
+    daily_loss = safety_status.get("daily_loss") or {}
+    if daily_loss.get("tripped") and safety_status.get("daily_loss_circuit_breaker_enabled", True):
+        global_block = True
+    for issue in (safety_status.get("reconciliation") or {}).get("issues") or []:
+        if not isinstance(issue, dict):
+            global_block = True
+            continue
+        contracts = issue.get("contracts") or ([issue.get("contract")] if issue.get("contract") else [])
+        contracts = {str(item or "").upper() for item in contracts if str(item or "").strip()}
+        if contracts:
+            blocked.update(contracts)
+        else:
+            global_block = True
+    cooldown = safety_status.get("cooldown") or {}
+    for contract, state in (cooldown.get("contracts") or {}).items():
+        if isinstance(state, dict) and state.get("active"):
+            blocked.add(str(contract).upper())
+    return global_block, blocked
+
 TRADE_STATUS_LABELS = {
     "blocked_pending_reconfirmation": "等待下一轮确认",
     "blocked_price_deviation": "报价偏差过大，未下单",
@@ -731,7 +754,7 @@ def _execute_entry_candidate_locked(client: GateFuturesClient, envelope: dict, *
         settings.environment, trade_symbol,
         ("unfilled", "no_fill", "trigger_expired", "trigger_cancelled"),
     )
-    if recent_unfilled:
+    if recent_unfilled and settings.unfilled_reentry_cooldown_enabled:
         remaining = int(
             (int(recent_unfilled.get("updated_at_ms") or 0) + UNFILLED_REENTRY_COOLDOWN_SECONDS * 1000 - now_ms)
             / 1000
@@ -1732,7 +1755,8 @@ def _refresh_entry_safety(client, journal, settings, safety_status):
                 "contracts": sorted({str(row.get("contract") or "") for row in unsafe})})
         untracked = _untracked_trigger_entries(context["trigger_entries"], pending)
         if untracked:
-            reconciliation["issues"].append({"code": "untracked_trigger_entry_orders", "orders": untracked})
+            reconciliation["issues"].append({"code": "untracked_trigger_entry_orders", "orders": untracked,
+                                               "contracts": sorted({str(row.get("contract") or "").upper() for row in untracked if row.get("contract")})})
         reconciliation["safe_for_new_risk"] = not reconciliation["issues"]
         equity = float(context["account"].get("total") or context["account"].get("available") or 0)
         loss = daily_loss_state(LEDGER, max_loss_usd=settings.max_daily_loss_usd,
@@ -1740,8 +1764,10 @@ def _refresh_entry_safety(client, journal, settings, safety_status):
             reset_path=DAILY_LOSS_RESET, environment=settings.environment)
         safety = {**safety_status, "checked_at_ms": int(time.time() * 1000),
             "reconciliation": reconciliation, "daily_loss": loss, "private_errors": []}
-        safety["safe_for_new_risk"] = bool(reconciliation["safe_for_new_risk"] and (not loss["tripped"] or not settings.daily_loss_circuit_breaker_enabled)
-            and not (safety.get("cooldown") or {}).get("active"))
+        safety["safe_for_new_risk"] = bool(reconciliation["safe_for_new_risk"] and (not loss["tripped"] or not settings.daily_loss_circuit_breaker_enabled))
+        global_safety_block, blocked_contracts = _safety_scope(safety)
+        safety["global_safety_block"] = global_safety_block
+        safety["blocked_contracts"] = sorted(blocked_contracts)
         return context, pending, safety
 
 
@@ -1799,6 +1825,7 @@ def run_cycle() -> dict:
             "code": "untracked_trigger_entry_orders",
             "count": len(untracked_trigger_entries),
             "orders": untracked_trigger_entries,
+            "contracts": sorted({str(row.get("contract") or "").upper() for row in untracked_trigger_entries if row.get("contract")}),
         })
         reconciliation["safe_for_new_risk"] = False
     equity = float(private_context["account"].get("total") or private_context["account"].get("available") or 0)
@@ -1831,8 +1858,11 @@ def run_cycle() -> dict:
         not private_context["private_errors"]
         and reconciliation["safe_for_new_risk"]
         and (not daily_loss["tripped"] or not settings.daily_loss_circuit_breaker_enabled)
-        and not cooldown["active"]
+        and not private_context["private_errors"]
     )
+    global_safety_block, blocked_contracts = _safety_scope(safety_status)
+    safety_status["global_safety_block"] = global_safety_block
+    safety_status["blocked_contracts"] = sorted(blocked_contracts)
     lifecycle_actions: list[dict] = []
     position_age_reviews: dict[str, dict] = {}
     if execution_enabled and not private_context["private_errors"]:
@@ -1958,6 +1988,9 @@ def run_cycle() -> dict:
                 reconciliation = reconcile_exchange_state(private_context["positions"], private_context["pending_orders"], private_context["protections"], max_pending_age_seconds=settings.max_pending_order_age_seconds)
                 safety_status["reconciliation"] = reconciliation
                 safety_status["safe_for_new_risk"] = bool(reconciliation["safe_for_new_risk"] and (not daily_loss["tripped"] or not settings.daily_loss_circuit_breaker_enabled))
+                global_safety_block, blocked_contracts = _safety_scope(safety_status)
+                safety_status["global_safety_block"] = global_safety_block
+                safety_status["blocked_contracts"] = sorted(blocked_contracts)
             except Exception as exc:
                 safety_status["safe_for_new_risk"] = False
                 safety_status["private_errors"].append({"category": classify_error(exc), "error": f"post-action reconciliation: {exc}"})
@@ -2226,7 +2259,9 @@ def run_cycle() -> dict:
             safety_status = {**safety_status, "safe_for_new_risk": False,
                 "private_errors": [{"category": classify_error(exc), "error": f"执行前安全复核失败: {exc}"}]}
         atomic_json(SAFETY_STATUS, safety_status)
-    if execution_enabled and safety_status["safe_for_new_risk"] and not breakout_stop_cycle and not pending_lifecycle_stop and llm_source == "gate-multifactor-llm" and universe_unchanged:
+    global_safety_block = bool(safety_status.get("global_safety_block"))
+    blocked_contracts = {str(item).upper() for item in safety_status.get("blocked_contracts") or []}
+    if execution_enabled and not global_safety_block and not breakout_stop_cycle and not pending_lifecycle_stop and llm_source == "gate-multifactor-llm" and universe_unchanged:
         ordered_candidates = sorted(
             executable,
             key=lambda row: (row["instId"] in confirmed_requotes, float(row["decision"].get("confidence") or 0)),
@@ -2268,9 +2303,16 @@ def run_cycle() -> dict:
                 risk_state=risk_state,
             )
 
-        candidate_outcomes, submitted_trades = _run_serial_candidates(
-            ordered_candidates, settings.max_entries_per_cycle, execute_candidate
+        scoped_candidates = [row for row in ordered_candidates if str(row.get("instId") or "").upper() not in blocked_contracts]
+        candidate_outcomes.extend(
+            {"status": "blocked_symbol_safety", "contract": str(row.get("instId") or "").upper(),
+             "reason": "该合约存在未完成对账或合约级冷静期；其他合约继续独立评估"}
+            for row in ordered_candidates if str(row.get("instId") or "").upper() in blocked_contracts
         )
+        candidate_outcomes_run, submitted_trades = _run_serial_candidates(
+            scoped_candidates, settings.max_entries_per_cycle, execute_candidate
+        )
+        candidate_outcomes.extend(candidate_outcomes_run)
         for trade_outcome in candidate_outcomes:
             trade_outcome.setdefault("policy_version", policy_snapshot["policy_version"])
             trade_outcome.setdefault("policy_hash", policy_snapshot["policy_hash"])
@@ -2278,7 +2320,7 @@ def run_cycle() -> dict:
         candidate_outcomes.append({"status": "blocked_safety_fail_closed",
                                    "reason": "交易对配置在本轮 AI 决策期间发生变化；旧标的决策已作废，等待下一轮",
                                    "instrument_pool_revision": instrument_pool_revision()})
-    elif execution_enabled and (not safety_status["safe_for_new_risk"] or breakout_stop_cycle or pending_lifecycle_stop):
+    elif execution_enabled and (global_safety_block or breakout_stop_cycle or pending_lifecycle_stop):
         safety_reasons = []
         if safety_status.get("private_errors"):
             safety_reasons.extend(safety_status["private_errors"])
