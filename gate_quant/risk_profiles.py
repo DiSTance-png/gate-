@@ -14,7 +14,9 @@ PROFIT_LOCK_PROFILES: dict[str, dict[str, Any]] = {
     "conservative": {"breakeven_r": 0.8, "breakeven_roi_pct": 1.5, "second_lock_r": 1.5, "second_lock_roi_pct": 3.0, "locked_profit_r": 0.6, "peak_exit_roi_pct": 2.5, "peak_exit_r": 1.0, "peak_drawdown_min_pct": 35, "peak_drawdown_max_pct": 45, "dissipation_roi_pct": 1.5, "dissipation_phi": -0.12, "dissipation_curvature": 1.5, "dissipation_requires_all": False},
     "standard": {"breakeven_r": 1.0, "breakeven_roi_pct": 1.8, "second_lock_r": 1.8, "second_lock_roi_pct": 3.2, "locked_profit_r": 0.75, "peak_exit_roi_pct": 3.0, "peak_exit_r": 1.3, "peak_drawdown_min_pct": 40, "peak_drawdown_max_pct": 48, "dissipation_roi_pct": 2.0, "dissipation_phi": -0.13, "dissipation_curvature": 1.6, "dissipation_requires_all": False},
     "active": {"breakeven_r": 1.2, "breakeven_roi_pct": 2.0, "second_lock_r": 2.0, "second_lock_roi_pct": 3.4, "locked_profit_r": 0.9, "peak_exit_roi_pct": 3.2, "peak_exit_r": 1.5, "peak_drawdown_min_pct": 42, "peak_drawdown_max_pct": 52, "dissipation_roi_pct": 2.2, "dissipation_phi": -0.14, "dissipation_curvature": 1.7, "dissipation_requires_all": True},
-    "aggressive": {"breakeven_r": 1.5, "breakeven_roi_pct": 2.2, "second_lock_r": 2.2, "second_lock_roi_pct": 3.5, "locked_profit_r": 1.0, "peak_exit_roi_pct": 3.5, "peak_exit_r": 1.8, "peak_drawdown_min_pct": 45, "peak_drawdown_max_pct": 55, "dissipation_roi_pct": 2.5, "dissipation_phi": -0.15, "dissipation_curvature": 1.8, "dissipation_requires_all": True},
+    # Aggressive entries still need a fast capital-protection ratchet: a move
+    # to 1R followed by a normal pullback must not turn into a full stop loss.
+    "aggressive": {"breakeven_r": 1.5, "execution_breakeven_r": 1.0, "breakeven_roi_pct": 2.2, "second_lock_r": 1.8, "second_lock_roi_pct": 3.2, "locked_profit_r": 0.7, "peak_exit_roi_pct": 3.5, "peak_exit_r": 1.8, "peak_drawdown_min_pct": 45, "peak_drawdown_max_pct": 55, "dissipation_roi_pct": 2.5, "dissipation_phi": -0.15, "dissipation_curvature": 1.8, "dissipation_requires_all": True},
 }
 
 
@@ -147,7 +149,7 @@ def derive_profit_lock_instruction(
         locked_r = float(lock["locked_profit_r"])
         target = entry + initial_risk * locked_r if side == "long" else entry - initial_risk * locked_r
         stage = "profit_lock"
-    elif r_multiple >= float(lock["breakeven_r"]):
+    elif r_multiple >= float(lock.get("execution_breakeven_r", lock["breakeven_r"])):
         buffer = abs(entry) * max(0.0, float(fee_buffer_pct))
         target = entry + buffer if side == "long" else entry - buffer
         stage = "breakeven"

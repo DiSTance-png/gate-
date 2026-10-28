@@ -25,6 +25,15 @@ def test_profit_lock_uses_second_stage_after_two_r():
     assert result["suggested_sl_price"] == 107.5
 
 
+def test_aggressive_profile_protects_after_one_r():
+    result = derive_profit_lock_instruction(
+        {"contract": "BTC_USDT", "size": 1, "entry_price": 100, "mark_price": 110},
+        [_stop(90)], "aggressive",
+    )
+    assert result["stage"] == "breakeven"
+    assert result["suggested_sl_price"] > 100
+
+
 def test_nested_gate_snapshot_is_observed():
     snapshot = {
         "feature": {
