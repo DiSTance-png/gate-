@@ -18,7 +18,7 @@ from .execution_journal import ExecutionJournal
 from .execution_reconciler import JOURNAL_PATH as EXECUTION_JOURNAL, reconcile_intent
 from .risk import RiskLimits
 from .service import GateTradingService, protection_coverage_status
-from .risk_profiles import get_risk_profile
+from .risk_profiles import derive_profit_lock_instruction, get_risk_profile
 from .safety import atomic_json, classify_error, cooldown_state, daily_loss_state, position_age_stage, reconcile_exchange_state
 from .protection_lifecycle import actionable_recovery_plans, is_system_protection, load_protection_intents, record_protection_intent, recovery_plans
 from .entry_confirmation import evaluate_retracement_confirmation
@@ -2105,6 +2105,21 @@ def run_cycle() -> dict:
     management = full_response if 'full_response' in locals() and isinstance(full_response, dict) else {}
     position_management = _as_instruction_list(management.get("position_management"))
     pending_management = _as_instruction_list(management.get("pending_orders_management"))
+
+    # The model may miss a profitable position in a noisy/partial response.
+    # Add a deterministic ratchet only when it improves an existing Gate stop;
+    # execution still runs through the normal write lock and confirmation path.
+    explicit_management = {
+        str(item.get("contract") or item.get("instId") or "").upper().replace("-USDT-SWAP", "_USDT").replace("-", "_"): str(item.get("action") or "HOLD").upper()
+        for item in position_management if isinstance(item, dict)
+    }
+    for current_position in private_context["positions"]:
+        contract_name = str(current_position.get("contract") or "").upper()
+        if not contract_name or explicit_management.get(contract_name) in {"CLOSE_MARKET", "UPDATE_SL"}:
+            continue
+        suggestion = derive_profit_lock_instruction(current_position, private_context["protections"], risk_profile.key)
+        if suggestion:
+            position_management.append(suggestion)
     decisions_payload = {symbol: {"instId": symbol, "decision_timestamp_ms": now, "decision": item, "source": llm_source, "llm_error": llm_error, "llm_preview": llm_preview, "policy_version": policy_snapshot["policy_version"], "policy_hash": policy_snapshot["policy_hash"], "risk_snapshot": risk_snapshot, "indicators": next(f for f in features if f["contract"] == symbol)} for symbol, item in decisions.items()}
     if settings.entry_intent_enabled:
         # The explicit-intent path owns a real Gate order lifecycle.  Legacy
@@ -2204,22 +2219,24 @@ def run_cycle() -> dict:
             current = matching[0]
             try:
                 if mgmt_action == "CLOSE_MARKET":
-                    management_result["positions"].append({"contract": contract_name, "action": mgmt_action, "result": GateTradingService(client, RiskLimits(settings.max_position_notional_usd, settings.max_total_margin_usd, settings.max_order_margin_usd)).close_position_safely(contract=contract_name, client_id=f"t-gate-close-{now}", position_mode=str(current.get("mode") or ""))})
+                    with gate_write_lock():
+                        management_result["positions"].append({"contract": contract_name, "action": mgmt_action, "result": GateTradingService(client, RiskLimits(settings.max_position_notional_usd, settings.max_total_margin_usd, settings.max_order_margin_usd)).close_position_safely(contract=contract_name, client_id=f"t-gate-close-{now}", position_mode=str(current.get("mode") or ""))})
                 elif mgmt_action == "UPDATE_SL" and float(instruction.get("suggested_sl_price") or 0) > 0:
                     meta = client.contracts(contract_name)
                     step = meta.get("order_price_round") or meta.get("mark_price_round") or "0"
                     position_size = Decimal(str(current.get("size") or 0))
                     service = GateTradingService(client, RiskLimits(settings.max_position_notional_usd, settings.max_total_margin_usd, settings.max_order_margin_usd))
-                    management_result["positions"].append({
-                        "contract": contract_name, "action": mgmt_action,
-                        "result": service.replace_stop_loss_safely(
-                            contract=contract_name,
-                            position_size=position_size,
-                            mark_price=Decimal(str(current.get("mark_price") or 0)),
-                            trigger_price=_round_price(float(instruction["suggested_sl_price"]), step),
-                            client_id=f"t-gate-slu-{now}-{contract_name.split('_', 1)[0].lower()}",
-                        ),
-                    })
+                    with gate_write_lock():
+                        management_result["positions"].append({
+                            "contract": contract_name, "action": mgmt_action,
+                            "result": service.replace_stop_loss_safely(
+                                contract=contract_name,
+                                position_size=position_size,
+                                mark_price=Decimal(str(current.get("mark_price") or 0)),
+                                trigger_price=_round_price(float(instruction["suggested_sl_price"]), step),
+                                client_id=f"t-gate-slu-{now}-{contract_name.split('_', 1)[0].lower()}",
+                            ),
+                        })
             except Exception as exc:
                 management_result["positions"].append({"contract": contract_name, "action": mgmt_action, "error": str(exc)})
         pending_lifecycle = _manage_open_entry_orders(

@@ -45,6 +45,9 @@ EVOLUTION_LAST_PROMPT_FILE = os.path.join(DATA_DIR, "self_improvement_last_promp
 LOG_FILE = os.path.join(LOGS_DIR, "self_improvement.log")
 EVOLUTION_LOCK_FILE = os.path.join(DATA_DIR, ".self_improvement.lock")
 
+MIN_CAUSAL_SAMPLES = 20
+MIN_INDEPENDENT_WINDOWS = 2
+
 from r20_backend.version import __version__
 from scripts.instrument_pool import load_instruments
 from scripts.prompt_library import active_profile, apply_module_layout
@@ -180,6 +183,44 @@ def build_performance_snapshot(closed_trades: List[Dict[str, Any]]) -> Dict[str,
         "average_slippage_bps": round(sum(slippage_values) / len(slippage_values), 4) if slippage_values else None,
         "by_instrument": by_instrument,
         "unavailable_fields": unavailable,
+    }
+
+
+def assess_evolution_evidence(closed_trades: List[Dict[str, Any]], diagnostics: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Decide whether a review may propose a durable strategy-memory change."""
+    observed = [row for row in closed_trades if str(row.get("snapshot_observability") or "") == "OBSERVED"]
+    windows: set[str] = set()
+    for row in observed:
+        parsed = _parse_bj(row.get("time") or row.get("open_time"))
+        if parsed:
+            # ISO weeks keep adjacent trades in one evaluation window while
+            # preventing a single busy day from counting as independent proof.
+            iso = parsed.isocalendar()
+            windows.add(f"{iso.year}-W{iso.week:02d}")
+    required_samples = max(1, int(os.getenv("GATE_EVOLUTION_MIN_OBSERVED_SAMPLES", MIN_CAUSAL_SAMPLES)))
+    required_windows = max(1, int(os.getenv("GATE_EVOLUTION_MIN_WINDOWS", MIN_INDEPENDENT_WINDOWS)))
+    reasons: list[str] = []
+    if len(observed) < required_samples:
+        reasons.append(f"可观测 OBSERVED 样本 {len(observed)} < {required_samples}")
+    if len(windows) < required_windows:
+        reasons.append(f"独立周窗口 {len(windows)} < {required_windows}")
+    net = sum(float(row.get("net_pnl") or 0) for row in observed)
+    fees = sum(float(row.get("fee") or 0) for row in observed)
+    if net <= 0:
+        reasons.append("扣除手续费后的 OBSERVED 样本净收益不为正")
+    return {
+        "ready_for_memory_candidate": not reasons,
+        "observed_samples": len(observed),
+        "required_observed_samples": required_samples,
+        "independent_windows": len(windows),
+        "required_independent_windows": required_windows,
+        "window_keys": sorted(windows),
+        "observed_net_pnl": round(net, 4),
+        "observed_fees": round(fees, 4),
+        "supporting_samples": len([row for row in observed if float(row.get("net_pnl") or 0) > 0]),
+        "counterexamples": len([row for row in observed if float(row.get("net_pnl") or 0) <= 0]),
+        "reasons": reasons,
+        "diagnostics_available": bool(diagnostics and "observed" in diagnostics),
     }
 
 
@@ -348,6 +389,20 @@ def _match_signal_snapshot(journal: dict[str, list[dict[str, Any]]], contract: s
     return snapshot if isinstance(snapshot, dict) else None
 
 
+def _ledger_entry_snapshot(trade: dict[str, Any]) -> dict[str, Any] | None:
+    """Recover the first Gate execution snapshot persisted with a close row."""
+    candidates = trade.get("entry_snapshots")
+    if isinstance(candidates, list):
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            snapshot = item.get("entry_snapshot")
+            if isinstance(snapshot, dict):
+                return snapshot
+    snapshot = trade.get("entry_snapshot")
+    return snapshot if isinstance(snapshot, dict) else None
+
+
 def load_closed_trades(*, return_diagnostics: bool = False, start_time_override: str | None = None):
     account_init_file = os.path.join(DATA_DIR, "account_initial_state.json")
     reset_time_str = "1970-01-01 00:00:00"
@@ -373,6 +428,11 @@ def load_closed_trades(*, return_diagnostics: bool = False, start_time_override:
         "filtered_outside_pool": 0,
         "snapshot_matched": 0,
         "snapshot_missing": 0,
+        "observed": 0,
+        "partial": 0,
+        "price_only": 0,
+        "unavailable": 0,
+        "independent_windows": 0,
         "effective_start_time": evolution_start,
     }
     if os.path.exists(LEDGER_JSON_FILE):
@@ -399,8 +459,10 @@ def load_closed_trades(*, return_diagnostics: bool = False, start_time_override:
                     fee = abs(float(t.get("fee", 0.0) or 0.0))
                     strat = str(t.get("strategy") or "⚡ 趋势")
                     reason = str(t.get("exit_reason") or t.get("remark") or "")
-                    snapshot = t.get("signal_snapshot") if isinstance(t.get("signal_snapshot"), dict) else _match_signal_snapshot(
-                        signal_journal, inst, t.get("open_time"), t.get("side") or t.get("direction")
+                    snapshot = (
+                        _ledger_entry_snapshot(t)
+                        or (t.get("signal_snapshot") if isinstance(t.get("signal_snapshot"), dict) else None)
+                        or _match_signal_snapshot(signal_journal, inst, t.get("open_time"), t.get("side") or t.get("direction"))
                     )
                     diagnostics["snapshot_matched" if snapshot else "snapshot_missing"] += 1
 
@@ -422,11 +484,14 @@ def load_closed_trades(*, return_diagnostics: bool = False, start_time_override:
                     observability, missing_fields = classify_trade(snapshot, trade_row)
                     trade_row["snapshot_observability"] = observability
                     trade_row["missing_evidence_fields"] = missing_fields
+                    diagnostics[observability.lower()] = diagnostics.get(observability.lower(), 0) + 1
                     closed_trades.append(trade_row)
                     diagnostics["accepted"] += 1
         except Exception as e:
             log_msg(f"读取交易台账异常: {e}")
 
+    observed_times = sorted({str(row.get("time") or "")[:10] for row in closed_trades if row.get("snapshot_observability") == "OBSERVED" and row.get("time")})
+    diagnostics["independent_windows"] = len({day[:7] for day in observed_times if day})
     return (closed_trades, diagnostics) if return_diagnostics else closed_trades
 
 EVOLUTION_SYSTEM_PROMPT = """你是 R20 Quantum Trader 的首席投资官，负责基于真实已平仓交易证据进行认知复盘。模型只输出严格 JSON；宿主程序负责北京时间戳与 Markdown 渲染。
@@ -613,6 +678,7 @@ def call_llm_evolution_review(closed_trades: List[Dict[str, Any]], existing_memo
     total_fees = round(sum(t["fee"] for t in closed_trades), 2)
     target_instruments = target_instruments or current_target_instruments()
     observability = summarize_trades(closed_trades)
+    evidence_gate = assess_evolution_evidence(closed_trades)
 
     memory_context = f"""======================= 【当前系统已有的历史长期记忆库】 =======================
 {existing_memory_md.strip()}
@@ -629,13 +695,14 @@ def call_llm_evolution_review(closed_trades: List[Dict[str, Any]], existing_memo
 - 累计净盈亏: {total_net:+.2f} USDT | 累计手续费消耗: {total_fees:.2f} USDT
 - 当前聚焦标的池: {target_instruments}
 - 主机侧证据审计: {json.dumps(observability, ensure_ascii=False)}
+- 持久化候选证据门: {json.dumps(evidence_gate, ensure_ascii=False)}
 - 只有 OBSERVED 样本可用于因果长期规则；缺失字段不得推断。
 
 【逐笔历史交易明细 (按时间排序)】:
 {json.dumps(closed_trades, indent=2, ensure_ascii=False)}
 
 【复盘与长期记忆进化任务】:
-请严格基于可观测台账证据复盘。当前输入若未提供交易发生时的 v/a/j/I、定积分、概率或 VaR 快照，不得将盈亏事后归因于这些指标，只能标注“数理快照不可观测”。证据不足时使用 NO_CHANGE，不得强行生成新规律。输出标准 JSON：
+请严格基于可观测台账证据复盘。当前输入若未提供交易发生时的 v/a/j/I、定积分、概率或 VaR 快照，不得将盈亏事后归因于这些指标，只能标注“数理快照不可观测”。证据门未通过时只能提出 COLLECT_EVIDENCE 行动，不能提出 ADD/REVISE/INVALIDATE 长期规则；证据门通过时也必须同时列出支持样本与反例，并扣除手续费后结论仍成立。输出标准 JSON：
 {{
   "change_status": "NO_CHANGE" | "ADD" | "REVISE" | "INVALIDATE",
   "diagnosis_insights": [
@@ -767,6 +834,7 @@ def run_self_evolution(force: bool = False):
     target_instruments = current_target_instruments()
     closed_trades, ledger_diagnostics = load_closed_trades(return_diagnostics=True)
     total_trades = len(closed_trades)
+    evidence_gate = assess_evolution_evidence(closed_trades, ledger_diagnostics)
     ledger_revision = hashlib.sha256(
         json.dumps(closed_trades, sort_keys=True, ensure_ascii=False).encode("utf-8")
     ).hexdigest()
@@ -820,8 +888,19 @@ def run_self_evolution(force: bool = False):
     )
     memory_operations = llm_review.get("memory_operations", [])
 
+    # A model may still describe useful observations when evidence is thin,
+    # but the host must prevent those observations from becoming durable rules.
+    # The compatibility branch is only for older callers that do not provide
+    # classification diagnostics; the production loader always does.
+    strict_evidence = bool(evidence_gate.get("diagnostics_available"))
+    if strict_evidence and not evidence_gate["ready_for_memory_candidate"]:
+        memory_operations = []
+        long_term_memory = list(existing_core_lessons)
+        preserve_existing_memory = True
+        change_status = "NO_CHANGE"
+
     candidate_payload = None
-    if not preserve_existing_memory:
+    if not preserve_existing_memory and (not strict_evidence or evidence_gate["ready_for_memory_candidate"]):
         # Safe extraction: convert potential dicts {"rule_text": "..."} to string safely
         safe_long_term = []
         for item in long_term_memory:
@@ -841,7 +920,10 @@ def run_self_evolution(force: bool = False):
             candidate_payload = {
                 "id": candidate_id, "status": "pending", "created_at": now_bj.isoformat(),
                 "ledger_revision": ledger_revision, "expected_memory_version": memory_snapshot["version"],
-                "sample_size": total_trades, "change_status": change_status,
+                "sample_size": int(evidence_gate.get("observed_samples") or 0) if strict_evidence else total_trades,
+                "total_trade_count": total_trades,
+                "evidence_gate": evidence_gate,
+                "change_status": change_status,
                 "proposed_memory": safe_long_term, "memory_operations": memory_operations,
                 "asset_multipliers": asset_mults,
                 "performance_snapshot": build_performance_snapshot(closed_trades),
@@ -866,11 +948,24 @@ def run_self_evolution(force: bool = False):
     performance_snapshot = build_performance_snapshot(closed_trades)
     auto_rollback = evaluate_testnet_auto_rollback(performance_snapshot, total_trades, profit_factor)
 
+    if candidate_payload:
+        no_candidate_reason = ""
+    elif llm_review.get("__llm_error__"):
+        no_candidate_reason = str(llm_review.get("__llm_error__"))
+    elif strict_evidence and not evidence_gate.get("ready_for_memory_candidate"):
+        no_candidate_reason = "；".join(evidence_gate.get("reasons") or [])
+    elif total_trades == 0:
+        no_candidate_reason = "没有符合复盘范围的已平仓样本"
+    else:
+        no_candidate_reason = str(llm_review.get("memory_overwrites_reason") or "证据不足，保留当前策略且未生成候选")
+
     # 4. Save Dashboard Report
     report_payload = {
         "timestamp": timestamp_str,
         "ledger_revision": ledger_revision,
         "total_trades": total_trades,
+        "causal_sample_size": int(evidence_gate.get("observed_samples") or 0),
+        "evidence_gate": evidence_gate,
         "target_instruments": target_instruments,
         "ledger_diagnostics": ledger_diagnostics,
         "observability": summarize_trades(closed_trades),
@@ -896,11 +991,7 @@ def run_self_evolution(force: bool = False):
         "normalized_proposal_count": int(llm_review.get("normalized_proposal_count") or 0),
         "dropped_proposal_count": int(llm_review.get("dropped_proposal_count") or 0),
         "drop_reasons": llm_review.get("drop_reasons") or [],
-        "no_candidate_reason": "" if candidate_payload else (
-            str(llm_review.get("__llm_error__") or "")
-            or str(llm_review.get("memory_overwrites_reason") or "")
-            or ("没有符合复盘范围的已平仓样本" if total_trades == 0 else "证据不足，保留当前策略且未生成候选")
-        ),
+        "no_candidate_reason": no_candidate_reason,
     }
 
     atomic_write_json(REPORT_JSON_FILE, report_payload)

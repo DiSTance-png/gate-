@@ -43,6 +43,8 @@
 - `gate_quant/web.py`：8081 Web、Gate 原生 API 路由和控制面挂载。
 - `r20_gateway/worker.py`、`r20_gateway/scheduler.py`：任务调度和通知投递。这里的 Gateway 不是交易所 API 网关。
 - `scripts/sync_gate_ledger.py`：Gate 原生平仓台账同步。
+
+自进化复盘只把执行台账中的完整 `entry_snapshot`（包括 Gate 平仓行内嵌的 `entry_snapshots`）归一化为 `OBSERVED` 证据；持久化策略候选必须通过至少 20 个可观测样本、两个独立周窗口、扣费后净收益为正并同时保留反例的宿主证据门。未通过时只能记录 `COLLECT_EVIDENCE`，不得生成长期记忆候选。盈利持仓达到当前风险档位的 R 阈值而模型漏报管理时，`ai_worker` 可在同一 Gate 写锁管理链内追加更严格的保本/锁盈止损指令。
 - `frontend/src`：Vue 监控页和管理后台。
 
 ## 进程和端口事实

@@ -107,7 +107,7 @@ Gate 双向持仓查询会同时返回 `dual_long` 与 `dual_short` 两行；执
 
 Gate 公共行情 GET 遇到超时、连接异常或 HTTP 500/502/503/504 时最多进行两次短延迟重试，减少偶发 Gate 故障导致的整轮决策缺失。私有请求及任何下单、撤单、平仓请求不使用该重试；订单写入超时仍必须先按客户端订单号查单。
 
-AI 的 `UPDATE_SL` 使用 Gate 单止损约束下的受控替换：只接受方向正确且比旧止损更严格的价格，先确认撤销唯一旧止损，再创建并确认新止损；若新建失败则立即恢复旧价格。止盈单不参与替换，恢复不明确时按 fail-closed 记录异常。
+AI 的 `UPDATE_SL` 使用 Gate 单止损约束下的受控替换：只接受方向正确且比旧止损更严格的价格，先确认撤销唯一旧止损，再创建并确认新止损；若新建失败则立即恢复旧价格。达到当前风险档位的保本 R 阈值而模型漏报管理时，执行层会把止损推进到开仓价加手续费缓冲；达到二阶阈值后锁定档位规定的盈利 R，仍经过同一写锁、查单和保护覆盖校验。止盈单不参与替换，恢复不明确时按 fail-closed 记录异常。
 
 只要执行台账存在待确认、部分成交、已触发待对账或人工复核状态，新增风险安全门就保持关闭。唯一例外是已确认仍在 Gate 等待触发的 `awaiting_trigger`：它保留风险预算但只占对应合约，不阻止其他合约使用剩余额度。一旦触发状态不明确，立即恢复组合级 fail-closed。
 
@@ -119,7 +119,7 @@ P0/P1 安全层还会记录 Gate 对账、日亏损熔断、挂单生命周期�
 
 每轮 AI 决策、交易结果和历史记录都绑定 `policy_version` 与 `policy_hash`。版本指纹覆盖提示词、自进化心法、物理拦截器、模型委员会、Gate 风险档位/杠杆/资金上限/生命周期参数和标的池；归档与回滚明确排除 API Key、Secret、代理、`GATE_ENVIRONMENT` 和 Live 开关。
 
-自动复盘默认只写入 `data/evolution_candidates/` 候选，不会直接覆盖当前稳定心法或标的倍率。超级管理员可在“自进化配置”审核应用或拒绝候选；没有有效心法变化时记录 `NO_CHANGE` 且不生成候选，旧空候选只能拒绝归档。候选现在保存结构化 `memory_operations`：`ADD` 追加、`REVISE` 修改指定非 baseline 规则、`INVALIDATE` 停用但保留历史、`COLLECT_EVIDENCE` 只提出采集建议。`structured_trading_memory.json` 是唯一权威，必须通过管理员显式初始化 baseline；`AI_TRADING_MEMORY.md` 只是派生镜像。baseline 永远不能被删除、修改或停用，版本冲突会拒绝发布。记忆候选不会写入 `asset_multipliers.json`，资产参数必须走独立审批流程。报告同时记录 `COLD_START`、`NO_CHANGE`、`INSUFFICIENT_EVIDENCE`、`WAITING_REVIEW`、`LLM_ERROR`、`PARSE_ERROR`、`PUBLICATION_ERROR` 和 `CONFLICT` 等状态，以及主机侧证据覆盖率。收益快照基于真实平仓台账统计净盈亏、手续费、最大回撤和分标的表现；台账没有资金费或滑点字段时显示“不可用”，不会估算或伪造。新入场会在执行台账固化完整因子、决策、风险与策略版本快照，平仓同步后供复盘使用；旧记录仍可按成交后 20 分钟内同方向信号快照匹配。
+自动复盘默认只写入 `data/evolution_candidates/` 候选，不会直接覆盖当前稳定心法或标的倍率。超级管理员可在“自进化配置”审核应用或拒绝候选；没有有效心法变化时记录 `NO_CHANGE` 且不生成候选，旧空候选只能拒绝归档。候选现在保存结构化 `memory_operations`：`ADD` 追加、`REVISE` 修改指定非 baseline 规则、`INVALIDATE` 停用但保留历史、`COLLECT_EVIDENCE` 只提出采集建议。`structured_trading_memory.json` 是唯一权威，必须通过管理员显式初始化 baseline；`AI_TRADING_MEMORY.md` 只是派生镜像。baseline 永远不能被删除、修改或停用，版本冲突会拒绝发布。记忆候选不会写入 `asset_multipliers.json`，资产参数必须走独立审批流程。报告的持久化候选证据门要求至少 20 个 `OBSERVED` 样本、至少 2 个独立周窗口、扣除手续费后仍有支持收益并保留反例；未达到时只保留 `COLLECT_EVIDENCE` 观察建议。收益快照基于真实平仓台账统计净盈亏、手续费、最大回撤和分标的表现；台账没有资金费或滑点字段时显示“不可用”，不会估算或伪造。新入场会在执行台账固化完整因子、决策、风险与策略版本快照，Gate 嵌套的 `entry_snapshots` 会在复盘前展开为可审计动力学字段，旧记录仍可按成交后 20 分钟内同方向信号快照匹配。
 
 Gateway 启动时会把上一次异常终止遗留的 `running` 任务标为“已中断”，并默认保留 30 天任务历史；可用 `GATE_JOB_RUNS_KEEP_DAYS` 调整，但不能小于 1 天。
 

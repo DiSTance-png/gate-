@@ -99,3 +99,68 @@ def validate_profile_catalog() -> None:
 
 
 validate_profile_catalog()
+
+
+def derive_profit_lock_instruction(
+    position: dict[str, Any], protections: list[dict[str, Any]], profile_key: str,
+    *, fee_buffer_pct: float = 0.0005,
+) -> dict[str, Any] | None:
+    """Return a deterministic, favorable stop ratchet for an open position.
+
+    This is intentionally a pure helper.  It does not place or cancel orders;
+    the existing Gate write-locked management path remains the only executor.
+    """
+    try:
+        size = float(position.get("size") or 0)
+        entry = float(position.get("entry_price") or position.get("avgPx") or 0)
+        mark = float(position.get("mark_price") or position.get("lastPx") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not size or entry <= 0 or mark <= 0:
+        return None
+    side = "long" if size > 0 else "short"
+    stop_rule = 2 if side == "long" else 1
+    stop_rows = []
+    for row in protections or []:
+        initial = row.get("initial") or {}
+        contract = str(initial.get("contract") or row.get("contract") or "").upper()
+        if contract != str(position.get("contract") or "").upper():
+            continue
+        if int((row.get("trigger") or {}).get("rule") or 0) != stop_rule:
+            continue
+        try:
+            price = float((row.get("trigger") or {}).get("price") or 0)
+        except (TypeError, ValueError):
+            price = 0
+        if price > 0:
+            stop_rows.append(price)
+    if not stop_rows:
+        return None
+    current_stop = max(stop_rows) if side == "long" else min(stop_rows)
+    initial_risk = entry - current_stop if side == "long" else current_stop - entry
+    favorable = mark - entry if side == "long" else entry - mark
+    if initial_risk <= 0 or favorable <= 0:
+        return None
+    r_multiple = favorable / initial_risk
+    lock = PROFIT_LOCK_PROFILES.get(str(profile_key or "standard"), PROFIT_LOCK_PROFILES["standard"])
+    if r_multiple >= float(lock["second_lock_r"]):
+        locked_r = float(lock["locked_profit_r"])
+        target = entry + initial_risk * locked_r if side == "long" else entry - initial_risk * locked_r
+        stage = "profit_lock"
+    elif r_multiple >= float(lock["breakeven_r"]):
+        buffer = abs(entry) * max(0.0, float(fee_buffer_pct))
+        target = entry + buffer if side == "long" else entry - buffer
+        stage = "breakeven"
+    else:
+        return None
+    favorable_move = target > current_stop if side == "long" else target < current_stop
+    if not favorable_move:
+        return None
+    return {
+        "contract": str(position.get("contract") or "").upper(),
+        "action": "UPDATE_SL",
+        "suggested_sl_price": target,
+        "reason": f"deterministic_{stage}_ratchet_{r_multiple:.2f}R",
+        "r_multiple": round(r_multiple, 4),
+        "stage": stage,
+    }
