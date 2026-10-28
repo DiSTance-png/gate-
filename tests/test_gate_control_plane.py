@@ -755,3 +755,80 @@ def test_daily_loss_reset_requires_flat_clean_account_and_is_audited(monkeypatch
         web.reset_gate_daily_loss(
             web.GateDailyLossResetRequest(confirmation="RESET GATE DAILY LOSS"), None,
         )
+
+
+def test_daily_loss_reset_preserves_existing_fully_protected_position(monkeypatch, tmp_path):
+    import gate_quant.web as web
+
+    now = 1_800_000_000
+    local_day = web.dt.datetime.fromtimestamp(now).strftime("%Y-%m-%d")
+    ledger = tmp_path / "trading_ledger.json"
+    ledger.write_text(json.dumps([
+        {"status": "closed", "close_time": f"{local_day} 01:00:00", "net_pnl": -60},
+    ]), encoding="utf-8")
+    events = []
+    monkeypatch.setattr(web, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(web, "DAILY_LOSS_RESET", tmp_path / "gate_daily_loss_reset.json")
+    monkeypatch.setattr(web, "TRADING_LEDGER", ledger)
+    monkeypatch.setattr(web.time, "time", lambda: now)
+    monkeypatch.setattr(web, "_require_control_admin", lambda token: {"username": "tester"})
+    monkeypatch.setattr(web, "load_settings", lambda: configured_settings(
+        environment="live", public_market_environment="live", live_trading_enabled=True,
+        max_daily_loss_usd=100, max_daily_loss_ratio=0.05,
+    ))
+    monkeypatch.setattr(web, "gate_write_lock", lambda: nullcontext())
+    monkeypatch.setattr(web.store, "add", lambda *args, **kwargs: events.append((args, kwargs)))
+    monkeypatch.setattr(web, "ExecutionJournal", lambda path: SimpleNamespace(active=lambda environment: []))
+
+    class ProtectedPositionGate:
+        def account(self): return {"total": "1000"}
+        def positions(self): return [{"contract": "BTC_USDT", "size": "2"}]
+        def open_orders(self): return []
+        def trigger_entry_orders(self): return []
+        def protection_orders(self):
+            return [
+                {"initial": {"contract": "BTC_USDT", "size": "-2", "reduce_only": True}, "trigger": {"rule": 1}},
+                {"initial": {"contract": "BTC_USDT", "size": "-2", "reduce_only": True}, "trigger": {"rule": 2}},
+            ]
+
+    monkeypatch.setattr(web, "GateFuturesClient", lambda settings: ProtectedPositionGate())
+    result = web.reset_gate_daily_loss(
+        web.GateDailyLossResetRequest(confirmation="RESET GATE DAILY LOSS"), None,
+    )
+
+    assert result["reset"] is True
+    assert result["marker"]["active_position_count"] == 1
+    assert result["marker"]["positions_preserved"] is True
+    assert result["daily_loss"]["loss_usd"] == 0
+    assert events[0][0][0] == "gate.daily_loss.reset"
+
+
+def test_daily_loss_reset_rejects_position_with_protection_gap(monkeypatch, tmp_path):
+    import gate_quant.web as web
+
+    now = 1_800_000_000
+    ledger = tmp_path / "trading_ledger.json"
+    ledger.write_text("[]", encoding="utf-8")
+    monkeypatch.setattr(web, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(web, "DAILY_LOSS_RESET", tmp_path / "gate_daily_loss_reset.json")
+    monkeypatch.setattr(web, "TRADING_LEDGER", ledger)
+    monkeypatch.setattr(web.time, "time", lambda: now)
+    monkeypatch.setattr(web, "_require_control_admin", lambda token: {"username": "tester"})
+    monkeypatch.setattr(web, "load_settings", lambda: configured_settings(
+        environment="live", public_market_environment="live", live_trading_enabled=True,
+    ))
+    monkeypatch.setattr(web, "gate_write_lock", lambda: nullcontext())
+    monkeypatch.setattr(web, "ExecutionJournal", lambda path: SimpleNamespace(active=lambda environment: []))
+
+    class UnprotectedPositionGate:
+        def account(self): return {"total": "1000"}
+        def positions(self): return [{"contract": "BTC_USDT", "size": "2"}]
+        def open_orders(self): return []
+        def trigger_entry_orders(self): return []
+        def protection_orders(self): return []
+
+    monkeypatch.setattr(web, "GateFuturesClient", lambda settings: UnprotectedPositionGate())
+    with pytest.raises(web.HTTPException, match="protection_gap"):
+        web.reset_gate_daily_loss(
+            web.GateDailyLossResetRequest(confirmation="RESET GATE DAILY LOSS"), None,
+        )

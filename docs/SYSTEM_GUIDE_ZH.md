@@ -95,6 +95,8 @@ Gate API v4
 - `gate_quant/protection_lifecycle.py`：保护意图、缺失保护恢复和孤立保护单识别。
 - `gate_quant/safety.py`：交易所状态对账、日亏损、挂单超时和止损冷却。日亏损熔断由 `GATE_DAILY_LOSS_CIRCUIT_BREAKER_ENABLED` 控制，关闭时只取消日亏损对新增风险的阻断，不删除亏损记录，也不影响其它安全门。
 
+管理员日亏损基线重置（`POST /api/v1/admin/gate/daily-loss/reset`）只保存当前环境当天的基线时间和审计信息，不发送任何 Gate 写请求，因此不会平仓、撤单、修改 TP/SL 或删除历史台账。重置前仍在统一写锁内完成私有只读核对：已有持仓可以保留，但必须通过完整 TP/SL 覆盖、无入场挂单、无突破计划、无活动执行意图以及无保护缺口、孤立保护或过期挂单的 fail-closed 对账；每日每环境最多一次，查询失败或状态不明确时拒绝。
+
 ### 4.4 Web、调度和记录
 
 - `gate_quant/web.py`：主 Web 服务和 Gate 原生 API。

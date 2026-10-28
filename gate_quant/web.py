@@ -919,8 +919,28 @@ def reset_gate_daily_loss(payload: GateDailyLossResetRequest, x_gate_session: st
         active_positions = [row for row in positions if isinstance(row, dict) and float(row.get("size") or 0) != 0]
         entry_orders = [row for row in orders if isinstance(row, dict) and not bool(row.get("reduce_only") or row.get("is_reduce_only") or row.get("close") or row.get("is_close"))]
         active_journal = ExecutionJournal(EXECUTION_JOURNAL).active(settings.environment)
-        if active_positions or entry_orders or triggers or protections or active_journal:
-            raise HTTPException(409, "仅允许在无持仓、无挂单、无保护单且无待对账执行时重置日亏损基线")
+        reconciliation = reconcile_exchange_state(
+            positions,
+            orders,
+            protections,
+            max_pending_age_seconds=settings.max_pending_order_age_seconds,
+            now=now,
+        )
+        # A reset only changes which historical closes count toward today's
+        # loss baseline. It must never mutate exchange state. Existing
+        # positions are therefore allowed only when the normal fail-closed
+        # reconciliation proves that their native TP/SL coverage is complete
+        # and there is no other risk-increasing state in flight.
+        reset_blockers = []
+        if entry_orders:
+            reset_blockers.append("entry_orders")
+        if triggers:
+            reset_blockers.append("trigger_entry_orders")
+        if active_journal:
+            reset_blockers.append("active_execution_intents")
+        reset_blockers.extend(str(issue.get("code") or "reconciliation") for issue in reconciliation.get("issues") or [])
+        if reset_blockers:
+            raise HTTPException(409, "当前状态不满足安全重置条件：" + ", ".join(dict.fromkeys(reset_blockers)))
         equity = float(account.get("total") or 0)
         before = daily_loss_state(
             TRADING_LEDGER, max_loss_usd=settings.max_daily_loss_usd,
@@ -934,6 +954,9 @@ def reset_gate_daily_loss(payload: GateDailyLossResetRequest, x_gate_session: st
             "actor": actor.get("username") or "admin",
             "loss_usd_before_reset": before.get("loss_usd", 0),
             "limit_usd": before.get("limit_usd", 0),
+            "active_position_count": len(active_positions),
+            "positions_preserved": True,
+            "reconciliation": reconciliation,
         }
         atomic_json(DAILY_LOSS_RESET, marker)
         after = daily_loss_state(
