@@ -36,13 +36,36 @@ def test_v4_stages_are_observe_only_and_do_not_submit_orders():
         remaining_cost=1, remaining_size=1,
     )
     assert s2["stage"] == "S2"
-    assert Decimal(s2["candidate_stop_price"]) == Decimal("101")
+    assert Decimal(s2["candidate_stop_price"]) == Decimal("99")
     s3 = profit_floor_candidate(
         side="long", entry_price=100, d0=10, mfe_r="1.6",
         remaining_cost=1, remaining_size=1,
     )
     assert s3["stage"] == "S3"
     assert Decimal(s3["candidate_stop_price"]) == Decimal("108")
+
+
+def test_v4_candidates_use_signed_price_distance_for_short_stages():
+    s0 = profit_floor_candidate(
+        side="short", entry_price=100, d0=10, mfe_r="0.2",
+        remaining_cost=1, remaining_size=1,
+    )
+    assert s0["stage"] == "S0"
+    assert Decimal(s0["candidate_stop_price"]) == Decimal("110")
+
+    s1 = profit_floor_candidate(
+        side="short", entry_price=100, d0=10, mfe_r="0.8",
+        remaining_cost=1, remaining_size=1,
+    )
+    assert s1["stage"] == "S1"
+    assert Decimal(s1["candidate_stop_price"]) == Decimal("102.5")
+
+    s3 = profit_floor_candidate(
+        side="short", entry_price=100, d0=10, mfe_r="1.6",
+        remaining_cost=1, remaining_size=1,
+    )
+    assert s3["stage"] == "S3"
+    assert Decimal(s3["candidate_stop_price"]) == Decimal("92")
 
 
 def test_observe_state_only_ratchets_local_mfe_and_serializes():
@@ -64,6 +87,16 @@ def test_observe_state_only_ratchets_local_mfe_and_serializes():
 def test_invalid_risk_is_unmanaged():
     result = profit_floor_candidate(
         side="long", entry_price=100, d0=0, mfe_r=2,
+        remaining_cost=1, remaining_size=1,
+    )
+    assert result["stage"] == "UNMANAGED"
+    assert result["candidate_stop_price"] is None
+
+
+def test_invalid_side_is_unmanaged():
+    assert initial_risk_distance(side="sideways", entry_price=100, initial_stop_price=90) == Decimal("0")
+    result = profit_floor_candidate(
+        side="sideways", entry_price=100, d0=10, mfe_r=2,
         remaining_cost=1, remaining_size=1,
     )
     assert result["stage"] == "UNMANAGED"

@@ -40,7 +40,12 @@ def initial_risk_distance(*, side: str, entry_price: Any, initial_stop_price: An
     entry = _decimal(entry_price)
     stop = _decimal(initial_stop_price)
     normalized = str(side or "").strip().lower()
-    distance = entry - stop if normalized in {"long", "多", "buy", "buy_long"} else stop - entry
+    if normalized in {"long", "多", "buy", "buy_long"}:
+        distance = entry - stop
+    elif normalized in {"short", "空", "sell", "sell_short"}:
+        distance = stop - entry
+    else:
+        return ZERO
     return distance if distance > ZERO else ZERO
 
 
@@ -65,10 +70,14 @@ def cost_distance(*, remaining_cost: Any, remaining_size: Any, contract_multipli
 def _candidate_price(*, side: str, entry_price: Any, distance: Decimal) -> Decimal:
     entry = _decimal(entry_price)
     normalized = str(side or "").strip().lower()
-    if normalized in {"long", "多", "buy", "buy_long"}:
+    if normalized in {
+        "long", "多", "buy", "buy_long",
+        "short", "空", "sell", "sell_short",
+    }:
+        # ``distance`` is signed in the position's price space.  Long and
+        # short candidates therefore share the same conversion; the caller
+        # supplies the direction for each stage.
         return entry + distance
-    if normalized in {"short", "空", "sell", "sell_short"}:
-        return entry - distance
     return ZERO
 
 
@@ -106,6 +115,9 @@ def profit_floor_candidate(*, side: str, entry_price: Any, d0: Any, mfe_r: Any,
         return {"stage": "UNMANAGED", "candidate_stop_price": None, "reason": "invalid_initial_risk"}
     normalized_side = str(side or "").strip().lower()
     is_long = normalized_side in {"long", "多", "buy", "buy_long"}
+    is_short = normalized_side in {"short", "空", "sell", "sell_short"}
+    if not (is_long or is_short):
+        return {"stage": "UNMANAGED", "candidate_stop_price": None, "reason": "invalid_side"}
     if stage == "S0":
         distance = risk * (Decimal("-1") if is_long else Decimal("1"))
     elif stage == "S1":
