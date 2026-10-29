@@ -38,6 +38,8 @@ LEDGER_JSON_FILE = os.path.join(DATA_DIR, "trading_ledger.json")
 REPORT_JSON_FILE = os.path.join(DATA_DIR, "self_improvement_report.json")
 REPORT_ARCHIVE_DIR = os.path.join(DATA_DIR, "self_improvement_history")
 EVOLUTION_CANDIDATE_DIR = os.path.join(DATA_DIR, "evolution_candidates")
+PARAMETER_CANDIDATE_DIR = os.path.join(DATA_DIR, "evolution_parameter_candidates")
+ASSET_MULTIPLIER_FILE = os.path.join(DATA_DIR, "asset_multipliers.json")
 AI_DECISIONS_FILE = os.path.join(DATA_DIR, "ai_brain_decisions.json")
 AI_MEMORY_FILE = os.path.join(DATA_DIR, "ai_trading_memory.json")
 AI_MEMORY_MD_FILE = os.path.join(DATA_DIR, "AI_TRADING_MEMORY.md")
@@ -90,6 +92,14 @@ def list_evolution_candidates(limit: int = 100) -> List[Dict[str, Any]]:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(payload, dict):
+                # Candidates created by the pre-structured-memory engine did
+                # not always persist the id/version fields.  Keep them visible
+                # for audit and make the stale version explicit instead of
+                # making the UI send an unusable literal "missing" value.
+                payload.setdefault("id", path.stem)
+                if not str(payload.get("expected_memory_version") or "").strip():
+                    payload["expected_memory_version"] = "missing"
+                    payload["apply_block_reason"] = "legacy_candidate_requires_current_memory_version"
                 rows.append(payload)
         except (OSError, ValueError):
             continue
@@ -105,7 +115,19 @@ def apply_evolution_candidate(candidate_id: str, expected_version: str) -> Dict[
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     if payload.get("status") != "pending":
         raise ValueError("该候选已处理，不能重复应用")
-    if str(payload.get("expected_memory_version") or "") != str(expected_version or ""):
+    candidate_version = str(payload.get("expected_memory_version") or "").strip()
+    requested_version = str(expected_version or "").strip()
+    # Legacy candidates were generated before the structured memory version
+    # was persisted.  Bind one only at the explicit administrator apply step,
+    # while still requiring the caller to send the freshly loaded version.
+    if candidate_version in {"", "missing"}:
+        from scripts import evolution_shield as memory_service
+        current_version = str(memory_service.read_memory_snapshot().get("version") or "")
+        if not requested_version or requested_version != current_version:
+            raise ValueError("旧候选缺少心法版本，请先重新加载当前心法后再应用")
+        payload["expected_memory_version"] = current_version
+        payload["legacy_version_bound_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    elif candidate_version != requested_version:
         raise ValueError("心法版本已变化，请重新复盘生成候选；未覆盖当前数据")
 
     from scripts import evolution_shield as memory_service
@@ -131,6 +153,91 @@ def apply_evolution_candidate(candidate_id: str, expected_version: str) -> Dict[
         payload["asset_multiplier_status"] = "not_applied_memory_only"
         atomic_write_json(path, payload)
     memory_service.sync_markdown_mirror()
+    return payload
+
+
+def _parameter_candidate_path(candidate_id: str) -> str:
+    clean = str(candidate_id or "")
+    if not clean or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for ch in clean):
+        raise ValueError("无效的参数候选标识")
+    os.makedirs(PARAMETER_CANDIDATE_DIR, exist_ok=True)
+    return os.path.join(PARAMETER_CANDIDATE_DIR, f"{clean}.json")
+
+
+def list_parameter_candidates(limit: int = 100) -> List[Dict[str, Any]]:
+    os.makedirs(PARAMETER_CANDIDATE_DIR, exist_ok=True)
+    rows: list[dict[str, Any]] = []
+    paths = sorted(Path(PARAMETER_CANDIDATE_DIR).glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(payload, dict):
+            payload.setdefault("id", path.stem)
+            rows.append(payload)
+        if len(rows) >= max(1, min(int(limit), 500)):
+            break
+    return rows
+
+
+def _read_current_policy_hash() -> str:
+    try:
+        from r20_backend.policy_snapshot import generate_policy_snapshot
+        return str(generate_policy_snapshot(root_dir=ROOT).get("policy_hash") or "")
+    except Exception:
+        return ""
+
+
+def apply_parameter_candidate(candidate_id: str, expected_policy_hash: str) -> Dict[str, Any]:
+    """Publish a reviewed asset multiplier candidate independently of memory."""
+    path = _parameter_candidate_path(candidate_id)
+    if not os.path.isfile(path):
+        raise FileNotFoundError("未找到参数候选")
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if payload.get("status") != "pending":
+        raise ValueError("该参数候选已处理，不能重复应用")
+    current_hash = _read_current_policy_hash()
+    expected = str(expected_policy_hash or payload.get("expected_policy_hash") or "").strip()
+    stored = str(payload.get("expected_policy_hash") or "").strip()
+    if stored and expected != stored:
+        raise ValueError("参数候选版本已变化，请重新加载后再操作")
+    if current_hash and expected and current_hash != expected:
+        raise ValueError("策略版本已变化，请重新生成参数候选；未覆盖当前配置")
+    multipliers = payload.get("multipliers")
+    if not isinstance(multipliers, dict) or not multipliers:
+        raise ValueError("参数候选为空")
+    normalized: dict[str, float] = {}
+    for key, value in multipliers.items():
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"参数候选包含无效倍率: {key}") from None
+        if not 0.5 <= number <= 1.5:
+            raise ValueError(f"参数候选倍率超出 0.5~1.5 安全范围: {key}")
+        normalized[str(key).upper()] = round(number, 4)
+    atomic_write_json(ASSET_MULTIPLIER_FILE, {
+        "schema_version": 1,
+        "multipliers": normalized,
+        "policy_hash": current_hash or expected,
+        "candidate_id": str(payload.get("id") or candidate_id),
+        "applied_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    })
+    payload.update({"status": "applied", "multipliers": normalized,
+                    "applied_at": datetime.datetime.now(datetime.timezone.utc).isoformat()})
+    atomic_write_json(path, payload)
+    return payload
+
+
+def reject_parameter_candidate(candidate_id: str) -> Dict[str, Any]:
+    path = _parameter_candidate_path(candidate_id)
+    if not os.path.isfile(path):
+        raise FileNotFoundError("未找到参数候选")
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if payload.get("status") != "pending":
+        raise ValueError("该参数候选已处理")
+    payload.update({"status": "rejected", "rejected_at": datetime.datetime.now(datetime.timezone.utc).isoformat()})
+    atomic_write_json(path, payload)
     return payload
 
 

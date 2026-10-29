@@ -90,6 +90,30 @@ def test_memory_candidate_does_not_write_asset_multipliers(monkeypatch, tmp_path
     assert not (data / "asset_multipliers.json").exists()
 
 
+def test_legacy_candidate_binds_current_memory_version_on_explicit_apply(monkeypatch, tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    candidates = data / "evolution_candidates"
+    candidates.mkdir()
+    monkeypatch.setattr(evolution, "DATA_DIR", str(data))
+    monkeypatch.setattr(evolution, "EVOLUTION_CANDIDATE_DIR", str(candidates))
+    monkeypatch.setattr(evolution_shield, "DATA_DIR", data)
+    monkeypatch.setattr(evolution_shield, "STRUCTURED_MEMORY_FILE", data / "structured_trading_memory.json")
+    monkeypatch.setattr(evolution_shield, "AI_MEMORY_MD_FILE", data / "AI_TRADING_MEMORY.md")
+    snapshot = evolution_shield.initialize_baseline_memory()
+    candidate = {
+        "id": "ev_legacy", "status": "pending", "expected_memory_version": "missing",
+        "sample_size": 20, "change_status": "ADD",
+        "proposed_memory": ["多个独立样本支持把手续费纳入入场期望评估"],
+    }
+    evolution.atomic_write_json(str(candidates / "ev_legacy.json"), candidate)
+    monkeypatch.setattr(evolution_shield, "sync_markdown_mirror", lambda: True)
+    result = evolution.apply_evolution_candidate("ev_legacy", snapshot["version"])
+    assert result["status"] == "applied"
+    persisted = json.loads((candidates / "ev_legacy.json").read_text(encoding="utf-8"))
+    assert persisted["expected_memory_version"] == snapshot["version"]
+
+
 def test_observability_is_host_determined():
     observed, missing = classify_trade({field: 1 for field in ("regime", "structure_1h", "velocity", "acceleration", "jerk", "impulse", "energy_integral", "deviation_area_integral", "continuation_probability", "breakdown_probability", "var", "cvar", "atr", "risk_reward")}, {"close_time": "2026-01-01", "net_pnl": 1})
     partial, _ = classify_trade({"atr": 1, "entry_price": 100}, {"close_time": "2026-01-01", "net_pnl": 1})
