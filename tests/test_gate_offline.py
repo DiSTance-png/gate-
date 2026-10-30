@@ -3,6 +3,7 @@ import requests
 import pytest
 from concurrent.futures import Future
 from decimal import Decimal
+from types import SimpleNamespace
 from gate_quant.client import GateFuturesClient, AmbiguousOrderError
 from gate_quant.config import GateSettings
 from gate_quant.risk import RiskLimits
@@ -33,6 +34,39 @@ class FakeSession:
             def raise_for_status(self): pass
             def json(self): return []
         return R()
+
+
+def test_contrarian_position_context_is_carried_into_management_and_close_requires_tag():
+    evidence = {
+        "client_id": "t-gate-ai-1-1",
+        "entry_action": "BUY_LONG",
+        "take_profit_price": "2262.69",
+        "stop_loss_price": "2153.19",
+        "entry_snapshot": {"decision": {
+            "strategy_mode": "contrarian", "raw_action": "SELL_SHORT",
+            "action": "BUY_LONG", "entry_intent": "immediate",
+            "risk_reward_ratio": 0.5, "take_profit_r": 1, "stop_loss_r": 2,
+        }},
+    }
+    journal = SimpleNamespace(latest_entry_snapshot_for_position=lambda **kwargs: evidence)
+    context = ai_worker._position_strategy_context(
+        {"contract": "ETH_USDT", "size": "35.5"}, journal, "live",
+    )
+    assert context["strategy_mode"] == "contrarian"
+    assert context["raw_action"] == "SELL_SHORT"
+    assert context["effective_action"] == "BUY_LONG"
+    assert context["take_profit_r"] == 1
+    assert context["stop_loss_r"] == 2
+    allowed, reason = ai_worker._allow_position_management_action(
+        {"action": "CLOSE_MARKET", "reason": "4H bearish"}, context,
+    )
+    assert allowed is False
+    assert "strategy_mode=contrarian" in reason
+    allowed, reason = ai_worker._allow_position_management_action(
+        {"action": "CLOSE_MARKET", "strategy_mode": "contrarian", "reason": "反向结构失效"}, context,
+    )
+    assert allowed is True
+    assert reason == ""
 
 
 @pytest.mark.parametrize("reply", [None, "retracement", "invalid"])

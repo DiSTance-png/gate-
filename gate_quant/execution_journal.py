@@ -252,6 +252,44 @@ class ExecutionJournal:
             result.append(row)
         return result
 
+    def latest_entry_snapshot_for_position(
+        self, *, environment: str, contract: str, side: str,
+    ) -> dict[str, Any] | None:
+        """Return the most recent filled entry evidence for an active position.
+
+        Active positions have no close timestamp, so the historical close lookup
+        above cannot identify their strategy.  Keeping this read in the journal
+        gives the AI management prompt the original/contrarian entry contract
+        without guessing from the live position side.
+        """
+        wanted_positive = str(side).lower() == "long"
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT client_id,requested_size,fill_price,entry_price,is_add_on,
+                          policy_version,policy_hash,created_at_ms,updated_at_ms,
+                          entry_snapshot_json
+                     FROM entry_intents
+                    WHERE environment=? AND contract=?
+                      AND CAST(filled_size AS REAL) != 0
+                      AND status IN ('filled','filled_protected','partially_filled',
+                                     'protection_pending','stop_protected_tp_pending')
+                    ORDER BY updated_at_ms DESC""",
+                (environment.lower(), contract.upper()),
+            ).fetchall()
+        for raw in rows:
+            row = dict(raw)
+            try:
+                if (float(row.get("requested_size") or 0) > 0) != wanted_positive:
+                    continue
+                snapshot = json.loads(row.pop("entry_snapshot_json") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(snapshot, dict) or not snapshot:
+                continue
+            row["entry_snapshot"] = snapshot
+            return row
+        return None
+
     @staticmethod
     def _append_event(connection: sqlite3.Connection, client_id: str, event_type: str, detail: Any, now: int) -> None:
         connection.execute(

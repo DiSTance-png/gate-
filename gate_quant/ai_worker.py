@@ -46,6 +46,83 @@ UNFILLED_REENTRY_COOLDOWN_SECONDS = 15 * 60
 CONTRARIAN_SHADOW = DATA / "contrarian_shadow.json"
 
 
+def _position_strategy_context(position: dict[str, Any], journal: ExecutionJournal, environment: str) -> dict[str, Any]:
+    """Resolve the strategy that opened an active position from durable evidence.
+
+    The exchange exposes only the effective long/short side.  Contrarian
+    entries therefore need their entry snapshot carried into the management
+    prompt; otherwise a reverse long is indistinguishable from an ordinary
+    trend long and the model can close it merely because the macro trend is
+    bearish.
+    """
+    contract = str(position.get("contract") or "").upper()
+    size = float(position.get("size") or 0)
+    side = "long" if size > 0 else "short" if size < 0 else ""
+    context: dict[str, Any] = {
+        "strategy_mode": "original",
+        "raw_action": "",
+        "effective_action": "BUY_LONG" if side == "long" else "SELL_SHORT" if side == "short" else "WAIT",
+        "entry_action": "BUY_LONG" if side == "long" else "SELL_SHORT" if side == "short" else "WAIT",
+        "entry_intent": "",
+        "planned_take_profit_price": 0.0,
+        "planned_stop_loss_price": 0.0,
+        "take_profit_r": 0.0,
+        "stop_loss_r": 0.0,
+        "reward_to_risk": 0.0,
+        "evidence_client_id": "",
+    }
+    if not contract or not side:
+        return context
+    try:
+        evidence = journal.latest_entry_snapshot_for_position(
+            environment=environment, contract=contract, side=side,
+        )
+    except Exception:
+        evidence = None
+    snapshot = (evidence or {}).get("entry_snapshot") or {}
+    decision = snapshot.get("decision") if isinstance(snapshot, dict) else {}
+    decision = decision if isinstance(decision, dict) else {}
+    strategy_mode = str(decision.get("strategy_mode") or snapshot.get("strategy_mode") or "original").strip().lower()
+    context.update({
+        "strategy_mode": strategy_mode if strategy_mode in {"original", "contrarian"} else "original",
+        "raw_action": str(decision.get("raw_action") or "").upper(),
+        "effective_action": str(decision.get("action") or context["effective_action"]).upper(),
+        "entry_action": str(evidence.get("entry_action") or decision.get("action") or context["entry_action"]).upper(),
+        "entry_intent": str(decision.get("entry_intent") or "").lower(),
+        "planned_take_profit_price": float(evidence.get("take_profit_price") or decision.get("take_profit_price") or 0),
+        "planned_stop_loss_price": float(evidence.get("stop_loss_price") or decision.get("stop_loss_price") or 0),
+        "take_profit_r": float(decision.get("take_profit_r") or (1.0 if strategy_mode == "contrarian" else 0.0)),
+        "stop_loss_r": float(decision.get("stop_loss_r") or (2.0 if strategy_mode == "contrarian" else 0.0)),
+        "reward_to_risk": float(decision.get("risk_reward_ratio") or decision.get("reward_to_risk") or 0),
+        "evidence_client_id": str(evidence.get("client_id") or ""),
+    })
+    if context["strategy_mode"] == "contrarian":
+        context["management_rule"] = "按反向仓位管理；不得仅因实际方向逆4H/1H趋势平仓，先依据反向失效、保护价或明确风险理由判断"
+    else:
+        context["management_rule"] = "按原策略仓位管理"
+    return context
+
+
+def _allow_position_management_action(instruction: dict[str, Any], strategy_context: dict[str, Any]) -> tuple[bool, str]:
+    """Require an explicit strategy tag before AI can close a contrarian position."""
+    if strategy_context.get("strategy_mode") != "contrarian":
+        return True, ""
+    action = str(instruction.get("action") or "HOLD").upper()
+    if action != "CLOSE_MARKET":
+        return True, ""
+    requested_mode = str(
+        instruction.get("strategy_mode")
+        or instruction.get("position_strategy_mode")
+        or ""
+    ).strip().lower()
+    if requested_mode != "contrarian":
+        return False, "反向仓位的平仓指令缺少 strategy_mode=contrarian，已安全忽略；不能仅按实际多空方向平仓"
+    reason = str(instruction.get("reason") or instruction.get("management_reason") or "").strip()
+    if not reason:
+        return False, "反向仓位的平仓指令缺少明确失效理由，已安全忽略"
+    return True, ""
+
+
 def _append_contrarian_shadow(rows: list[dict[str, Any]], *, now_ms: int, environment: str) -> None:
     """Persist bounded shadow observations separately from real execution intents."""
     if not rows:
@@ -2027,6 +2104,7 @@ def run_cycle() -> dict:
         try:
             from .strategy_adapter import build_prompt
             active_positions_detail = []
+            position_journal = ExecutionJournal(EXECUTION_JOURNAL)
             for position in private_context["positions"]:
                 size = float(position.get("size") or 0)
                 if not size:
@@ -2034,7 +2112,8 @@ def run_cycle() -> dict:
                 contract_name = str(position.get("contract") or "").upper()
                 age_state = position_age_stage(position, review_after_seconds=settings.max_position_age_seconds, force_close_after_seconds=settings.absolute_max_position_age_seconds)
                 stage_desc = "已到持仓复核期，须结合趋势、浮盈和反向信号决定继续持有、移损或退出" if age_state["stage"] == "review" else ("已到绝对持仓上限" if age_state["stage"] == "force_close" else "持有监控中")
-                active_positions_detail.append({"instId": contract_name.replace("_USDT", "-USDT-SWAP"), "name": contract_name, "side": "long" if size > 0 else "short", "pos": str(abs(size)), "lever": position.get("leverage") or position.get("lever") or "--", "avgPx": position.get("entry_price"), "lastPx": position.get("mark_price"), "upl": position.get("unrealised_pnl"), "uplRatio": 0.0, "holding_age_seconds": age_state["age_seconds"], "stage_desc": stage_desc})
+                strategy_context = _position_strategy_context(position, position_journal, settings.environment)
+                active_positions_detail.append({"instId": contract_name.replace("_USDT", "-USDT-SWAP"), "name": contract_name, "side": "long" if size > 0 else "short", "pos": str(abs(size)), "lever": position.get("leverage") or position.get("lever") or "--", "avgPx": position.get("entry_price"), "lastPx": position.get("mark_price"), "upl": position.get("unrealised_pnl"), "uplRatio": 0.0, "holding_age_seconds": age_state["age_seconds"], "stage_desc": stage_desc, **strategy_context})
             pending_orders_detail = [{"ordId": str(order.get("id")), "instId": str(order.get("contract") or "").replace("_USDT", "-USDT-SWAP"), "side": "buy" if float(order.get("size") or 0) > 0 else "sell", "posSide": "net", "px": order.get("price"), "sz": abs(float(order.get("size") or 0)), "state": order.get("status", "open"), "cTime": str(order.get("create_time_ms") or ""), "text": order.get("text", "")} for order in private_context["pending_orders"] if isinstance(order, dict)]
             pending_orders_detail.extend([
                 {"ordId": str(order.get("id")), "instId": str((order.get("initial") or {}).get("contract") or "").replace("_USDT", "-USDT-SWAP"),
@@ -2048,7 +2127,10 @@ def run_cycle() -> dict:
             committed_margin = _account_committed_margin(private_context["account"])
             system_prompt, prompt = build_prompt(strategy_packages, positions=active_positions_detail, pending_orders=pending_orders_detail, available_usdt=available, execution_leverage=settings.leverage, max_order_margin_usdt=settings.max_order_margin_usd, max_total_margin_usdt=settings.max_total_margin_usd, current_margin_usdt=committed_margin, risk_snapshot=risk_snapshot, entry_intent_enabled=settings.entry_intent_enabled)
             prompt += (f"\n本轮最多允许实际提交 {settings.max_entries_per_cycle} 个开仓/加仓订单。"
-                       "每个合约应独立判断；某个合约等待二次报价确认或被风控拒绝，不代表其他合格合约必须观望。")
+                       "每个合约应独立判断；某个合约等待二次报价确认或被风控拒绝，不代表其他合格合约必须观望。"
+                       "仓位管理必须读取 active_positions_detail 中的 strategy_mode、raw_action、effective_action 和 management_rule；"
+                       "strategy_mode=contrarian 的仓位是有意反向开仓，不能仅因 effective_action 与4H/1H趋势相反就 CLOSE_MARKET。"
+                       "反向仓位只有在反向结构失效、明确风险失效或保护逻辑需要退出时才可平仓；此时 position_management 必须输出 strategy_mode=contrarian 和具体 reason。")
         except Exception:
             prompt = ('Output ONLY one compact final JSON object with top-level keys decisions, position_management, pending_orders_management. '
                       f'The decisions object must contain exactly the configured Gate contracts {symbols} and each item must include direction_bias LONG|SHORT|NEUTRAL, action BUY_LONG|SELL_SHORT|WAIT, confidence 0-100, entry_price, take_profit_price, stop_loss_price, leverage={settings.leverage:g}, margin_usdt (positive and <= {settings.max_order_margin_usd:.2f}), summary_reason'
@@ -2225,6 +2307,8 @@ def run_cycle() -> dict:
                     "summary_reason": f"反向候选：{item.get('summary_reason', 'AI retracement signal')}",
                     "risk_reward_ratio": float(candidate.get("reward_to_risk") or 0),
                     "contrarian_risk_scale": 1.0 / stop_loss_r,
+                    "take_profit_r": float(candidate.get("take_profit_r") or 0),
+                    "stop_loss_r": float(candidate.get("stop_loss_r") or 0),
                 }
                 contrarian_executable.append({
                     "instId": symbol,
@@ -2344,6 +2428,13 @@ def run_cycle() -> dict:
         management_result = {"positions": [], "pending_orders": []}
         # Apply only explicit, schema-valid lifecycle instructions. Missing or
         # malformed instructions are ignored; the entry path remains fail-closed.
+        position_strategy_contexts = {
+            str(position.get("contract") or "").upper(): _position_strategy_context(
+                position, ExecutionJournal(EXECUTION_JOURNAL), settings.environment,
+            )
+            for position in private_context["positions"]
+            if isinstance(position, dict) and float(position.get("size") or 0) != 0
+        }
         for instruction in position_management:
             if not isinstance(instruction, dict):
                 continue
@@ -2360,6 +2451,16 @@ def run_cycle() -> dict:
                 continue
             current = matching[0]
             try:
+                allowed, management_block_reason = _allow_position_management_action(
+                    instruction, position_strategy_contexts.get(contract_name, {}),
+                )
+                if not allowed:
+                    management_result["positions"].append({
+                        "contract": contract_name, "action": mgmt_action,
+                        "status": "blocked_strategy_context", "reason": management_block_reason,
+                        "strategy_mode": position_strategy_contexts.get(contract_name, {}).get("strategy_mode", "original"),
+                    })
+                    continue
                 if mgmt_action == "CLOSE_MARKET":
                     with gate_write_lock():
                         management_result["positions"].append({"contract": contract_name, "action": mgmt_action, "result": GateTradingService(client, RiskLimits(settings.max_position_notional_usd, settings.max_total_margin_usd, settings.max_order_margin_usd)).close_position_safely(contract=contract_name, client_id=f"t-gate-close-{now}", position_mode=str(current.get("mode") or ""))})

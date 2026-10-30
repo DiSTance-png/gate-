@@ -185,6 +185,8 @@ def build_prompt(packages: list[dict[str, Any]], *, positions: list[dict[str, An
         "每个决策必须区分 direction_bias 与 action：direction_bias 只允许 LONG、SHORT、NEUTRAL；"
         "action 可以表达通过方向、结构、价格几何和 R:R 初筛后的入场候选；"
         "retracement 候选通过全部确定性风控后会创建 Gate 原生 GTC 限价单，不再叠加本地触价、收回和二次动量确认。"
+        "active_positions_detail 中若 strategy_mode=contrarian，表示该仓位是有意反向开仓；不得仅因 effective_action 与4H/1H趋势相反就平仓，必须依据该反向仓位自身的保护价、反向失效条件或明确风险理由管理。"
+        "对 strategy_mode=contrarian 的 CLOSE_MARKET 指令必须同时返回 strategy_mode=contrarian 和具体 reason；缺少任一字段时执行层会安全忽略。"
         "已有普通入场挂单时，必须在 pending_orders_management 中逐单输出 KEEP、AMEND 或 CANCEL："
         "KEEP 继续等待原价；AMEND 仅在同方向 retracement 新决策仍有效时使用，执行层会先确认撤销旧单，再让新报价重新通过完整风控并创建新订单；"
         "CANCEL 用于信号失效、转为 WAIT 或方向变化。不得通过 decisions 为同合约重复创建第二张入场单。"
