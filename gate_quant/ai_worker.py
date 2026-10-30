@@ -2200,6 +2200,13 @@ def run_cycle() -> dict:
             contrarian_shadow.append(candidate)
             if candidate.get("eligible") and settings.contrarian_mode in {"testnet", "live"}:
                 effective_action = str(candidate.get("effective_action") or "WAIT")
+                # Keep the dollar risk close to the original AI plan when the
+                # contrarian stop is wider than one R.  Order sizing is margin
+                # based, so a 2R stop must use roughly half the margin of a 1R
+                # stop rather than silently doubling the loss budget.
+                raw_margin = float(item.get("margin_usdt") or item.get("margin_usd") or 0)
+                stop_loss_r = max(float(candidate.get("stop_loss_r") or 1.0), 1e-9)
+                risk_scaled_margin = raw_margin / stop_loss_r
                 effective_decision = {
                     "direction_bias": "LONG" if effective_action == "BUY_LONG" else "SHORT",
                     "market_regime": item.get("market_regime", "TRANSITION"),
@@ -2213,10 +2220,11 @@ def run_cycle() -> dict:
                     "take_profit_price": float(candidate["take_profit_price"]),
                     "stop_loss_price": float(candidate["stop_loss_price"]),
                     "leverage": settings.leverage,
-                    "margin_usdt": float(item.get("margin_usdt") or item.get("margin_usd") or 0),
-                    "margin_usd": float(item.get("margin_usd") or item.get("margin_usdt") or 0),
+                    "margin_usdt": risk_scaled_margin,
+                    "margin_usd": risk_scaled_margin,
                     "summary_reason": f"反向候选：{item.get('summary_reason', 'AI retracement signal')}",
                     "risk_reward_ratio": float(candidate.get("reward_to_risk") or 0),
+                    "contrarian_risk_scale": 1.0 / stop_loss_r,
                 }
                 contrarian_executable.append({
                     "instId": symbol,
