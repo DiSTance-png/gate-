@@ -29,7 +29,7 @@ from .contrarian import build_candidate
 from scripts.instrument_pool import configured_gate_contracts, instrument_pool_revision
 
 ROOT = Path(__file__).resolve().parents[1]
-load_dotenv(ROOT / ".env", override=True)
+load_dotenv(ROOT / ".env", override=False)
 DATA = ROOT / "data"
 DATA.mkdir(exist_ok=True)
 DECISIONS = DATA / "ai_brain_decisions.json"

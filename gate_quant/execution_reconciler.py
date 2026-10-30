@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
 JOURNAL_PATH = DATA / "gate_execution.db"
 HEARTBEAT_PATH = DATA / "gate_execution_reconciler.json"
-load_dotenv(ROOT / ".env", override=True)
+load_dotenv(ROOT / ".env", override=False)
 
 
 def _decimal(value: Any) -> Decimal:
