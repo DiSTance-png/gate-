@@ -2249,6 +2249,12 @@ def run_cycle() -> dict:
             item = envelope["decision"]
             if item.get("action") == "WAIT":
                 continue
+            # Contrarian candidates have already been deterministically
+            # rebuilt from the raw signal with their own configured payoff
+            # geometry.  The original strategy gate's normal R:R floor must
+            # not turn a valid 1R/2R contrarian candidate back into WAIT.
+            if str(item.get("strategy_mode") or "").lower() == "contrarian":
+                continue
             # Normalize inherited council aliases at the strategy boundary.
             item["take_profit_price"] = float(item.get("take_profit_price") or item.get("take_profit") or 0)
             item["stop_loss_price"] = float(item.get("stop_loss_price") or item.get("stop_loss") or 0)

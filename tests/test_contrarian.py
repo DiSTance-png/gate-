@@ -102,7 +102,7 @@ def test_contrarian_configuration_is_explicit_and_fail_closed_for_invalid_values
         raise AssertionError("invalid contrarian mode must be rejected")
 
 
-def test_live_contrarian_mode_requires_live_execution_and_two_to_one_reward_risk():
+def test_live_contrarian_mode_requires_live_execution_and_reversed_reward_risk():
     live = GateSettings(
         environment="live", api_key="k", api_secret="s",
         public_market_environment="live", live_trading_enabled=True,
@@ -113,9 +113,9 @@ def test_live_contrarian_mode_requires_live_execution_and_two_to_one_reward_risk
         GateSettings(
             environment="live", api_key="k", api_secret="s",
             public_market_environment="live", live_trading_enabled=True,
-            contrarian_mode="live", contrarian_take_profit_r=1, contrarian_stop_loss_r=1,
+            contrarian_mode="live", contrarian_take_profit_r=0.25, contrarian_stop_loss_r=1,
         ).validate()
     except ValueError as exc:
         assert "reward-to-risk" in str(exc)
     else:
-        raise AssertionError("contrarian mode must keep the 2:1 reward-risk floor")
+        raise AssertionError("contrarian mode must keep the 0.5R reward-risk floor")

@@ -39,8 +39,10 @@ class GateSettings:
     max_entry_slippage_pct: float = 0.003
     entry_intent_enabled: bool = False
     contrarian_mode: str = "off"
-    contrarian_take_profit_r: float = 2.0
-    contrarian_stop_loss_r: float = 1.0
+    # Contrarian entries intentionally use the inverse payoff geometry: bank
+    # one unit on a favorable move while risking two units on the stop.
+    contrarian_take_profit_r: float = 1.0
+    contrarian_stop_loss_r: float = 2.0
     breakout_expiration_seconds: int = 840
     max_daily_loss_usd: float = 100.0
     max_daily_loss_ratio: float = 0.05
@@ -91,8 +93,8 @@ class GateSettings:
             raise ValueError("GATE_CONTRARIAN_MODE must be off, shadow, testnet, or live")
         if self.contrarian_take_profit_r <= 0 or self.contrarian_stop_loss_r <= 0:
             raise ValueError("Contrarian TP/SL R values must be positive")
-        if self.contrarian_take_profit_r / self.contrarian_stop_loss_r < 2.0:
-            raise ValueError("Contrarian reward-to-risk must be at least 2.0R")
+        if self.contrarian_take_profit_r / self.contrarian_stop_loss_r < 0.5:
+            raise ValueError("Contrarian reward-to-risk must be at least 0.5R")
         if self.contrarian_mode == "live" and (self.environment != "live" or not self.live_trading_enabled):
             raise ValueError("Live contrarian mode requires live environment and live trading enabled")
         if self.contrarian_mode == "testnet" and (self.environment != "testnet" or not self.testnet_execute_trades):
@@ -150,8 +152,8 @@ def load_settings() -> GateSettings:
         max_entry_slippage_pct=float(os.getenv("GATE_MAX_ENTRY_SLIPPAGE_PCT", "0.003")),
         entry_intent_enabled=_bool("GATE_ENTRY_INTENT_ENABLED"),
         contrarian_mode=os.getenv("GATE_CONTRARIAN_MODE", "off").strip().lower(),
-        contrarian_take_profit_r=float(os.getenv("GATE_CONTRARIAN_TP_R", "2.0")),
-        contrarian_stop_loss_r=float(os.getenv("GATE_CONTRARIAN_SL_R", "1.0")),
+        contrarian_take_profit_r=float(os.getenv("GATE_CONTRARIAN_TP_R", "1.0")),
+        contrarian_stop_loss_r=float(os.getenv("GATE_CONTRARIAN_SL_R", "2.0")),
         breakout_expiration_seconds=int(os.getenv("GATE_BREAKOUT_EXPIRATION_SECONDS", "840")),
         max_daily_loss_usd=float(os.getenv("GATE_MAX_DAILY_LOSS_USD", "100")),
         max_daily_loss_ratio=float(os.getenv("GATE_MAX_DAILY_LOSS_RATIO", "0.05")),

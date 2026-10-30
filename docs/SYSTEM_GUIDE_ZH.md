@@ -202,7 +202,7 @@ GATE_BREAKOUT_EXPIRATION_SECONDS=840
 
 ### 6.3 反向策略层
 
-反向策略不修改 AI 提示词，也不改变已有持仓管理。AI 的 `action` 先作为原始方向保存；只有 `retracement` 候选才会生成相反方向的立即入场假设，并使用当前买一/卖一重新计算价格。默认关闭，可用 `GATE_CONTRARIAN_MODE=shadow` 开启观察；候选写入独立的 `data/contrarian_shadow.json`。`GATE_CONTRARIAN_TP_R/GATE_CONTRARIAN_SL_R` 默认是 `2R/1R`，配置校验强制收益风险比至少 2:1。`testnet` 或 `live` 模式只替换回调新仓候选，继续经过统一安全门、保证金、执行台账、Gate 原生双保护和恢复链；当前持仓、强趋势、无效原始止损或缺少报价时不会生成可执行候选。
+反向策略不修改 AI 提示词，也不改变已有持仓管理。AI 的 `action` 先作为原始方向保存；只有 `retracement` 候选才会生成相反方向的立即入场假设，并使用当前买一/卖一重新计算价格。默认关闭，可用 `GATE_CONTRARIAN_MODE=shadow` 开启观察；候选写入独立的 `data/contrarian_shadow.json`。当前反向几何为 `GATE_CONTRARIAN_TP_R/GATE_CONTRARIAN_SL_R=1R/2R`，配置校验保留至少 0.5R 的反向收益风险比底线。`testnet` 或 `live` 模式只替换回调新仓候选，继续经过统一安全门、保证金、执行台账、Gate 原生双保护和恢复链；当前持仓、强趋势、无效原始止损或缺少报价时不会生成可执行候选。
 
 ## 7. 张数、名义价值和保证金
 
