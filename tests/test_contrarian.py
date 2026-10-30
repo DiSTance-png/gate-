@@ -44,6 +44,17 @@ def test_active_position_blocks_reverse_candidate_without_reversing_position():
     assert "active_position_blocks_new_entry" in result["reason"]
 
 
+def test_pending_entry_blocks_reverse_candidate_to_prevent_duplicate_orders():
+    result = build_candidate(
+        {"action": "BUY_LONG", "entry_intent": "retracement", "entry_price": 95,
+         "take_profit_price": 105, "stop_loss_price": 90},
+        _feature(), {"highest_bid": 99.8, "lowest_ask": 100.2},
+        pending_entry=True, mode="live", take_profit_r=2, stop_loss_r=1,
+    )
+    assert result["eligible"] is False
+    assert "pending_entry_blocks_new_entry" in result["reason"]
+
+
 def test_only_retracement_signals_are_candidates_and_invalid_geometry_fails_closed():
     assert build_candidate(
         {"action": "BUY_LONG", "entry_intent": "immediate", "entry_price": 100,
@@ -69,6 +80,17 @@ def test_strong_trend_is_recorded_but_not_shadow_eligible():
     assert "regime_not_eligible" in result["reason"]
 
 
+def test_live_mode_can_create_an_eligible_candidate_but_requires_the_execution_layer():
+    result = build_candidate(
+        {"action": "SELL_SHORT", "entry_intent": "retracement", "entry_price": 105,
+         "take_profit_price": 95, "stop_loss_price": 110},
+        _feature(), {"highest_bid": 99, "lowest_ask": 100},
+        mode="live", take_profit_r=2, stop_loss_r=1,
+    )
+    assert result["eligible"] is True
+    assert result["enforceable"] is True
+
+
 def test_contrarian_configuration_is_explicit_and_fail_closed_for_invalid_values():
     settings = GateSettings(environment="testnet", contrarian_mode="shadow")
     settings.validate()
@@ -78,3 +100,22 @@ def test_contrarian_configuration_is_explicit_and_fail_closed_for_invalid_values
         assert "GATE_CONTRARIAN_MODE" in str(exc)
     else:
         raise AssertionError("invalid contrarian mode must be rejected")
+
+
+def test_live_contrarian_mode_requires_live_execution_and_two_to_one_reward_risk():
+    live = GateSettings(
+        environment="live", api_key="k", api_secret="s",
+        public_market_environment="live", live_trading_enabled=True,
+        contrarian_mode="live",
+    )
+    live.validate()
+    try:
+        GateSettings(
+            environment="live", api_key="k", api_secret="s",
+            public_market_environment="live", live_trading_enabled=True,
+            contrarian_mode="live", contrarian_take_profit_r=1, contrarian_stop_loss_r=1,
+        ).validate()
+    except ValueError as exc:
+        assert "reward-to-risk" in str(exc)
+    else:
+        raise AssertionError("contrarian mode must keep the 2:1 reward-risk floor")

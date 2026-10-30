@@ -757,6 +757,7 @@ def _execute_entry_candidate_locked(client: GateFuturesClient, envelope: dict, *
     decision = envelope["decision"]
     trade_feature = envelope["indicators"]
     action = str(decision.get("action") or "WAIT")
+    contrarian_candidate = str(decision.get("strategy_mode") or "").lower() == "contrarian"
     confidence = float(decision.get("confidence") or 0)
     journal = ExecutionJournal(EXECUTION_JOURNAL)
     cooldown = (cooldown_state(LEDGER, cooldown_seconds=settings.stop_cooldown_seconds, contract=trade_symbol)
@@ -789,7 +790,7 @@ def _execute_entry_candidate_locked(client: GateFuturesClient, envelope: dict, *
     quote = quote_rows[0] if isinstance(quote_rows, list) and quote_rows else (quote_rows if isinstance(quote_rows, dict) else {})
     gate_reference = float(quote.get("mark_price") or quote.get("last") or trade_feature.get("last") or 0)
     tick = contract.get("order_price_round") or contract.get("mark_price_round") or "0"
-    if settings.entry_intent_enabled:
+    if settings.entry_intent_enabled or contrarian_candidate:
         entry_plan = _entry_execution_plan(
             action=action,
             entry_intent=str(decision.get("entry_intent") or ""),
@@ -931,14 +932,15 @@ def _execute_entry_candidate_locked(client: GateFuturesClient, envelope: dict, *
         return {"trade": {"status": "blocked_risk_limit", "contract": trade_symbol, "reason": str(exc), "risk": risk},
                 "submitted": False, "stop_cycle": False}
     try:
-        from .strategy_adapter import validate_decision
-        active_inst_ids, active_sides = _active_position_context(positions)
-        package = {**trade_feature, "instId": trade_symbol, "data_quality": "valid", "macro_4h": trade_feature.get("macro_4h", "RANGE")}
-        gated_action, gate_reason, rr = validate_decision(package, decision, active_inst_ids=active_inst_ids, active_position_sides=active_sides, risk_snapshot=risk_snapshot)
-        if gated_action != action:
-            return {"trade": {"status": "blocked_by_strategy_interceptor", "contract": trade_symbol,
-                              "reason": gate_reason or "Gate strategy interceptor rejected decision", "risk_reward": rr},
-                    "submitted": False, "stop_cycle": False}
+        if not contrarian_candidate:
+            from .strategy_adapter import validate_decision
+            active_inst_ids, active_sides = _active_position_context(positions)
+            package = {**trade_feature, "instId": trade_symbol, "data_quality": "valid", "macro_4h": trade_feature.get("macro_4h", "RANGE")}
+            gated_action, gate_reason, rr = validate_decision(package, decision, active_inst_ids=active_inst_ids, active_position_sides=active_sides, risk_snapshot=risk_snapshot)
+            if gated_action != action:
+                return {"trade": {"status": "blocked_by_strategy_interceptor", "contract": trade_symbol,
+                                  "reason": gate_reason or "Gate strategy interceptor rejected decision", "risk_reward": rr},
+                        "submitted": False, "stop_cycle": False}
     except Exception as exc:
         return {"trade": {"status": "blocked_by_strategy_interceptor_error", "contract": trade_symbol, "reason": str(exc)},
                 "submitted": False, "stop_cycle": False}
@@ -1037,7 +1039,7 @@ def _execute_entry_candidate_locked(client: GateFuturesClient, envelope: dict, *
         "entry_client_id": client_id, "position_side": "long" if size > 0 else "short", "entry_size": str(abs(size)),
         "entry_price": limit_price, "requested_entry_price": entry_price, "take_profit_price": rounded_tp, "stop_loss_price": rounded_sl,
         "take_profit_distance_pct": tp_distance_pct, "stop_loss_distance_pct": sl_distance_pct,
-        "entry_intent": decision.get("entry_intent"), "order_type": entry_plan["order_type"], "requote": requote,
+        "entry_intent": decision.get("entry_intent"), "order_type": entry_plan["order_type"], "strategy_mode": decision.get("strategy_mode", "original"), "raw_action": decision.get("raw_action"), "requote": requote,
         "created_at_ms": now_ms, "policy_version": policy_snapshot["policy_version"], "policy_hash": policy_snapshot["policy_hash"]})
     try:
         lifecycle = reconcile_intent(client, journal, intent, settings, now_ms=now_ms)
@@ -2139,6 +2141,8 @@ def run_cycle() -> dict:
             position_management.append(suggestion)
     decisions_payload = {symbol: {"instId": symbol, "decision_timestamp_ms": now, "decision": item, "source": llm_source, "llm_error": llm_error, "llm_preview": llm_preview, "policy_version": policy_snapshot["policy_version"], "policy_hash": policy_snapshot["policy_hash"], "risk_snapshot": risk_snapshot, "indicators": next(f for f in features if f["contract"] == symbol)} for symbol, item in decisions.items()}
     contrarian_shadow: list[dict[str, Any]] = []
+    contrarian_executable: list[dict[str, Any]] = []
+    contrarian_replaced_symbols: set[str] = set()
     if settings.contrarian_mode != "off":
         active_position_sides: dict[str, str] = {}
         raw_positions = private_context.get("positions") or []
@@ -2156,13 +2160,30 @@ def run_cycle() -> dict:
                 active_position_sides[contract] = "long" if signed_size > 0 else "short"
         feature_map = {str(feature.get("contract") or "").upper(): feature for feature in features}
         ticker_map = {str(symbol).upper(): ticker for symbol, ticker in ticker_by_symbol.items()}
+        pending_contracts = {
+            str(row.get("contract") or "").upper()
+            for row in [*(private_context.get("pending_orders") or []), *(private_context.get("trigger_entries") or [])]
+            if isinstance(row, dict) and str(row.get("contract") or (row.get("initial") or {}).get("contract") or "").strip()
+        }
         for symbol, envelope in decisions_payload.items():
             item = envelope["decision"]
+            if (
+                settings.contrarian_mode in {"testnet", "live"}
+                and str(item.get("action") or "").upper() in {"BUY_LONG", "SELL_SHORT"}
+                and str(item.get("entry_intent") or "").lower() == "retracement"
+            ):
+                # In execution modes, every retracement signal is replaced by
+                # a contrarian candidate, including candidates rejected for
+                # invalid data or an active position.  This prevents an old
+                # pending-requote confirmation from restoring the original
+                # direction.
+                contrarian_replaced_symbols.add(str(symbol).upper())
             candidate = build_candidate(
                 item,
                 feature_map.get(str(symbol).upper(), {}),
                 ticker_map.get(str(symbol).upper(), {}),
                 current_position_side=active_position_sides.get(str(symbol).upper(), ""),
+                pending_entry=str(symbol).upper() in pending_contracts,
                 mode=settings.contrarian_mode,
                 take_profit_r=settings.contrarian_take_profit_r,
                 stop_loss_r=settings.contrarian_stop_loss_r,
@@ -2174,8 +2195,43 @@ def run_cycle() -> dict:
                 "summary_reason": item.get("summary_reason", ""),
                 "policy_version": policy_snapshot["policy_version"],
                 "policy_hash": policy_snapshot["policy_hash"],
+                "contrarian_mode": settings.contrarian_mode,
             })
             contrarian_shadow.append(candidate)
+            if candidate.get("eligible") and settings.contrarian_mode in {"testnet", "live"}:
+                effective_action = str(candidate.get("effective_action") or "WAIT")
+                effective_decision = {
+                    "direction_bias": "LONG" if effective_action == "BUY_LONG" else "SHORT",
+                    "market_regime": item.get("market_regime", "TRANSITION"),
+                    "action": effective_action,
+                    "raw_action": item.get("action", "WAIT"),
+                    "strategy_mode": "contrarian",
+                    "contrarian_mode": settings.contrarian_mode,
+                    "confidence": float(item.get("confidence") or 0),
+                    "entry_intent": "immediate",
+                    "entry_price": float(candidate["entry_price"]),
+                    "take_profit_price": float(candidate["take_profit_price"]),
+                    "stop_loss_price": float(candidate["stop_loss_price"]),
+                    "leverage": settings.leverage,
+                    "margin_usdt": float(item.get("margin_usdt") or item.get("margin_usd") or 0),
+                    "margin_usd": float(item.get("margin_usd") or item.get("margin_usdt") or 0),
+                    "summary_reason": f"反向候选：{item.get('summary_reason', 'AI retracement signal')}",
+                    "risk_reward_ratio": float(candidate.get("reward_to_risk") or 0),
+                }
+                contrarian_executable.append({
+                    "instId": symbol,
+                    "decision_timestamp_ms": now,
+                    "decision": effective_decision,
+                    "source": "contrarian-execution",
+                    "llm_error": envelope.get("llm_error", ""),
+                    "llm_preview": envelope.get("llm_preview", ""),
+                    "policy_version": policy_snapshot["policy_version"],
+                    "policy_hash": policy_snapshot["policy_hash"],
+                    "risk_snapshot": risk_snapshot,
+                    "indicators": feature_map.get(str(symbol).upper(), {}),
+                    "contrarian_candidate": candidate,
+                })
+                contrarian_replaced_symbols.add(str(symbol).upper())
         _append_contrarian_shadow(contrarian_shadow, now_ms=now, environment=settings.environment)
     if settings.entry_intent_enabled:
         # The explicit-intent path owns a real Gate order lifecycle.  Legacy
@@ -2235,7 +2291,23 @@ def run_cycle() -> dict:
         if d["decision"].get("action") in {"BUY_LONG", "SELL_SHORT"}
         and float(d["decision"].get("confidence") or 0) >= risk_profile.min_confidence
     }
+    if settings.contrarian_mode in {"testnet", "live"}:
+        # A live/testnet contrarian mode replaces only retracement entries.  It
+        # never changes AI position_management and leaves immediate/breakout
+        # entries on the original path.
+        executable_by_symbol = {
+            symbol: envelope for symbol, envelope in executable_by_symbol.items()
+            if symbol.upper() not in contrarian_replaced_symbols
+        }
+        for envelope in contrarian_executable:
+            if float(envelope["decision"].get("confidence") or 0) >= risk_profile.min_confidence:
+                executable_by_symbol[str(envelope["instId"])] = envelope
     for confirmed_candidate in _confirmed_requote_candidates(confirmed_requotes, decisions_payload):
+        if (
+            settings.contrarian_mode in {"testnet", "live"}
+            and str(confirmed_candidate.get("instId") or "").upper() in contrarian_replaced_symbols
+        ):
+            continue
         executable_by_symbol[str(confirmed_candidate["instId"])] = confirmed_candidate
     executable = list(executable_by_symbol.values())
     executable, quote_blocks = _preflight_candidate_quotes(client, executable, pending_requotes, confirmed_requotes, now_ms=now, entry_intent_enabled=settings.entry_intent_enabled)

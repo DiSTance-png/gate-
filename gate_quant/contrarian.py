@@ -92,6 +92,7 @@ def build_candidate(
     ticker: Mapping[str, Any] | None = None,
     *,
     current_position_side: str = "",
+    pending_entry: bool = False,
     mode: str = "shadow",
     take_profit_r: Any = "1.0",
     stop_loss_r: Any = "2.0",
@@ -120,8 +121,8 @@ def build_candidate(
     reasons: list[str] = []
     if mode == "off":
         reasons.append("contrarian_mode_off")
-    elif mode != "shadow":
-        reasons.append("execution_mode_not_enabled_in_shadow_phase")
+    elif mode not in {"shadow", "testnet", "live"}:
+        reasons.append("invalid_execution_mode")
     if not contract:
         reasons.append("invalid_contract")
     if raw_entry <= ZERO or raw_sl <= ZERO or risk_distance <= ZERO:
@@ -136,12 +137,14 @@ def build_candidate(
         reasons.append("regime_not_eligible")
     if current_side in {"long", "short"}:
         reasons.append("active_position_blocks_new_entry")
+    if pending_entry:
+        reasons.append("pending_entry_blocks_new_entry")
 
     tp = entry + risk_distance * tp_r if effective_side == "long" else entry - risk_distance * tp_r
     sl = entry - risk_distance * sl_r if effective_side == "long" else entry + risk_distance * sl_r
     eligible = not reasons
     return ContrarianCandidate(
-        strategy_mode=mode,
+        strategy_mode="contrarian",
         contract=contract,
         raw_action=raw_action,
         effective_action=effective_action,
@@ -160,4 +163,5 @@ def build_candidate(
         current_position_side=current_side,
         eligible=eligible,
         reason="eligible_shadow_candidate" if eligible else ";".join(reasons),
+        enforceable=bool(eligible and mode in {"testnet", "live"}),
     ).to_dict()
