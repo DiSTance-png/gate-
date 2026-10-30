@@ -38,6 +38,9 @@ class GateSettings:
     unfilled_reentry_cooldown_enabled: bool = False
     max_entry_slippage_pct: float = 0.003
     entry_intent_enabled: bool = False
+    contrarian_mode: str = "off"
+    contrarian_take_profit_r: float = 1.0
+    contrarian_stop_loss_r: float = 2.0
     breakout_expiration_seconds: int = 840
     max_daily_loss_usd: float = 100.0
     max_daily_loss_ratio: float = 0.05
@@ -84,6 +87,10 @@ class GateSettings:
             raise ValueError("GATE_INITIAL_CAPITAL_USD cannot be negative")
         if not 0 <= self.max_entry_slippage_pct <= 0.02:
             raise ValueError("GATE_MAX_ENTRY_SLIPPAGE_PCT must be between 0 and 0.02")
+        if self.contrarian_mode not in {"off", "shadow", "testnet", "live"}:
+            raise ValueError("GATE_CONTRARIAN_MODE must be off, shadow, testnet, or live")
+        if self.contrarian_take_profit_r <= 0 or self.contrarian_stop_loss_r <= 0:
+            raise ValueError("Contrarian TP/SL R values must be positive")
         if not 60 <= self.breakout_expiration_seconds <= 900:
             raise ValueError("GATE_BREAKOUT_EXPIRATION_SECONDS must be between 60 and 900")
         if min(self.max_pending_order_age_seconds, self.max_position_age_seconds, self.absolute_max_position_age_seconds, self.stop_cooldown_seconds) < 0:
@@ -136,6 +143,9 @@ def load_settings() -> GateSettings:
         unfilled_reentry_cooldown_enabled=_bool("GATE_UNFILLED_REENTRY_COOLDOWN_ENABLED", False),
         max_entry_slippage_pct=float(os.getenv("GATE_MAX_ENTRY_SLIPPAGE_PCT", "0.003")),
         entry_intent_enabled=_bool("GATE_ENTRY_INTENT_ENABLED"),
+        contrarian_mode=os.getenv("GATE_CONTRARIAN_MODE", "off").strip().lower(),
+        contrarian_take_profit_r=float(os.getenv("GATE_CONTRARIAN_TP_R", "1.0")),
+        contrarian_stop_loss_r=float(os.getenv("GATE_CONTRARIAN_SL_R", "2.0")),
         breakout_expiration_seconds=int(os.getenv("GATE_BREAKOUT_EXPIRATION_SECONDS", "840")),
         max_daily_loss_usd=float(os.getenv("GATE_MAX_DAILY_LOSS_USD", "100")),
         max_daily_loss_ratio=float(os.getenv("GATE_MAX_DAILY_LOSS_RATIO", "0.05")),

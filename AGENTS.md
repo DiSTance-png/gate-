@@ -39,6 +39,7 @@
 - `gate_quant/execution_reconciler.py`：10 秒成交、持仓与保护单对账。
 - `gate_quant/protection_lifecycle.py`：保护意图恢复、保护缺口和孤立保护单生命周期。
 - `gate_quant/anomaly_audit.py`：只读异常与未闭环审计、环境隔离的异常指纹和恢复历史；不得在此模块加入交易写操作。
+- `gate_quant/contrarian.py`：可选反向策略的纯候选计算；当前仅支持关闭或影子观察，不能授权 Gate 写操作，也不替代 `position_management`。
 - `gate_quant/safety.py`、`gate_quant/risk.py`、`gate_quant/risk_profiles.py`：硬风控与风险档位。
 - `gate_quant/web.py`：8081 Web、Gate 原生 API 路由和控制面挂载。
 - `r20_gateway/worker.py`、`r20_gateway/scheduler.py`：任务调度和通知投递。这里的 Gateway 不是交易所 API 网关。

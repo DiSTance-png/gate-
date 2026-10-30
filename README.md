@@ -38,6 +38,8 @@ GATE_BREAKOUT_EXPIRATION_SECONDS=840
 
 `GATE_TESTNET_BASE_URL` 和 `GATE_LIVE_BASE_URL` 可按 Gate 账户集群覆盖，必须是完整的 `/api/v4` 地址。当前默认 Testnet 地址已用本账户验证；Gate 官方 SDK 当前列出的 `fx-api-testnet.gateio.ws` 属于另一集群，切换前必须用同一凭证做只读检测。
 
+反向策略通过 `GATE_CONTRARIAN_MODE` 独立控制，默认 `off`。`shadow` 模式只记录“AI 回调做多/做空”对应的相反方向候选，不发送订单、不写入真实执行台账，也不改变已有持仓管理；`GATE_CONTRARIAN_TP_R=1.0` 与 `GATE_CONTRARIAN_SL_R=2.0` 表示反向候选使用 1R 止盈、2R 止损。`testnet` 和 `live` 目前只会记录未启用原因，尚未开放写入路径，必须完成影子样本和独立风控评审后再实现。
+
 ## Linux VPS 部署
 
 服务器建议把仓库放在 `/opt/gate-quant`，使用 Python 3.12、Node.js 20 LTS，并分别运行两个 systemd 服务：

@@ -25,6 +25,7 @@ from .entry_confirmation import evaluate_retracement_confirmation
 from .exchange_write_lock import gate_write_lock
 from .portfolio_risk import correlated_exposure_gate
 from .regime import classify_market_regime, normalize_direction_bias
+from .contrarian import build_candidate
 from scripts.instrument_pool import configured_gate_contracts, instrument_pool_revision
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,6 +43,21 @@ PROTECTION_INTENTS = DATA / "protection_intents.json"
 PENDING_REQUOTES = DATA / "pending_requotes.json"
 PENDING_REQUOTE_TTL_SECONDS = 20 * 60
 UNFILLED_REENTRY_COOLDOWN_SECONDS = 15 * 60
+CONTRARIAN_SHADOW = DATA / "contrarian_shadow.json"
+
+
+def _append_contrarian_shadow(rows: list[dict[str, Any]], *, now_ms: int, environment: str) -> None:
+    """Persist bounded shadow observations separately from real execution intents."""
+    if not rows:
+        return
+    try:
+        existing = json.loads(CONTRARIAN_SHADOW.read_text(encoding="utf-8")) if CONTRARIAN_SHADOW.exists() else []
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        existing = []
+    if not isinstance(existing, list):
+        existing = []
+    stamped = [{"observed_at_ms": now_ms, "environment": environment, **row} for row in rows]
+    atomic_json(CONTRARIAN_SHADOW, (existing + stamped)[-5000:])
 
 
 def _safety_scope(safety_status: dict[str, Any]) -> tuple[bool, set[str]]:
@@ -108,6 +124,7 @@ def _save_decision_payload(payload: dict, decisions_payload: dict, trade: dict, 
         "position_management": payload.get("position_management") or [],
         "pending_orders_management": payload.get("pending_orders_management") or [],
         "management_result": payload.get("management_result") or {},
+        "contrarian_shadow": payload.get("contrarian_shadow") or [],
         "decisions": {
             symbol: {
                 "action": envelope["decision"].get("action", "WAIT"),
@@ -2121,6 +2138,45 @@ def run_cycle() -> dict:
         if suggestion:
             position_management.append(suggestion)
     decisions_payload = {symbol: {"instId": symbol, "decision_timestamp_ms": now, "decision": item, "source": llm_source, "llm_error": llm_error, "llm_preview": llm_preview, "policy_version": policy_snapshot["policy_version"], "policy_hash": policy_snapshot["policy_hash"], "risk_snapshot": risk_snapshot, "indicators": next(f for f in features if f["contract"] == symbol)} for symbol, item in decisions.items()}
+    contrarian_shadow: list[dict[str, Any]] = []
+    if settings.contrarian_mode != "off":
+        active_position_sides: dict[str, str] = {}
+        raw_positions = private_context.get("positions") or []
+        if isinstance(raw_positions, dict):
+            raw_positions = [raw_positions]
+        for position in raw_positions:
+            if not isinstance(position, dict):
+                continue
+            contract = str(position.get("contract") or "").upper()
+            try:
+                signed_size = float(position.get("size") or 0)
+            except (TypeError, ValueError):
+                signed_size = 0.0
+            if contract and signed_size:
+                active_position_sides[contract] = "long" if signed_size > 0 else "short"
+        feature_map = {str(feature.get("contract") or "").upper(): feature for feature in features}
+        ticker_map = {str(symbol).upper(): ticker for symbol, ticker in ticker_by_symbol.items()}
+        for symbol, envelope in decisions_payload.items():
+            item = envelope["decision"]
+            candidate = build_candidate(
+                item,
+                feature_map.get(str(symbol).upper(), {}),
+                ticker_map.get(str(symbol).upper(), {}),
+                current_position_side=active_position_sides.get(str(symbol).upper(), ""),
+                mode=settings.contrarian_mode,
+                take_profit_r=settings.contrarian_take_profit_r,
+                stop_loss_r=settings.contrarian_stop_loss_r,
+            )
+            if candidate is None:
+                continue
+            candidate.update({
+                "confidence": item.get("confidence", 0),
+                "summary_reason": item.get("summary_reason", ""),
+                "policy_version": policy_snapshot["policy_version"],
+                "policy_hash": policy_snapshot["policy_hash"],
+            })
+            contrarian_shadow.append(candidate)
+        _append_contrarian_shadow(contrarian_shadow, now_ms=now, environment=settings.environment)
     if settings.entry_intent_enabled:
         # The explicit-intent path owns a real Gate order lifecycle.  Legacy
         # local touch/reclaim plans are not execution state and must not be
@@ -2367,6 +2423,7 @@ def run_cycle() -> dict:
                "policy_snapshot": policy_snapshot, "risk_snapshot": risk_snapshot, "safety_status": safety_status,
                "position_management": position_management, "pending_orders_management": pending_management,
                "management_result": result.get("management") or {}, "private_context": private_context,
+               "contrarian_shadow": contrarian_shadow,
                "trade": result["trade"], "trades": all_outcomes}
     _save_decision_payload(payload, decisions_payload, result["trade"], now, settings.environment, risk_snapshot)
     result["decisions"] = decisions_payload
