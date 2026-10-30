@@ -22,7 +22,11 @@ def load_dotenv(path: Path) -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        os.environ[key.strip()] = value.strip().strip('"').strip("'")
+        # Respect explicit process environment overrides.  This loader runs at
+        # import time and may be called again by refresh_settings(); replacing
+        # an exported value with the repository .env made test and emergency
+        # runtime switches (including contrarian mode) impossible to apply.
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
 load_dotenv(ROOT / ".env")
