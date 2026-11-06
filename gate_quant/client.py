@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import time
 from decimal import Decimal
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ import requests
 
 from .config import GateSettings
 from .exchange_write_lock import gate_write_lock
+from .protection_identity import ProtectionIdentityStore, matches as protection_matches, order_id as protection_order_id
 
 PRICE_ORDER_EXPIRATION_QUANTUM_SECONDS = 86400
 from .signing import gate_signature
@@ -28,6 +30,9 @@ class GateFuturesClient:
         self.session = self.session or requests.Session()
         if self.settings.proxy_url:
             self.session.proxies.update({"http": self.settings.proxy_url, "https": self.settings.proxy_url})
+        scope = hashlib.sha256(json.dumps([self.settings.environment, self.settings.base_url,
+            self.settings.settle, self.settings.api_key]).encode()).hexdigest()
+        self.protection_identities = ProtectionIdentityStore(scope)
 
     def _request(self, method: str, endpoint: str, *, params: dict | None = None, payload: dict | None = None, private: bool = False):
         if private and method.upper() in {"POST", "PUT", "PATCH", "DELETE"}:
@@ -130,8 +135,17 @@ class GateFuturesClient:
     def find_protection_by_client_id(self, client_id: str, contract: str):
         rows = self.protection_orders(contract) or []
         for row in rows if isinstance(rows, list) else []:
-            if str((row.get("initial") or {}).get("text") or "") == client_id:
+            if str(row.get("_gate_verified_client_id") or (row.get("initial") or {}).get("text") or "") == client_id:
                 return row
+        record = self.protection_identities.get(client_id)
+        if record and record["exchange_id"]:
+            request = json.loads(record["request_json"])
+            if request["contract"].upper() != contract.upper():
+                return None
+            found = self.price_order(record["exchange_id"])
+            if isinstance(found, dict) and protection_matches(found, client_id=client_id,
+                    exchange_id=record["exchange_id"], **request):
+                return {**found, "_gate_verified_client_id": client_id}
         return None
     @staticmethod
     def _is_protection_price_order(row: dict) -> bool:
@@ -212,6 +226,41 @@ class GateFuturesClient:
     def create_protection_order(self, *, contract: str, size: int | float | Decimal, trigger_price: str, rule: int, client_id: str, reduce_only: bool = True, close: bool = False, expiration: int = 86400):
         if rule not in {1, 2}:
             raise ValueError("Gate trigger rule must be 1 (>=) or 2 (<=)")
+        if not reduce_only or close:
+            raise ValueError("Gate protection requires reduce_only=true and close=false")
+        # Keep the durable submission marker and returned Gate ID inside the
+        # same cross-process write lane as the POST. A crash/timeout must never
+        # lead to a second POST with an unresolved identity.
+        with gate_write_lock():
+            request = dict(contract=contract, size=str(size), trigger_price=str(trigger_price), rule=rule)
+            previous = self.protection_identities.get(client_id)
+            if previous:
+                if json.loads(previous["request_json"]) != request:
+                    raise ValueError("Gate protection client id reused with different parameters")
+                found = self.find_protection_by_client_id(client_id, contract)
+                if found and protection_matches(found, client_id=client_id,
+                        exchange_id=previous["exchange_id"], **request):
+                    return {"reconciled": True, "order": found}
+                raise AmbiguousOrderError("Previous Gate protection submission is unresolved; it was not retried")
+            self.protection_identities.prepare(client_id, request)
+            try:
+                result = self._create_protection_order(contract=contract, size=size, trigger_price=trigger_price,
+                    rule=rule, client_id=client_id, reduce_only=reduce_only, close=close, expiration=expiration)
+            except AmbiguousOrderError:
+                found = self.find_protection_by_client_id(client_id, contract)
+                if found and protection_matches(found, client_id=client_id, **request):
+                    self.protection_identities.bind(client_id, protection_order_id(found))
+                    return {"reconciled": True, "order": found}
+                raise
+            payload = result.get("order") if isinstance(result, dict) and isinstance(result.get("order"), dict) else result
+            if isinstance(payload, dict):
+                self.protection_identities.bind(client_id, protection_order_id(payload))
+            return result
+
+    def _create_protection_order(self, *, contract, size, trigger_price, rule, client_id,
+                                 reduce_only=True, close=False, expiration=86400):
+        if rule not in {1, 2}:
+            raise ValueError("Gate trigger rule must be 1 (>=) or 2 (<=)")
         requested_size = Decimal(str(size))
         initial = {"contract": contract, "size": self._api_size(requested_size), "price": "0", "tif": "ioc", "reduce_only": reduce_only, "close": close, "text": client_id}
         payload = {"initial": initial, "trigger": {"price": trigger_price, "rule": rule, "expiration": expiration, "strategy_type": 0}}
@@ -223,13 +272,7 @@ class GateFuturesClient:
             side = "long" if requested_size < 0 else "short"
             initial.update({"size": 0, "auto_size": f"close_{side}", "close": False})
             payload["order_type"] = f"close-{side}-position"
-        try:
-            return self._request("POST", f"/futures/{self.settings.settle}/price_orders", payload=payload, private=True)
-        except AmbiguousOrderError:
-            found = self.find_protection_by_client_id(client_id, contract)
-            if found:
-                return {"reconciled": True, "order": found}
-            raise
+        return self._request("POST", f"/futures/{self.settings.settle}/price_orders", payload=payload, private=True)
     def create_trigger_entry_order(self, *, contract: str, size: int | float | Decimal,
                                    trigger_price: str, execution_price: str, rule: int,
                                    client_id: str, expiration: int):
@@ -268,6 +311,7 @@ class GateFuturesClient:
 
     def protection_orders(self, contract: str | None = None):
         rows = self.price_orders(status="open", contract=contract) or []
-        return [row for row in rows if isinstance(row, dict) and self._is_protection_price_order(row)]
+        return self.protection_identities.annotate(
+            [row for row in rows if isinstance(row, dict) and self._is_protection_price_order(row)])
     def cancel_protection_order(self, order_id: str): return self._request("DELETE", f"/futures/{self.settings.settle}/price_orders/{order_id}", private=True)
     def cancel_trigger_entry_order(self, order_id: str): return self._request("DELETE", f"/futures/{self.settings.settle}/price_orders/{order_id}", private=True)

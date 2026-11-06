@@ -21,6 +21,7 @@ from .service import GateTradingService, protection_coverage_status
 from .risk_profiles import derive_profit_lock_instruction, get_risk_profile
 from .safety import atomic_json, classify_error, cooldown_state, daily_loss_state, position_age_stage, reconcile_exchange_state
 from .protection_lifecycle import actionable_recovery_plans, is_system_protection, load_protection_intents, record_protection_intent, recovery_plans
+from .protection_identity import confirm_protection
 from .entry_confirmation import evaluate_retracement_confirmation
 from .exchange_write_lock import gate_write_lock
 from .portfolio_risk import correlated_exposure_gate
@@ -1974,9 +1975,8 @@ def run_cycle() -> dict:
                 meta = client.contracts(contract_name)
                 trigger_price = _round_price(float(plan["trigger_price"]), meta.get("order_price_round") or meta.get("mark_price_round") or "0")
                 created = client.create_protection_order(contract=contract_name, size=Decimal(plan["close_size"]), trigger_price=trigger_price, rule=plan["rule"], client_id=client_id)
-                current_rows = client.protection_orders(contract_name) or []
-                if not _protection_matches(current_rows, client_id=client_id, size=Decimal(plan["close_size"]), rule=plan["rule"]):
-                    raise RuntimeError(f"Gate repaired {kind} order was not confirmed")
+                confirm_protection(client, created, client_id=client_id, contract=contract_name,
+                                   size=Decimal(plan["close_size"]), trigger_price=trigger_price, rule=plan["rule"])
                 lifecycle_actions.append({"action": "RESTORE_TAKE_PROFIT" if kind == "take_profit" else "RESTORE_STOP_LOSS", **plan, "client_id": client_id, "result": created})
             except Exception as exc:
                 lifecycle_actions.append({"action": "RESTORE_TAKE_PROFIT" if kind == "take_profit" else "RESTORE_STOP_LOSS", **plan, "client_id": client_id, "error": str(exc), "category": classify_error(exc)})

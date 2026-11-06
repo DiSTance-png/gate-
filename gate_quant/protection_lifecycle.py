@@ -9,7 +9,7 @@ from .safety import atomic_json
 from .service import protection_coverage_status
 
 
-SYSTEM_PROTECTION_PREFIXES = ("t-gate-tp-", "t-gate-sl-", "t-gate-rtp-", "t-gate-rsl-")
+SYSTEM_PROTECTION_PREFIXES = ("t-gate-tp-", "t-gate-sl-", "t-gate-rtp-", "t-gate-rsl-", "t-gate-slu-")
 
 
 def _decimal(value: Any) -> Decimal:
@@ -115,7 +115,7 @@ def record_protection_intent(path: Path, intent: dict[str, Any]) -> None:
 
 
 def is_system_protection(order: dict[str, Any]) -> bool:
-    text_value = str((order.get("initial") or {}).get("text") or "")
+    text_value = str(order.get("_gate_verified_client_id") or (order.get("initial") or {}).get("text") or "")
     return text_value.startswith(SYSTEM_PROTECTION_PREFIXES)
 
 

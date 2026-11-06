@@ -41,6 +41,8 @@ def _duration_text(start, end) -> str:
 
 def _exit_reason(row: dict) -> str:
     text = str(row.get("text") or "")
+    if text.startswith("t-gate-rclose-"):
+        return "成交保护校验失败，安全回滚平仓"
     if text.startswith("t-gate-time-"):
         return "超过最大持仓时间自动平仓"
     if text.startswith("t-gate-close-"):

@@ -2,6 +2,7 @@ from __future__ import annotations
 from .client import GateFuturesClient, AmbiguousOrderError
 from .risk import RiskLimits
 from decimal import Decimal
+from .protection_identity import confirm_protection
 
 
 def protection_coverage_status(protections: list[dict], position_size: int | float | Decimal) -> dict:
@@ -153,9 +154,8 @@ class GateTradingService:
                 contract=contract, size=close_size, trigger_price=str(proposed),
                 rule=rule, client_id=client_id,
             )
-            confirmed = self.client.find_protection_by_client_id(client_id, contract)
-            if not confirmed:
-                raise RuntimeError("replacement Gate stop-loss was not confirmed")
+            confirm_protection(self.client, created, client_id=client_id, contract=contract,
+                               size=close_size, trigger_price=str(proposed), rule=rule)
             return {"replaced": True, "old_order_id": old_id, "old_price": str(old_price),
                     "new_price": str(proposed), "cancel": cancelled, "order": created}
         except Exception as exc:
@@ -164,9 +164,11 @@ class GateTradingService:
                 contract=contract, size=close_size, trigger_price=str(old_price),
                 rule=rule, client_id=rollback_id,
             )
-            restored = self.client.find_protection_by_client_id(rollback_id, contract)
-            if not restored:
-                raise RuntimeError(f"new stop-loss failed and old stop-loss restoration is unconfirmed: {exc}") from exc
+            try:
+                confirm_protection(self.client, rollback, client_id=rollback_id, contract=contract,
+                                   size=close_size, trigger_price=str(old_price), rule=rule)
+            except Exception as restore_exc:
+                raise RuntimeError(f"new stop-loss failed and old stop-loss restoration is unconfirmed: {exc}; {restore_exc}") from exc
             raise RuntimeError(f"new stop-loss failed; old stop-loss restored: {exc}") from exc
 
     def place_trigger_entry(self, **kwargs):

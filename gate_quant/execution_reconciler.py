@@ -15,6 +15,7 @@ from .execution_journal import ExecutionJournal
 from .exchange_write_lock import gate_write_lock
 from .risk import RiskLimits
 from .service import GateTradingService, protection_coverage_status
+from .protection_identity import confirm_protection
 
 import logging
 logger = logging.getLogger(__name__)
@@ -315,17 +316,17 @@ def _reconcile_intent_unlocked(
         stop_size = close_sign * stop_missing
         try:
             existing = client.find_protection_by_client_id(protection_client_id, contract)
+            created = existing
             if not existing:
-                client.create_protection_order(
+                created = client.create_protection_order(
                     contract=contract,
                     size=stop_size,
                     trigger_price=str(stop_price),
                     rule=2 if position_size > 0 else 1,
                     client_id=protection_client_id,
                 )
-            protections = client.protection_orders(contract) or []
-            if not _protection_matches(protections, protection_client_id, stop_size, 2 if position_size > 0 else 1):
-                raise RuntimeError("Gate stop-loss creation was not confirmed")
+            confirm_protection(client, created, client_id=protection_client_id, contract=contract,
+                               size=stop_size, trigger_price=str(stop_price), rule=2 if position_size > 0 else 1)
             intent = journal.update(client_id, stop_revision=revision + 1)
         except Exception as exc:
             cleanup: dict[str, Any] = {}
@@ -355,17 +356,17 @@ def _reconcile_intent_unlocked(
         take_profit_size = close_sign * take_profit_missing
         try:
             existing = client.find_protection_by_client_id(protection_client_id, contract)
+            created = existing
             if not existing:
-                client.create_protection_order(
+                created = client.create_protection_order(
                     contract=contract,
                     size=take_profit_size,
                     trigger_price=str(take_profit_price),
                     rule=1 if position_size > 0 else 2,
                     client_id=protection_client_id,
                 )
-            protections = client.protection_orders(contract) or []
-            if not _protection_matches(protections, protection_client_id, take_profit_size, 1 if position_size > 0 else 2):
-                raise RuntimeError("Gate take-profit creation was not confirmed")
+            confirm_protection(client, created, client_id=protection_client_id, contract=contract,
+                               size=take_profit_size, trigger_price=str(take_profit_price), rule=1 if position_size > 0 else 2)
             intent = journal.update(client_id, take_profit_revision=revision + 1)
         except Exception as exc:
             cleanup: dict[str, Any] = {}
