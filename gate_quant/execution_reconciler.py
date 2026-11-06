@@ -16,6 +16,9 @@ from .exchange_write_lock import gate_write_lock
 from .risk import RiskLimits
 from .service import GateTradingService, protection_coverage_status
 
+import logging
+logger = logging.getLogger(__name__)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
@@ -56,6 +59,7 @@ def _protection_id(intent: dict[str, Any], kind: str, revision: int) -> str:
 
 def _protection_matches(rows: list[dict], client_id: str, size: Decimal, rule: int) -> bool:
     expected_side = "long" if size < 0 else "short"
+    logger.info(f"[PROTECTION_MATCH_DEBUG] Looking for client_id={client_id}, size={size}, rule={rule}, expected_side={expected_side}")
     for row in rows or []:
         initial = row.get("initial") or {}
         trigger = row.get("trigger") or {}
@@ -63,13 +67,16 @@ def _protection_matches(rows: list[dict], client_id: str, size: Decimal, rule: i
             str(initial.get("auto_size") or "").lower() == f"close_{expected_side}"
             or str(row.get("order_type") or "").lower() == f"close-{expected_side}-position"
         )
+        logger.info(f"[PROTECTION_MATCH_DEBUG] Checking row: text={initial.get('text')}, size={initial.get('size')}, auto_size={initial.get('auto_size')}, order_type={row.get('order_type')}, rule={trigger.get('rule')}, status={row.get('status')}, full_close={full_close}")
         if (
             str(initial.get("text") or "") == client_id
             and (_decimal(initial.get("size")) == size or full_close)
             and int(trigger.get("rule") or 0) == rule
             and str(row.get("status") or "open").lower() == "open"
         ):
+            logger.info(f"[PROTECTION_MATCH_DEBUG] Match found!")
             return True
+    logger.warning(f"[PROTECTION_MATCH_DEBUG] No match found for client_id={client_id}, size={size}, rule={rule}")
     return False
 
 
