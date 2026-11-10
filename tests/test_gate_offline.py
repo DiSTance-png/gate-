@@ -20,6 +20,7 @@ from gate_quant import ai_worker
 from r20_gateway.scheduler import JOBS, GatewayScheduler
 from gate_quant.safety import classify_error, cooldown_state, daily_loss_state, position_age_stage, reconcile_exchange_state
 from gate_quant.protection_lifecycle import actionable_recovery_plans, intent_from_history, is_system_protection, recovery_plans
+from gate_quant.execution_reconciler import cleanup_orphan_protections
 from scripts.sync_gate_ledger import _ledger_row
 
 
@@ -33,6 +34,36 @@ class FakeSession:
             def raise_for_status(self): pass
             def json(self): return []
         return R()
+
+
+class OrphanProtectionClient:
+    def __init__(self):
+        self.rows = [
+            {"id_string": "sys-orphan", "status": "open", "initial": {"contract": "SOL_USDT", "size": -1, "is_reduce_only": True, "text": "t-gate-sl-old"}, "trigger": {"rule": 2, "price": "90"}},
+            {"id_string": "manual-orphan", "status": "open", "initial": {"contract": "SOL_USDT", "size": -1, "is_reduce_only": True, "text": "api"}, "trigger": {"rule": 1, "price": "110"}},
+        ]
+
+    def positions(self):
+        return []
+
+    def open_orders(self):
+        return []
+
+    def protection_orders(self, contract=None):
+        return list(self.rows)
+
+    def cancel_protection_order(self, order_id):
+        self.rows = [row for row in self.rows if str(row["id_string"]) != str(order_id)]
+        return {"id": order_id, "status": "finished"}
+
+
+def test_reconciler_cleans_only_verified_system_orphans():
+    client = OrphanProtectionClient()
+    settings = GateSettings(environment="testnet", max_pending_order_age_seconds=1800)
+    result = cleanup_orphan_protections(client, settings)
+    assert result["orphan_count"] == 2
+    assert [row["id_string"] for row in client.rows] == ["manual-orphan"]
+    assert {row["action"] for row in result["actions"]} == {"CANCEL_SYSTEM_ORPHAN", "KEEP_UNVERIFIED_ORPHAN"}
 
 
 @pytest.mark.parametrize("reply", [None, "retracement", "invalid"])

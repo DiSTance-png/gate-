@@ -162,7 +162,24 @@ def _decision_findings(decision: dict[str, Any], positions: list[dict[str, Any]]
         str(row.get("contract") or row.get("instId") or "").upper().replace("-USDT-SWAP", "_USDT").replace("-", "_")
         for row in management if isinstance(row, dict)
     }
-    active_contracts = {str(row.get("contract") or "").upper() for row in positions if _decimal(row.get("size")) != 0}
+    # The live snapshot can contain a position opened after this AI response
+    # (the entry path runs later in the same cycle). Only positions present in
+    # the decision-time snapshot require a management instruction. Older
+    # decisions have no snapshot metadata, so retain the historical behavior.
+    snapshot = decision.get("position_management_snapshot")
+    if isinstance(snapshot, dict) and isinstance(snapshot.get("contracts"), list):
+        decision_contracts = {
+            str(value or "").upper().replace("-USDT-SWAP", "_USDT").replace("-", "_")
+            for value in snapshot.get("contracts")
+            if str(value or "").strip()
+        }
+        active_contracts = {
+            str(row.get("contract") or "").upper().replace("-USDT-SWAP", "_USDT").replace("-", "_")
+            for row in positions
+            if _decimal(row.get("size")) != 0 and str(row.get("contract") or "").upper().replace("-USDT-SWAP", "_USDT").replace("-", "_") in decision_contracts
+        }
+    else:
+        active_contracts = {str(row.get("contract") or "").upper().replace("-USDT-SWAP", "_USDT").replace("-", "_") for row in positions if _decimal(row.get("size")) != 0}
     unmanaged = sorted(active_contracts - managed)
     if unmanaged:
         result.append(finding(

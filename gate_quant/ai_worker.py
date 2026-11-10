@@ -107,6 +107,7 @@ def _save_decision_payload(payload: dict, decisions_payload: dict, trade: dict, 
         "risk_snapshot": risk_snapshot,
         "safety_status": payload.get("safety_status") or {},
         "position_management": payload.get("position_management") or [],
+        "position_management_snapshot": payload.get("position_management_snapshot") or {},
         "pending_orders_management": payload.get("pending_orders_management") or [],
         "management_result": payload.get("management_result") or {},
         "decisions": {
@@ -1997,6 +1998,14 @@ def run_cycle() -> dict:
     safety_status["lifecycle_actions"] = lifecycle_actions
     atomic_json(SAFETY_STATUS, safety_status)
     atomic_json(RUNTIME_HEARTBEAT, {"component": "gate_trader", "pid": os.getpid(), "timestamp_ms": safety_status["checked_at_ms"], "status": "running", "safe_for_new_risk": safety_status["safe_for_new_risk"]})
+    # Keep the decision-time position universe separate from the final context:
+    # an entry submitted later in this cycle must not be audited as if the model
+    # had been required to manage it in the same response.
+    decision_position_contracts = sorted({
+        str(position.get("contract") or "").upper()
+        for position in private_context["positions"]
+        if isinstance(position, dict) and float(position.get("size") or 0) != 0
+    })
     selected = features[0]
     decisions = {f["contract"]: {"action": "WAIT", "confidence": 0.0, "entry_price": 0.0, "summary_reason": "No valid LLM decision"} for f in features}
     llm_source = "gate-multifactor-fallback"
@@ -2109,10 +2118,20 @@ def run_cycle() -> dict:
     # The model may miss a profitable position in a noisy/partial response.
     # Add a deterministic ratchet only when it improves an existing Gate stop;
     # execution still runs through the normal write lock and confirmation path.
-    explicit_management = {
-        str(item.get("contract") or item.get("instId") or "").upper().replace("-USDT-SWAP", "_USDT").replace("-", "_"): str(item.get("action") or "HOLD").upper()
-        for item in position_management if isinstance(item, dict)
-    }
+    explicit_management: dict[str, str] = {}
+    for item in position_management:
+        if not isinstance(item, dict):
+            continue
+        contract_name = str(item.get("contract") or item.get("instId") or "").upper().replace("-USDT-SWAP", "_USDT").replace("-", "_")
+        action_name = str(item.get("action") or "HOLD").upper()
+        if action_name == "UPDATE_SL":
+            try:
+                if float(item.get("suggested_sl_price") or 0) <= 0:
+                    continue
+            except (TypeError, ValueError):
+                continue
+        if contract_name:
+            explicit_management[contract_name] = action_name
     for current_position in private_context["positions"]:
         contract_name = str(current_position.get("contract") or "").upper()
         if not contract_name or explicit_management.get(contract_name) in {"CLOSE_MARKET", "UPDATE_SL"}:
@@ -2120,6 +2139,16 @@ def run_cycle() -> dict:
         suggestion = derive_profit_lock_instruction(current_position, private_context["protections"], risk_profile.key)
         if suggestion:
             position_management.append(suggestion)
+        elif explicit_management.get(contract_name) not in {"HOLD"}:
+            # A missing/partial model response is allowed to preserve risk, but
+            # it must never silently omit an existing position from the cycle.
+            position_management.append({
+                "contract": contract_name,
+                "action": "HOLD",
+                "confidence": 0.0,
+                "reason": "模型未提供该持仓管理结论，确定性兜底保持持仓；不自动平仓",
+                "management_source": "deterministic_hold_fallback",
+            })
     decisions_payload = {symbol: {"instId": symbol, "decision_timestamp_ms": now, "decision": item, "source": llm_source, "llm_error": llm_error, "llm_preview": llm_preview, "policy_version": policy_snapshot["policy_version"], "policy_hash": policy_snapshot["policy_hash"], "risk_snapshot": risk_snapshot, "indicators": next(f for f in features if f["contract"] == symbol)} for symbol, item in decisions.items()}
     if settings.entry_intent_enabled:
         # The explicit-intent path owns a real Gate order lifecycle.  Legacy
@@ -2218,7 +2247,13 @@ def run_cycle() -> dict:
                 continue
             current = matching[0]
             try:
-                if mgmt_action == "CLOSE_MARKET":
+                if mgmt_action == "HOLD":
+                    management_result["positions"].append({
+                        "contract": contract_name,
+                        "action": "HOLD",
+                        "result": {"held": True, "management_source": instruction.get("management_source", "model")},
+                    })
+                elif mgmt_action == "CLOSE_MARKET":
                     with gate_write_lock():
                         management_result["positions"].append({"contract": contract_name, "action": mgmt_action, "result": GateTradingService(client, RiskLimits(settings.max_position_notional_usd, settings.max_total_margin_usd, settings.max_order_margin_usd)).close_position_safely(contract=contract_name, client_id=f"t-gate-close-{now}", position_mode=str(current.get("mode") or ""))})
                 elif mgmt_action == "UPDATE_SL" and float(instruction.get("suggested_sl_price") or 0) > 0:
@@ -2366,6 +2401,7 @@ def run_cycle() -> dict:
     payload = {**decisions_payload, "generated_at_ms": now, "exchange": "gate", "environment": settings.environment,
                "policy_snapshot": policy_snapshot, "risk_snapshot": risk_snapshot, "safety_status": safety_status,
                "position_management": position_management, "pending_orders_management": pending_management,
+               "position_management_snapshot": {"captured_at_ms": int(safety_status.get("checked_at_ms") or now), "contracts": decision_position_contracts},
                "management_result": result.get("management") or {}, "private_context": private_context,
                "trade": result["trade"], "trades": all_outcomes}
     _save_decision_payload(payload, decisions_payload, result["trade"], now, settings.environment, risk_snapshot)

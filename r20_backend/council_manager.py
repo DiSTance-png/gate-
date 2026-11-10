@@ -701,6 +701,8 @@ def execute_council_debate(
         "你必须对全局资金、在途持仓、在途挂单及 6 大主力标的做出终审裁决：\n"
         "1. 【持仓与挂单闭环管理】：\n"
         "   - 在 position_management 中对所有活动持仓下达权威指令（HOLD / CLOSE_MARKET / UPDATE_SL）及理由；\n"
+        "   - position_management 必须覆盖输入中本轮开始时的每一个活动持仓；无明确退出或移损理由时必须输出 HOLD，不得省略；\n"
+        "   - UPDATE_SL 只能收紧止损：多仓新止损低于当前价且高于旧止损，空仓新止损高于当前价且低于旧止损，优先锁定已有利润；禁止放宽止损或把止损移到会扩大亏损的位置；\n"
         "   - 在 pending_orders_management 中对所有在途未成交挂单下达处理指令（CANCEL / KEEP）及理由；\n"
         "2. 【6 大标的开仓方案终审 (decisions) 与采纳归属 (adopted_role)】：\n"
         f"   - 仔细比对各位交易员提交的方案{'与交叉质询辩论' if consensus_mode == 'cross_examination' else ''}，评估逻辑最扎实者采纳，存在漏洞者驳回；\n"

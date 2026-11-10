@@ -16,6 +16,8 @@ from .exchange_write_lock import gate_write_lock
 from .risk import RiskLimits
 from .service import GateTradingService, protection_coverage_status
 from .protection_identity import confirm_protection
+from .protection_lifecycle import is_system_protection
+from .safety import classify_error, reconcile_exchange_state
 
 import logging
 logger = logging.getLogger(__name__)
@@ -119,6 +121,56 @@ def _cancel_remainder(service: GateTradingService, intent: dict[str, Any], order
     if not order_id:
         raise RuntimeError("open Gate entry has no exchange order id")
     return service.cancel_order_confirmed(contract=str(intent["contract"]), order_id=order_id)
+
+
+def cleanup_orphan_protections(client: GateFuturesClient, settings: GateSettings) -> dict[str, Any]:
+    """Remove only Gate-created protections that no longer cover a live order/position.
+
+    This runs from the 10-second reconciler so an exchange-triggered close does not
+    leave its sibling TP/SL active until the next 15-minute AI cycle. Unknown or
+    manually-created protections are retained and reported for human review.
+    """
+    with gate_write_lock():
+        positions = client.positions() or []
+        orders = client.open_orders() or []
+        protections = client.protection_orders() or []
+        reconciliation = reconcile_exchange_state(
+            positions if isinstance(positions, list) else [positions],
+            orders if isinstance(orders, list) else [orders],
+            protections if isinstance(protections, list) else [protections],
+            max_pending_age_seconds=settings.max_pending_order_age_seconds,
+        )
+        actions: list[dict[str, Any]] = []
+        for orphan in reconciliation["orphan_protections"]:
+            order_id = str(orphan.get("id_string") or orphan.get("id") or "")
+            contract = str((orphan.get("initial") or {}).get("contract") or orphan.get("contract") or "").upper()
+            if not order_id or not is_system_protection(orphan):
+                actions.append({
+                    "action": "KEEP_UNVERIFIED_ORPHAN",
+                    "contract": contract,
+                    "order_id": order_id,
+                    "reason": "not_created_by_gate_quant",
+                })
+                continue
+            try:
+                result = GateTradingService(
+                    client,
+                    RiskLimits(settings.max_position_notional_usd, settings.max_total_margin_usd, settings.max_order_margin_usd),
+                ).cancel_protection_confirmed(order_id=order_id)
+                actions.append({"action": "CANCEL_SYSTEM_ORPHAN", "contract": contract, "order_id": order_id, "result": result})
+            except Exception as exc:
+                actions.append({
+                    "action": "CANCEL_SYSTEM_ORPHAN",
+                    "contract": contract,
+                    "order_id": order_id,
+                    "error": str(exc),
+                    "category": classify_error(exc),
+                })
+        return {
+            "orphan_count": len(reconciliation["orphan_protections"]),
+            "actions": actions,
+            "reconciliation": reconciliation,
+        }
 
 
 def _position_for_contract(client: GateFuturesClient, contract: str, requested_size: Decimal) -> dict[str, Any]:
@@ -425,11 +477,13 @@ def run_once() -> dict[str, Any]:
         if str(intent.get("status") or "") != "manual_review"
         or now_ms - int(intent.get("updated_at_ms") or 0) >= 300_000
     ]
-    if not intents:
-        return {"status": "idle", "environment": settings.environment, "processed": 0}
     if not settings.api_key or not settings.api_secret:
-        return {"status": "blocked", "environment": settings.environment, "processed": 0, "error": "credentials unavailable"}
+        return {"status": "blocked", "environment": settings.environment, "processed": 0, "orphan_cleanup": {"status": "skipped", "reason": "credentials unavailable"}, "error": "credentials unavailable"}
     client = GateFuturesClient(settings)
+    try:
+        orphan_cleanup = cleanup_orphan_protections(client, settings)
+    except Exception as exc:
+        orphan_cleanup = {"status": "error", "error": str(exc), "category": classify_error(exc), "actions": []}
     results = []
     for intent in intents:
         try:
@@ -437,7 +491,7 @@ def run_once() -> dict[str, Any]:
         except Exception as exc:
             journal.update(str(intent["client_id"]), last_error=f"{type(exc).__name__}: {exc}")
             results.append({"client_id": intent["client_id"], "status": "error", "error": str(exc)})
-    return {"status": "ok", "environment": settings.environment, "processed": len(results), "results": results}
+    return {"status": "ok" if results else "idle", "environment": settings.environment, "processed": len(results), "results": results, "orphan_cleanup": orphan_cleanup}
 
 
 def main() -> None:

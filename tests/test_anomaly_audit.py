@@ -118,6 +118,18 @@ def test_open_position_without_ai_management_is_visible():
     assert "protection_gap" not in codes(report)
 
 
+def test_position_opened_after_decision_is_not_reported_as_missing_management():
+    positions = [{"contract": "SOL_USDT", "size": "1", "mark_price": "100", "initial_margin": "10"}]
+    protections = [
+        {"initial": {"contract": "SOL_USDT", "size": "-1", "reduce_only": True}, "trigger": {"rule": 1}},
+        {"initial": {"contract": "SOL_USDT", "size": "-1", "reduce_only": True}, "trigger": {"rule": 2}},
+    ]
+    decision = complete_decision(management=[])
+    decision["position_management_snapshot"] = {"captured_at_ms": NOW - 10_000, "contracts": []}
+    report = collect_anomalies(**healthy_inputs(positions=positions, protections=protections, decision=decision))
+    assert "position_management_missing" not in codes(report)
+
+
 def test_wrong_side_and_duplicate_full_close_protections_are_visible():
     positions = [{"contract": "BTC_USDT", "size": "2", "mark_price": "50000", "initial_margin": "20"}]
     protections = [

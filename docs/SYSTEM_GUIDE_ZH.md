@@ -90,7 +90,7 @@ Gate API v4
 ### 4.3 执行可靠性
 
 - `gate_quant/execution_journal.py`：下单前持久化入场意图。
-- `gate_quant/execution_reconciler.py`：每 10 秒确认订单、成交、持仓和保护覆盖。
+- `gate_quant/execution_reconciler.py`：每 10 秒确认订单、成交、持仓和保护覆盖，并及时清理已无持仓/入场单关联的系统保护单；来源不明的保护单只报警。
 - `gate_quant/exchange_write_lock.py`：跨线程、跨进程串行化 Gate 私有写操作。
 - `gate_quant/protection_lifecycle.py`：保护意图、缺失保护恢复和孤立保护单识别。
 - `gate_quant/safety.py`：交易所状态对账、日亏损、挂单超时和止损冷却。日亏损熔断由 `GATE_DAILY_LOSS_CIRCUIT_BREAKER_ENABLED` 控制，关闭时只取消日亏损对新增风险的阻断，不删除亏损记录，也不影响其它安全门。
@@ -280,7 +280,7 @@ Gate 官方 `FuturesInitialOrder.size` 对 `price_orders` 定义为整数张。�
 
 ## 10. 部分成交和保护单
 
-对账器每 10 秒读取：
+对账器每 10 秒读取并在统一 Gate 写锁内处理：
 
 - 入场订单的 `size`、`left` 和状态。
 - 下单前基准持仓。
@@ -309,7 +309,7 @@ Gate 官方 `FuturesInitialOrder.size` 对 `price_orders` 定义为整数张。�
 - 只认可明确的 `reduce_only/is_reduce_only` 或 `close/is_close`。
 - 普通反向计划单不能计入覆盖。
 
-孤立保护单指：对应合约没有持仓，也没有待成交入场单。系统只会自动撤销客户端订单号前缀或持久化 Gate ID 与完整参数复核能够证明由本系统创建的保护单；原始交易所 text 保留不变，内部使用 `_gate_verified_client_id` 传递核验后的归属。人工或来源不明的保护单只报警并关闭新增风险，不擅自撤销；升级前没有持久化 ID 的 `text=api` 历史订单不自动接管。
+孤立保护单指：对应合约没有持仓，也没有待成交入场单。10 秒执行对账器和 AI 生命周期巡检都会重新读取真实持仓、普通挂单与保护单；系统只会自动撤销客户端订单号前缀或持久化 Gate ID 与完整参数复核能够证明由本系统创建的保护单；原始交易所 text 保留不变，内部使用 `_gate_verified_client_id` 传递核验后的归属。人工或来源不明的保护单只报警并关闭新增风险，不擅自撤销；升级前没有持久化 ID 的 `text=api` 历史订单不自动接管。
 
 若持仓缺少保护，只有在历史保护意图能和当前环境、合约、方向、开仓时间可靠关联时才补单。若历史触发价已经被市场穿越，不会把保护单重新挂到错误一侧，而是进入受控平仓处置。无法关联时保持 fail-closed。
 
