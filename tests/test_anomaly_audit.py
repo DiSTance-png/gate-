@@ -130,6 +130,16 @@ def test_position_opened_after_decision_is_not_reported_as_missing_management():
     assert "position_management_missing" not in codes(report)
 
 
+def test_legacy_decision_uses_position_open_time_when_snapshot_is_absent():
+    positions = [{"contract": "ETH_USDT", "size": "1", "open_time": (NOW + 1_000) / 1000, "mark_price": "100", "initial_margin": "10"}]
+    protections = [
+        {"initial": {"contract": "ETH_USDT", "size": "-1", "reduce_only": True}, "trigger": {"rule": 1}},
+        {"initial": {"contract": "ETH_USDT", "size": "-1", "reduce_only": True}, "trigger": {"rule": 2}},
+    ]
+    report = collect_anomalies(**healthy_inputs(positions=positions, protections=protections, decision=complete_decision(management=[])))
+    assert "position_management_missing" not in codes(report)
+
+
 def test_wrong_side_and_duplicate_full_close_protections_are_visible():
     positions = [{"contract": "BTC_USDT", "size": "2", "mark_price": "50000", "initial_margin": "20"}]
     protections = [

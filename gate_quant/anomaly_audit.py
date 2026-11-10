@@ -179,7 +179,17 @@ def _decision_findings(decision: dict[str, Any], positions: list[dict[str, Any]]
             if _decimal(row.get("size")) != 0 and str(row.get("contract") or "").upper().replace("-USDT-SWAP", "_USDT").replace("-", "_") in decision_contracts
         }
     else:
-        active_contracts = {str(row.get("contract") or "").upper().replace("-USDT-SWAP", "_USDT").replace("-", "_") for row in positions if _decimal(row.get("size")) != 0}
+        active_contracts = set()
+        for row in positions:
+            if _decimal(row.get("size")) == 0:
+                continue
+            opened_ms = _timestamp_ms(row, "open_time_ms", "open_time", "create_time_ms", "create_time")
+            # For legacy decisions without a snapshot, use the exchange's
+            # position-open timestamp when available. Missing timestamps retain
+            # the old conservative behavior and still require management.
+            if generated_ms and opened_ms and opened_ms > generated_ms:
+                continue
+            active_contracts.add(str(row.get("contract") or "").upper().replace("-USDT-SWAP", "_USDT").replace("-", "_"))
     unmanaged = sorted(active_contracts - managed)
     if unmanaged:
         result.append(finding(
