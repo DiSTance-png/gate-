@@ -6,7 +6,7 @@ import sqlite3
 import time
 import re
 import requests
-from decimal import Decimal, ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, ROUND_HALF_UP
 from pathlib import Path
 from dataclasses import replace
 from typing import Any
@@ -22,6 +22,7 @@ from .risk_profiles import derive_profit_lock_instruction, get_risk_profile
 from .safety import atomic_json, classify_error, cooldown_state, daily_loss_state, position_age_stage, reconcile_exchange_state
 from .protection_lifecycle import actionable_recovery_plans, is_system_protection, load_protection_intents, record_protection_intent, recovery_plans
 from .protection_identity import confirm_protection
+from .position_management import active_position_contracts, filter_position_management, management_contract
 from .entry_confirmation import evaluate_retracement_confirmation
 from .exchange_write_lock import gate_write_lock
 from .portfolio_risk import correlated_exposure_gate
@@ -1728,6 +1729,45 @@ def _execution_enabled(settings) -> bool:
     return False
 
 
+def _prepare_position_management(instructions, positions, protections, profile_key) -> list[dict]:
+    active_contracts = active_position_contracts(positions)
+    result = filter_position_management(_as_instruction_list(instructions), active_contracts)
+    explicit_management = {}
+    for item in result:
+        action = str(item.get("action") or "HOLD").upper()
+        if action == "UPDATE_SL":
+            try:
+                price = Decimal(str(item.get("suggested_sl_price") or 0))
+                if not price.is_finite() or price <= 0:
+                    continue
+            except (InvalidOperation, TypeError, ValueError):
+                continue
+        explicit_management[management_contract(item)] = action
+    handled = set()
+    for position in positions:
+        if not active_position_contracts([position]):
+            continue
+        contract = management_contract(position)
+        if contract in handled:
+            continue
+        handled.add(contract)
+        if explicit_management.get(contract) in {"CLOSE_MARKET", "UPDATE_SL"}:
+            continue
+        suggestion = derive_profit_lock_instruction(position, protections, profile_key)
+        if suggestion:
+            # A ratchet supersedes HOLD; one position should not display two
+            # contradictory instructions in the same cycle.
+            result = [row for row in result if management_contract(row) != contract]
+            result.extend(filter_position_management([suggestion], active_contracts))
+        elif explicit_management.get(contract) != "HOLD":
+            result.extend(filter_position_management([{
+                "contract": contract, "action": "HOLD", "confidence": 0.0,
+                "reason": "模型未提供该持仓管理结论，保持现有持仓与保护",
+                "management_source": "deterministic_hold_fallback",
+            }], active_contracts))
+    return result
+
+
 def _refresh_entry_safety(client, journal, settings, safety_status):
     """Reconcile existing intents, then rebuild safety from fresh exchange facts."""
     with gate_write_lock():
@@ -2001,11 +2041,7 @@ def run_cycle() -> dict:
     # Keep the decision-time position universe separate from the final context:
     # an entry submitted later in this cycle must not be audited as if the model
     # had been required to manage it in the same response.
-    decision_position_contracts = sorted({
-        str(position.get("contract") or "").upper()
-        for position in private_context["positions"]
-        if isinstance(position, dict) and float(position.get("size") or 0) != 0
-    })
+    decision_position_contracts = sorted(active_position_contracts(private_context["positions"]))
     selected = features[0]
     decisions = {f["contract"]: {"action": "WAIT", "confidence": 0.0, "entry_price": 0.0, "summary_reason": "No valid LLM decision"} for f in features}
     llm_source = "gate-multifactor-fallback"
@@ -2112,43 +2148,11 @@ def run_cycle() -> dict:
         llm_source = "gate-multifactor-llm-error"
     now = int(time.time() * 1000)
     management = full_response if 'full_response' in locals() and isinstance(full_response, dict) else {}
-    position_management = _as_instruction_list(management.get("position_management"))
+    position_management = _prepare_position_management(
+        management.get("position_management"), private_context["positions"],
+        private_context["protections"], risk_profile.key,
+    )
     pending_management = _as_instruction_list(management.get("pending_orders_management"))
-
-    # The model may miss a profitable position in a noisy/partial response.
-    # Add a deterministic ratchet only when it improves an existing Gate stop;
-    # execution still runs through the normal write lock and confirmation path.
-    explicit_management: dict[str, str] = {}
-    for item in position_management:
-        if not isinstance(item, dict):
-            continue
-        contract_name = str(item.get("contract") or item.get("instId") or "").upper().replace("-USDT-SWAP", "_USDT").replace("-", "_")
-        action_name = str(item.get("action") or "HOLD").upper()
-        if action_name == "UPDATE_SL":
-            try:
-                if float(item.get("suggested_sl_price") or 0) <= 0:
-                    continue
-            except (TypeError, ValueError):
-                continue
-        if contract_name:
-            explicit_management[contract_name] = action_name
-    for current_position in private_context["positions"]:
-        contract_name = str(current_position.get("contract") or "").upper()
-        if not contract_name or explicit_management.get(contract_name) in {"CLOSE_MARKET", "UPDATE_SL"}:
-            continue
-        suggestion = derive_profit_lock_instruction(current_position, private_context["protections"], risk_profile.key)
-        if suggestion:
-            position_management.append(suggestion)
-        elif explicit_management.get(contract_name) not in {"HOLD"}:
-            # A missing/partial model response is allowed to preserve risk, but
-            # it must never silently omit an existing position from the cycle.
-            position_management.append({
-                "contract": contract_name,
-                "action": "HOLD",
-                "confidence": 0.0,
-                "reason": "模型未提供该持仓管理结论，确定性兜底保持持仓；不自动平仓",
-                "management_source": "deterministic_hold_fallback",
-            })
     decisions_payload = {symbol: {"instId": symbol, "decision_timestamp_ms": now, "decision": item, "source": llm_source, "llm_error": llm_error, "llm_preview": llm_preview, "policy_version": policy_snapshot["policy_version"], "policy_hash": policy_snapshot["policy_hash"], "risk_snapshot": risk_snapshot, "indicators": next(f for f in features if f["contract"] == symbol)} for symbol, item in decisions.items()}
     if settings.entry_intent_enabled:
         # The explicit-intent path owns a real Gate order lifecycle.  Legacy

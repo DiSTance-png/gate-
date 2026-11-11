@@ -36,6 +36,7 @@ from .exchange_write_lock import gate_write_lock
 from .instrument_universe import create_preview as create_instrument_preview, apply_preview as apply_instrument_preview
 from .risk import RiskLimits
 from .service import GateTradingService, protection_coverage_status
+from .position_management import history_position_management
 
 TRADE_STATUS_LABELS = {
     "not_submitted": "未下单",
@@ -710,6 +711,9 @@ def all_dashboard():
     errors = [e for e in (account_error, position_error, order_error, trigger_error, protection_error, account_book_error) if e]
     history_view = []
     for row in reversed(decision_history[-200:]):
+        if not isinstance(row, dict):
+            continue
+        row = {**row, "position_management": history_position_management(row)}
         stamp = int(row.get("generated_at_ms") or 0) if isinstance(row, dict) else 0
         trade_status = str((row.get("trade") or {}).get("status") or "not_submitted")
         history_view.append({**row, "time": dt.datetime.fromtimestamp(stamp / 1000).strftime("%Y-%m-%d %H:%M:%S") if stamp else "时间未记录", "macro_assessment": f"{(row.get('risk_snapshot') or {}).get('label', profile.label)}档位 · Gate {(row.get('environment') or s.environment).upper()} · {TRADE_STATUS_LABELS.get(trade_status, {'not_submitted': '未下单'}.get(trade_status, trade_status))}", "trade_status_label": TRADE_STATUS_LABELS.get(trade_status, {'not_submitted': '未下单'}.get(trade_status, trade_status))})
@@ -1020,6 +1024,7 @@ def gate_admin_history(page: int = 1, page_size: int = 20, query: str = "", x_ga
     for cycle in reversed(history):
         if not isinstance(cycle, dict):
             continue
+        cycle = {**cycle, "position_management": history_position_management(cycle)}
         text = json.dumps(cycle, ensure_ascii=False).lower()
         if needle and needle not in text:
             continue

@@ -158,7 +158,7 @@ function toggle(i: number) {
           >
             <span class="text-[10px] 2xl:text-xs font-bold block uppercase" style="color: var(--text-faint);">在途持仓管理指令</span>
             <div v-for="(p, j) in item.position_management" :key="j" class="flex flex-wrap items-center gap-x-2 gap-y-0.5 2xl:gap-x-3" style="color: var(--text-muted);">
-              <strong style="color: var(--text-main);">{{ p.instId }}</strong>
+              <strong style="color: var(--text-main);">{{ p.instId || p.contract }}</strong>
               <span
                 class="px-2 py-0.5 rounded font-bold border text-[10px] 2xl:text-xs"
                 :style="{

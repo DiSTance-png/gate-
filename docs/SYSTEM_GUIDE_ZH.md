@@ -123,6 +123,8 @@ Gate API v4
 
 Gate Futures K 线进入指标计算前必须按数值时间戳升序排序，并拒绝重复时间戳、未来时间戳和超过三个周期未更新的数据。15M、1H、4H 指标各自使用本周期序列计算；1H 的冲量、急动度、定积分、概率和 VaR/CVaR 不得从 15M 结果拼接。最新 15M 收盘价与 ticker 偏差超过 3% 时，整轮在调用 AI 前 fail-closed。
 
+`position_management` 仅保留本轮决策开始时 `size != 0` 的合约；没有实际持仓的合约不生成兜底 HOLD，也不保留模型误报的管理指令。兜底按合约生成一次，盈利保护棘轮替代同合约 HOLD。管理记录同时包含 Gate `contract` 和显示用 `instId`。主页和管理员历史列表按照当轮 `position_management_snapshot` 过滤旧版冗余记录，原始历史及审计文件不改写，不使用今天的仓位删减过去真实的管理记录。
+
 决策链把方向观点与执行动作分开：`direction_bias=LONG|SHORT|NEUTRAL` 可在 `action=WAIT` 时保留，但不能绕过执行门禁。`gate_quant/regime.py` 使用 4H/1H 结构、1H 加速度、`+DI/-DI`、15M/1H 动量占比、VWAP 偏离和涨跌幅确定性分类 `TREND_UP/TREND_DOWN/PULLBACK_UP/REBOUND_DOWN/RANGE/TRANSITION/EXHAUSTION_*`。`TRANSITION` 禁止双向新仓；上涨衰竭禁止追多，下跌衰竭禁止追空。ADX 仅表示强度，方向必须由 `+DI/-DI` 和结构共同确认。
 
 启用显式入场意图后，回踩/反弹候选不再进入 `WAITING_TOUCH -> WAITING_RECLAIM` 本地二次策略状态机。通过确定性行情、价格几何、R:R、资金和组合风险检查后，`retracement` 直接创建 Gate 原生 GTC 限价单，由交易所等待计划价。关闭显式入场意图时，旧状态机仅作为兼容路径保留。
